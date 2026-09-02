@@ -7,7 +7,7 @@ mod tui;
 
 use agent::{Agent, HttpAgent, Message, Role};
 use clap::Parser;
-use cli::{Cli, ConfigAction, Commands};
+use cli::{Cli, Commands, ConfigAction, FormatAction};
 use config::Config;
 use console::style;
 use indicatif::{ProgressBar, ProgressStyle};
@@ -58,7 +58,79 @@ async fn main() -> anyhow::Result<()> {
                     style("model:   ").cyan().bold(),
                     config.model.as_deref().unwrap_or("<не задан>")
                 );
+                println!(
+                    "{} {}",
+                    style("режим ответа:").cyan().bold(),
+                    if config.custom_response_mode {
+                        "кастомный"
+                    } else {
+                        "дефолтный"
+                    }
+                );
+                print_response_format(&config.response_format);
             }
+            ConfigAction::Format { action } => match action {
+                FormatAction::Set {
+                    description,
+                    max_length,
+                    stop,
+                    stop_instruction,
+                } => {
+                    let mut config = Config::load()?;
+                    if description.is_some() {
+                        config.response_format.description = description;
+                    }
+                    if max_length.is_some() {
+                        config.response_format.max_length = max_length;
+                    }
+                    if stop.is_some() {
+                        config.response_format.stop = stop;
+                    }
+                    if stop_instruction.is_some() {
+                        config.response_format.stop_instruction = stop_instruction;
+                    }
+                    config.custom_response_mode = true;
+                    config.save()?;
+                    println!(
+                        "{}",
+                        style("Настройки формата сохранены, кастомный режим включён.")
+                            .green()
+                            .bold()
+                    );
+                }
+                FormatAction::Enable => {
+                    let mut config = Config::load()?;
+                    config.custom_response_mode = true;
+                    config.save()?;
+                    println!("{}", style("Кастомный режим ответа включён.").green().bold());
+                }
+                FormatAction::Disable => {
+                    let mut config = Config::load()?;
+                    config.custom_response_mode = false;
+                    config.save()?;
+                    println!("{}", style("Кастомный режим ответа выключен.").green().bold());
+                }
+                FormatAction::Reset => {
+                    let mut config = Config::load()?;
+                    config.response_format = Default::default();
+                    config.custom_response_mode = false;
+                    config.save()?;
+                    println!("{}", style("Настройки формата сброшены.").green().bold());
+                }
+                FormatAction::Show => {
+                    let config = Config::load()?;
+                    println!(
+                        "{} {}",
+                        style("режим ответа:").cyan().bold(),
+                        if config.custom_response_mode {
+                            "кастомный"
+                        } else {
+                            "дефолтный"
+                        }
+                    );
+                    print_response_format(&config.response_format);
+                }
+            },
         },
     }
 
@@ -67,6 +139,36 @@ async fn main() -> anyhow::Result<()> {
 
 fn print_markdown(text: &str) {
     agent_skin().print_text(text);
+}
+
+fn print_response_format(format: &config::ResponseFormat) {
+    println!(
+        "{} {}",
+        style("описание:      ").cyan().bold(),
+        format.description.as_deref().unwrap_or("<не задано>")
+    );
+    println!(
+        "{} {}",
+        style("макс. длина:   ").cyan().bold(),
+        format
+            .max_length
+            .map(|v| v.to_string())
+            .unwrap_or_else(|| "<не задано>".to_string())
+    );
+    println!(
+        "{} {}",
+        style("stop:          ").cyan().bold(),
+        format
+            .stop
+            .as_ref()
+            .map(|v| v.join(", "))
+            .unwrap_or_else(|| "<не задано>".to_string())
+    );
+    println!(
+        "{} {}",
+        style("stop-инструкция:").cyan().bold(),
+        format.stop_instruction.as_deref().unwrap_or("<не задано>")
+    );
 }
 
 async fn ask_with_spinner(agent: &HttpAgent, history: &[Message]) -> anyhow::Result<String> {

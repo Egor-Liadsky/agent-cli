@@ -1,9 +1,10 @@
 use super::{Agent, Message, Role};
-use crate::config::Config;
+use crate::config::{Config, ResponseFormat};
 use anyhow::{bail, Context, Result};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::io::Write;
+use std::sync::RwLock;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 const DEFAULT_BASE_URL: &str = "https://api.deepseek.com";
@@ -14,6 +15,7 @@ pub struct HttpAgent {
     api_key: String,
     base_url: String,
     model: String,
+    response_format: RwLock<Option<ResponseFormat>>,
 }
 
 impl HttpAgent {
@@ -34,7 +36,37 @@ impl HttpAgent {
                 .model
                 .clone()
                 .unwrap_or_else(|| DEFAULT_MODEL.to_string()),
+            response_format: RwLock::new(config.active_response_format().cloned()),
         })
+    }
+
+    /// Текущие настройки формата ответа (`None` — дефолтный режим).
+    pub fn response_format(&self) -> Option<ResponseFormat> {
+        self.response_format.read().unwrap().clone()
+    }
+
+    /// Обновить режим ответа "на лету", без перезапуска.
+    pub fn set_response_format(&self, format: Option<ResponseFormat>) {
+        *self.response_format.write().unwrap() = format;
+    }
+
+    /// Системный промпт с описанием формата и условием завершения ответа
+    /// (используется только в кастомном режиме).
+    fn system_prompt(&self) -> Option<String> {
+        let format = self.response_format.read().unwrap();
+        let format = format.as_ref()?;
+        let mut parts = Vec::new();
+        if let Some(description) = &format.description {
+            parts.push(format!("Формат ответа: {description}"));
+        }
+        if let Some(instruction) = &format.stop_instruction {
+            parts.push(format!("Условие завершения ответа: {instruction}"));
+        }
+        if parts.is_empty() {
+            None
+        } else {
+            Some(parts.join("\n"))
+        }
     }
 }
 
@@ -42,6 +74,10 @@ impl HttpAgent {
 struct ChatRequest<'a> {
     model: &'a str,
     messages: Vec<ChatMessage>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_tokens: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stop: Option<Vec<String>>,
 }
 
 #[derive(Serialize)]
@@ -76,59 +112,105 @@ struct ApiErrorDetail {
 }
 
 #[derive(Serialize)]
-struct LogEntry<'a> {
+struct RequestLogEntry<'a> {
+    id: &'a str,
     timestamp: u64,
     url: &'a str,
     model: &'a str,
+    request: serde_json::Value,
+}
+
+#[derive(Serialize)]
+struct ResponseLogEntry<'a> {
+    id: &'a str,
+    timestamp: u64,
     status: u16,
     duration_ms: u128,
-    request: serde_json::Value,
     response: serde_json::Value,
 }
 
-fn log_file_path() -> Result<std::path::PathBuf> {
+fn logs_dir() -> Result<std::path::PathBuf> {
     let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("logs");
     std::fs::create_dir_all(&dir)
         .with_context(|| format!("не удалось создать директорию логов {}", dir.display()))?;
-    Ok(dir.join("requests.jsonl"))
+    Ok(dir)
 }
 
-fn log_request(entry: &LogEntry) {
-    let Ok(path) = log_file_path() else { return };
-    let Ok(line) = serde_json::to_string(entry) else {
-        return;
-    };
+fn append_log_line(file_name: &str, line: &str) {
+    let Ok(dir) = logs_dir() else { return };
     if let Ok(mut file) = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .open(&path)
+        .open(dir.join(file_name))
     {
         let _ = writeln!(file, "{line}");
     }
 }
 
+fn log_request(entry: &RequestLogEntry) {
+    if let Ok(line) = serde_json::to_string(entry) {
+        append_log_line("requests.jsonl", &line);
+    }
+}
+
+fn log_response(entry: &ResponseLogEntry) {
+    if let Ok(line) = serde_json::to_string(entry) {
+        append_log_line("responses.jsonl", &line);
+    }
+}
+
+fn unix_timestamp() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
 #[async_trait]
 impl Agent for HttpAgent {
     async fn ask(&self, history: &[Message]) -> Result<String> {
-        let messages = history
-            .iter()
-            .map(|m| ChatMessage {
-                role: match m.role {
-                    Role::User => "user",
-                    Role::Assistant => "assistant",
-                },
-                content: m.content.clone(),
-            })
-            .collect();
+        let mut messages = Vec::with_capacity(history.len() + 1);
+        if let Some(system_content) = self.system_prompt() {
+            messages.push(ChatMessage {
+                role: "system",
+                content: system_content,
+            });
+        }
+        messages.extend(history.iter().map(|m| ChatMessage {
+            role: match m.role {
+                Role::User => "user",
+                Role::Assistant => "assistant",
+            },
+            content: m.content.clone(),
+        }));
 
         let url = format!("{}/chat/completions", self.base_url.trim_end_matches('/'));
 
+        let active_format = self.response_format();
         let request_body = ChatRequest {
             model: &self.model,
             messages,
+            max_tokens: active_format.as_ref().and_then(|f| f.max_length),
+            stop: active_format.as_ref().and_then(|f| f.stop.clone()),
         };
         let request_json =
             serde_json::to_value(&request_body).unwrap_or(serde_json::Value::Null);
+
+        let request_id = format!(
+            "{}-{:x}",
+            unix_timestamp(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.subsec_nanos())
+                .unwrap_or(0)
+        );
+        log_request(&RequestLogEntry {
+            id: &request_id,
+            timestamp: unix_timestamp(),
+            url: &url,
+            model: &self.model,
+            request: request_json,
+        });
 
         let started_at = Instant::now();
         let response = self
@@ -149,16 +231,11 @@ impl Agent for HttpAgent {
 
         let response_json = serde_json::from_str::<serde_json::Value>(&body)
             .unwrap_or(serde_json::Value::String(body.clone()));
-        log_request(&LogEntry {
-            timestamp: SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map(|d| d.as_secs())
-                .unwrap_or(0),
-            url: &url,
-            model: &self.model,
+        log_response(&ResponseLogEntry {
+            id: &request_id,
+            timestamp: unix_timestamp(),
             status: status.as_u16(),
             duration_ms,
-            request: request_json,
             response: response_json,
         });
 

@@ -2,11 +2,28 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
+#[derive(Serialize, Deserialize, Default, Debug, Clone)]
+pub struct ResponseFormat {
+    /// Описание формата ответа (например: "отвечай маркированным списком")
+    pub description: Option<String>,
+    /// Ограничение на длину ответа в токенах (max_tokens)
+    pub max_length: Option<u32>,
+    /// Stop-последовательности: API оборвёт ответ, встретив одну из них
+    pub stop: Option<Vec<String>>,
+    /// Явная инструкция модели о том, когда завершать ответ
+    pub stop_instruction: Option<String>,
+}
+
 #[derive(Serialize, Deserialize, Default, Debug)]
 pub struct Config {
     pub api_key: Option<String>,
     pub base_url: Option<String>,
     pub model: Option<String>,
+    /// Режим ответа: false — дефолтный, true — кастомный (см. response_format)
+    #[serde(default)]
+    pub custom_response_mode: bool,
+    #[serde(default)]
+    pub response_format: ResponseFormat,
 }
 
 impl Config {
@@ -37,6 +54,15 @@ impl Config {
         std::fs::write(&path, content)
             .with_context(|| format!("не удалось записать конфиг {}", path.display()))?;
         Ok(())
+    }
+
+    /// Настройки формата ответа, если включён кастомный режим
+    pub fn active_response_format(&self) -> Option<&ResponseFormat> {
+        if self.custom_response_mode {
+            Some(&self.response_format)
+        } else {
+            None
+        }
     }
 
     pub fn masked_api_key(&self) -> String {

@@ -1,5 +1,6 @@
 use crate::agent::{Agent, HttpAgent, Message, Role};
 use crate::chats::{self, ChatSession};
+use crate::config::{Config, ResponseFormat};
 use crate::markdown::agent_skin;
 use ansi_to_tui::IntoText;
 use crossterm::{
@@ -13,11 +14,11 @@ use crossterm::{
 use futures::StreamExt;
 use ratatui::{
     backend::CrosstermBackend,
-    layout::{Constraint, Direction, Layout},
+    layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span, Text},
-    widgets::{Block, Borders, List, ListItem, Paragraph, Wrap},
-    Terminal,
+    widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap},
+    Frame, Terminal,
 };
 use std::io;
 use std::sync::Arc;
@@ -35,6 +36,125 @@ enum ChatEvent {
 enum Focus {
     Input,
     Sidebar,
+    Settings,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum FormatField {
+    Mode,
+    Description,
+    MaxLength,
+    Stop,
+    StopInstruction,
+}
+
+impl FormatField {
+    const ALL: [FormatField; 5] = [
+        FormatField::Mode,
+        FormatField::Description,
+        FormatField::MaxLength,
+        FormatField::Stop,
+        FormatField::StopInstruction,
+    ];
+
+    fn label(self) -> &'static str {
+        match self {
+            FormatField::Mode => "Режим",
+            FormatField::Description => "Описание формата",
+            FormatField::MaxLength => "Макс. длина ответа (токены)",
+            FormatField::Stop => "Stop-последовательности (через запятую)",
+            FormatField::StopInstruction => "Инструкция завершения ответа",
+        }
+    }
+}
+
+/// Состояние редактора настроек формата ответа.
+struct SettingsEditor {
+    custom_mode: bool,
+    description: String,
+    max_length: String,
+    stop: String,
+    stop_instruction: String,
+    field: usize,
+    error: Option<String>,
+}
+
+impl SettingsEditor {
+    fn from_format(format: Option<&ResponseFormat>) -> Self {
+        let custom_mode = format.is_some();
+        let format = format.cloned().unwrap_or_default();
+        Self {
+            custom_mode,
+            description: format.description.unwrap_or_default(),
+            max_length: format.max_length.map(|v| v.to_string()).unwrap_or_default(),
+            stop: format.stop.map(|v| v.join(", ")).unwrap_or_default(),
+            stop_instruction: format.stop_instruction.unwrap_or_default(),
+            field: 0,
+            error: None,
+        }
+    }
+
+    fn current_field(&self) -> FormatField {
+        FormatField::ALL[self.field]
+    }
+
+    fn move_focus(&mut self, delta: i32) {
+        let len = FormatField::ALL.len() as i32;
+        let next = (self.field as i32 + delta).rem_euclid(len);
+        self.field = next as usize;
+    }
+
+    fn field_value_mut(&mut self) -> Option<&mut String> {
+        match self.current_field() {
+            FormatField::Mode => None,
+            FormatField::Description => Some(&mut self.description),
+            FormatField::MaxLength => Some(&mut self.max_length),
+            FormatField::Stop => Some(&mut self.stop),
+            FormatField::StopInstruction => Some(&mut self.stop_instruction),
+        }
+    }
+
+    /// Собрать ResponseFormat из введённых значений. Возвращает ошибку текстом,
+    /// если "макс. длина" не парсится в число.
+    fn build(&mut self) -> Result<Option<ResponseFormat>, String> {
+        if !self.custom_mode {
+            return Ok(None);
+        }
+        let max_length = if self.max_length.trim().is_empty() {
+            None
+        } else {
+            Some(
+                self.max_length
+                    .trim()
+                    .parse::<u32>()
+                    .map_err(|_| "Макс. длина должна быть целым числом".to_string())?,
+            )
+        };
+        let stop: Vec<String> = self
+            .stop
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+        let description = non_empty(&self.description);
+        let stop_instruction = non_empty(&self.stop_instruction);
+
+        Ok(Some(ResponseFormat {
+            description,
+            max_length,
+            stop: if stop.is_empty() { None } else { Some(stop) },
+            stop_instruction,
+        }))
+    }
+}
+
+fn non_empty(s: &str) -> Option<String> {
+    let trimmed = s.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
 }
 
 pub async fn run(agent: HttpAgent) -> anyhow::Result<()> {
@@ -74,6 +194,7 @@ async fn run_app(
     let mut auto_scroll = true;
     let mut scroll_to_message: Option<usize> = None;
     let mut focus = Focus::Input;
+    let mut settings: Option<SettingsEditor> = None;
 
     let (tx, mut rx) = mpsc::unbounded_channel::<ChatEvent>();
     let mut events = EventStream::new();
@@ -221,10 +342,14 @@ async fn run_app(
             }
 
             let help = Paragraph::new(Line::from(Span::styled(
-                "Tab — переключить панель · Enter — отправить/выбрать чат · Ctrl+N — новый чат · Esc/Ctrl+C — выход",
+                "Tab — переключить панель · Ctrl+P — настройки ответа · Ctrl+N — новый чат · Esc/Ctrl+C — выход",
                 Style::default().fg(Color::DarkGray),
             )));
             f.render_widget(help, chunks[3]);
+
+            if let Some(editor) = &settings {
+                render_settings_popup(f, editor);
+            }
         })?;
 
         tokio::select! {
@@ -241,7 +366,7 @@ async fn run_app(
                             break;
                         }
                         if key.code == KeyCode::Char('n') && key.modifiers.contains(KeyModifiers::CONTROL) {
-                            if pending {
+                            if pending || focus == Focus::Settings {
                                 continue;
                             }
                             chats.insert(0, ChatSession::new());
@@ -250,14 +375,79 @@ async fn run_app(
                             focus = Focus::Input;
                             continue;
                         }
-                        if key.code == KeyCode::Tab {
+                        if key.code == KeyCode::Char('p') && key.modifiers.contains(KeyModifiers::CONTROL) {
+                            if pending {
+                                continue;
+                            }
+                            if focus == Focus::Settings {
+                                settings = None;
+                                focus = Focus::Input;
+                            } else {
+                                settings = Some(SettingsEditor::from_format(
+                                    agent.response_format().as_ref(),
+                                ));
+                                focus = Focus::Settings;
+                            }
+                            continue;
+                        }
+                        if key.code == KeyCode::Tab && focus != Focus::Settings {
                             focus = match focus {
                                 Focus::Input => Focus::Sidebar,
                                 Focus::Sidebar => Focus::Input,
+                                Focus::Settings => unreachable!(),
                             };
                             continue;
                         }
                         if pending {
+                            continue;
+                        }
+
+                        if focus == Focus::Settings {
+                            let editor = settings.as_mut().expect("settings focus implies editor");
+                            match key.code {
+                                KeyCode::Esc => {
+                                    settings = None;
+                                    focus = Focus::Input;
+                                }
+                                KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                                    match editor.build() {
+                                        Ok(format) => {
+                                            agent.set_response_format(format.clone());
+                                            if let Ok(mut config) = Config::load() {
+                                                config.custom_response_mode = format.is_some();
+                                                config.response_format = format.unwrap_or_default();
+                                                let _ = config.save();
+                                            }
+                                            settings = None;
+                                            focus = Focus::Input;
+                                        }
+                                        Err(err) => editor.error = Some(err),
+                                    }
+                                }
+                                KeyCode::Tab | KeyCode::Down => editor.move_focus(1),
+                                KeyCode::Up => editor.move_focus(-1),
+                                KeyCode::Left | KeyCode::Right
+                                    if editor.current_field() == FormatField::Mode =>
+                                {
+                                    editor.custom_mode = !editor.custom_mode;
+                                }
+                                KeyCode::Char(' ')
+                                    if editor.current_field() == FormatField::Mode =>
+                                {
+                                    editor.custom_mode = !editor.custom_mode;
+                                }
+                                KeyCode::Char(c) => {
+                                    if let Some(value) = editor.field_value_mut() {
+                                        value.push(c);
+                                    }
+                                }
+                                KeyCode::Backspace => {
+                                    if let Some(value) = editor.field_value_mut() {
+                                        value.pop();
+                                    }
+                                }
+                                _ => {}
+                            }
                             continue;
                         }
 
@@ -358,4 +548,77 @@ async fn run_app(
     }
 
     Ok(())
+}
+
+fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {
+    let width = width.min(area.width);
+    let height = height.min(area.height);
+    let x = area.x + (area.width.saturating_sub(width)) / 2;
+    let y = area.y + (area.height.saturating_sub(height)) / 2;
+    Rect::new(x, y, width, height)
+}
+
+fn render_settings_popup(f: &mut Frame, editor: &SettingsEditor) {
+    let area = centered_rect(70, 14, f.area());
+    f.render_widget(Clear, area);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan))
+        .title(" Настройки формата ответа (Ctrl+S — сохранить, Esc — отмена) ");
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    let mut lines: Vec<Line> = Vec::new();
+    for field in FormatField::ALL {
+        let selected = field == editor.current_field();
+        let label_style = if selected {
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Cyan)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::White).add_modifier(Modifier::BOLD)
+        };
+
+        let value = match field {
+            FormatField::Mode => {
+                if editor.custom_mode {
+                    "Кастомный (◀/▶ или Space — переключить)".to_string()
+                } else {
+                    "Дефолтный (◀/▶ или Space — переключить)".to_string()
+                }
+            }
+            FormatField::Description => editor.description.clone(),
+            FormatField::MaxLength => editor.max_length.clone(),
+            FormatField::Stop => editor.stop.clone(),
+            FormatField::StopInstruction => editor.stop_instruction.clone(),
+        };
+        let cursor = if selected && field != FormatField::Mode { "▏" } else { "" };
+
+        lines.push(Line::from(Span::styled(format!(" {} ", field.label()), label_style)));
+        lines.push(Line::from(Span::styled(
+            format!("   {value}{cursor}"),
+            Style::default().fg(if editor.custom_mode || field == FormatField::Mode {
+                Color::White
+            } else {
+                Color::DarkGray
+            }),
+        )));
+    }
+    if let Some(err) = &editor.error {
+        lines.push(Line::raw(""));
+        lines.push(Line::from(Span::styled(
+            format!("Ошибка: {err}"),
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        )));
+    }
+    lines.push(Line::raw(""));
+    lines.push(Line::from(Span::styled(
+        "Tab/↑/↓ — поле · буквы/Backspace — редактировать · Ctrl+S — сохранить · Esc — отмена",
+        Style::default().fg(Color::DarkGray),
+    )));
+
+    let content = Paragraph::new(Text::from(lines)).wrap(Wrap { trim: false });
+    f.render_widget(content, inner);
 }
