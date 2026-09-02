@@ -188,9 +188,28 @@ fn unix_timestamp() -> u64 {
         .unwrap_or(0)
 }
 
-#[async_trait]
-impl Agent for HttpAgent {
-    async fn ask(&self, history: &[Message]) -> Result<String> {
+fn request_id() -> String {
+    format!(
+        "{}-{:x}",
+        unix_timestamp(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.subsec_nanos())
+            .unwrap_or(0)
+    )
+}
+
+fn parse_api_error(status: reqwest::StatusCode, body: &str) -> anyhow::Error {
+    let detail = serde_json::from_str::<ApiErrorBody>(body)
+        .ok()
+        .and_then(|e| e.error)
+        .map(|e| e.message)
+        .unwrap_or_else(|| body.to_string());
+    anyhow::anyhow!("API вернул ошибку ({status}): {detail}")
+}
+
+impl HttpAgent {
+    fn build_messages(&self, history: &[Message]) -> Vec<ChatMessage> {
         let mut messages = Vec::with_capacity(history.len() + 1);
         if let Some(system_content) = self.system_prompt() {
             messages.push(ChatMessage {
@@ -205,12 +224,13 @@ impl Agent for HttpAgent {
             },
             content: m.content.clone(),
         }));
+        messages
+    }
 
-        let url = format!("{}/chat/completions", self.base_url.trim_end_matches('/'));
-
+    fn build_request(&self, messages: Vec<ChatMessage>) -> ChatRequest<'_> {
         let active_format = self.response_format();
         let sampling = self.sampling();
-        let request_body = ChatRequest {
+        ChatRequest {
             model: &self.model,
             messages,
             max_tokens: active_format.as_ref().and_then(|f| f.max_length),
@@ -220,22 +240,16 @@ impl Agent for HttpAgent {
             top_k: sampling.top_k,
             frequency_penalty: sampling.frequency_penalty,
             presence_penalty: sampling.presence_penalty,
-        };
-        let request_json =
-            serde_json::to_value(&request_body).unwrap_or(serde_json::Value::Null);
+        }
+    }
 
-        let request_id = format!(
-            "{}-{:x}",
-            unix_timestamp(),
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map(|d| d.subsec_nanos())
-                .unwrap_or(0)
-        );
+    async fn send_request(&self, url: &str, request_body: &ChatRequest<'_>) -> Result<String> {
+        let id = request_id();
+        let request_json = serde_json::to_value(request_body).unwrap_or(serde_json::Value::Null);
         log_request(&RequestLogEntry {
-            id: &request_id,
+            id: &id,
             timestamp: unix_timestamp(),
-            url: &url,
+            url,
             model: &self.model,
             request: request_json,
         });
@@ -243,9 +257,9 @@ impl Agent for HttpAgent {
         let started_at = Instant::now();
         let response = self
             .client
-            .post(&url)
+            .post(url)
             .bearer_auth(&self.api_key)
-            .json(&request_body)
+            .json(request_body)
             .send()
             .await
             .context("не удалось отправить запрос к API")?;
@@ -260,7 +274,7 @@ impl Agent for HttpAgent {
         let response_json = serde_json::from_str::<serde_json::Value>(&body)
             .unwrap_or(serde_json::Value::String(body.clone()));
         log_response(&ResponseLogEntry {
-            id: &request_id,
+            id: &id,
             timestamp: unix_timestamp(),
             status: status.as_u16(),
             duration_ms,
@@ -268,24 +282,33 @@ impl Agent for HttpAgent {
         });
 
         if !status.is_success() {
-            let detail = serde_json::from_str::<ApiErrorBody>(&body)
-                .ok()
-                .and_then(|e| e.error)
-                .map(|e| e.message)
-                .unwrap_or(body);
-            bail!("API вернул ошибку ({status}): {detail}");
+            bail!(parse_api_error(status, &body));
         }
 
-        let parsed: ChatResponse =
-            serde_json::from_str(&body).context("не удалось разобрать ответ API")?;
+        Ok(body)
+    }
+}
 
-        let answer = parsed
-            .choices
-            .into_iter()
-            .next()
-            .map(|c| c.message.content)
-            .context("ответ API не содержит вариантов")?;
+fn extract_answer(body: &str) -> Result<String> {
+    let parsed: ChatResponse =
+        serde_json::from_str(body).context("не удалось разобрать ответ API")?;
 
-        Ok(answer)
+    parsed
+        .choices
+        .into_iter()
+        .next()
+        .map(|c| c.message.content)
+        .context("ответ API не содержит вариантов")
+}
+
+#[async_trait]
+impl Agent for HttpAgent {
+    async fn ask(&self, history: &[Message]) -> Result<String> {
+        let messages = self.build_messages(history);
+        let url = format!("{}/chat/completions", self.base_url.trim_end_matches('/'));
+        let request_body = self.build_request(messages);
+
+        let body = self.send_request(&url, &request_body).await?;
+        extract_answer(&body)
     }
 }

@@ -266,380 +266,446 @@ pub async fn run(agent: HttpAgent) -> anyhow::Result<()> {
     result
 }
 
+/// Итог обработки одного события клавиатуры/канала на текущей итерации цикла.
+enum LoopControl {
+    Continue,
+    Break,
+}
+
+struct AppState {
+    chats: Vec<ChatSession>,
+    active: usize,
+    input: String,
+    pending: bool,
+    spinner_frame: usize,
+    scroll: u16,
+    auto_scroll: bool,
+    scroll_to_message: Option<usize>,
+    focus: Focus,
+    settings: Option<SettingsEditor>,
+}
+
 async fn run_app(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     agent: Arc<HttpAgent>,
 ) -> anyhow::Result<()> {
     let mut chats: Vec<ChatSession> = chats::list_chats().unwrap_or_default();
     chats.insert(0, ChatSession::new());
-    let mut active: usize = 0;
 
-    let mut input = String::new();
-    let mut pending = false;
-    let mut spinner_frame = 0usize;
-    let mut scroll: u16 = 0;
-    let mut auto_scroll = true;
-    let mut scroll_to_message: Option<usize> = None;
-    let mut focus = Focus::Input;
-    let mut settings: Option<SettingsEditor> = None;
+    let mut state = AppState {
+        chats,
+        active: 0,
+        input: String::new(),
+        pending: false,
+        spinner_frame: 0,
+        scroll: 0,
+        auto_scroll: true,
+        scroll_to_message: None,
+        focus: Focus::Input,
+        settings: None,
+    };
 
     let (tx, mut rx) = mpsc::unbounded_channel::<ChatEvent>();
     let mut events = EventStream::new();
     let mut tick = tokio::time::interval(Duration::from_millis(80));
 
     loop {
-        terminal.draw(|f| {
-            let outer = Layout::default()
-                .direction(Direction::Horizontal)
-                .constraints([Constraint::Length(28), Constraint::Min(20)])
-                .split(f.area());
-
-            let sidebar_items: Vec<ListItem> = chats
-                .iter()
-                .enumerate()
-                .map(|(i, chat)| {
-                    let is_active = i == active;
-                    let style = if is_active {
-                        Style::default()
-                            .fg(Color::Black)
-                            .bg(Color::Cyan)
-                            .add_modifier(Modifier::BOLD)
-                    } else {
-                        Style::default().fg(Color::White)
-                    };
-                    let prefix = if is_active { "● " } else { "  " };
-                    ListItem::new(Line::from(Span::styled(
-                        format!("{prefix}{}", chat.title),
-                        style,
-                    )))
-                })
-                .collect();
-
-            let sidebar_border_style = if focus == Focus::Sidebar {
-                Style::default().fg(Color::Cyan)
-            } else {
-                Style::default().fg(Color::DarkGray)
-            };
-            let sidebar = List::new(sidebar_items).block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .border_style(sidebar_border_style)
-                    .title(" Чаты (Ctrl+N — новый) "),
-            );
-            f.render_widget(sidebar, outer[0]);
-
-            let chunks = Layout::default()
-                .direction(Direction::Vertical)
-                .constraints([
-                    Constraint::Length(1),
-                    Constraint::Min(3),
-                    Constraint::Length(3),
-                    Constraint::Length(1),
-                ])
-                .split(outer[1]);
-
-            let title = Paragraph::new(Line::from(vec![
-                Span::styled(
-                    " agentcli ",
-                    Style::default()
-                        .fg(Color::Black)
-                        .bg(Color::Cyan)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::raw(format!("  {}", chats[active].title)),
-            ]));
-            f.render_widget(title, chunks[0]);
-
-            let mut lines: Vec<Line> = Vec::new();
-            let mut target_line: Option<u16> = None;
-            if chats[active].messages.is_empty() {
-                if let Ok(text) = BILLY_ART.into_text() {
-                    lines.extend(text.lines);
-                }
-                lines.push(Line::raw(""));
-                lines.push(Line::from(Span::styled(
-                    "        agent-cli — консольный AI-агент",
-                    Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
-                )));
-                lines.push(Line::raw(""));
-            }
-            for (i, entry) in chats[active].messages.iter().enumerate() {
-                if scroll_to_message == Some(i) {
-                    target_line = Some(lines.len() as u16);
-                }
-                let (label, color) = match entry.role {
-                    Role::User => ("Вы", Color::Green),
-                    Role::Assistant => ("Агент", Color::Cyan),
-                };
-                lines.push(Line::from(Span::styled(
-                    format!("● {label}"),
-                    Style::default().fg(color).add_modifier(Modifier::BOLD),
-                )));
-                let rendered = agent_skin().term_text(&entry.content).to_string();
-                match rendered.into_text() {
-                    Ok(text) => lines.extend(text.lines),
-                    Err(_) => lines.push(Line::raw(entry.content.clone())),
-                }
-                lines.push(Line::raw(""));
-            }
-            if pending {
-                lines.push(Line::from(Span::styled(
-                    format!("{} Агент думает...", SPINNER_FRAMES[spinner_frame]),
-                    Style::default().fg(Color::Magenta),
-                )));
-            }
-
-            let history_area = chunks[1];
-            let total_lines = lines.len() as u16;
-            let visible = history_area.height.saturating_sub(2);
-            if auto_scroll {
-                scroll = total_lines.saturating_sub(visible);
-            } else if let Some(target) = target_line {
-                scroll = target.min(total_lines.saturating_sub(visible));
-                scroll_to_message = None;
-            } else {
-                scroll = scroll.min(total_lines.saturating_sub(visible));
-            }
-
-            let history_widget = Paragraph::new(Text::from(lines))
-                .block(Block::default().borders(Borders::ALL).title(" История "))
-                .wrap(Wrap { trim: false })
-                .scroll((scroll, 0));
-            f.render_widget(history_widget, history_area);
-
-            let input_border_style = if focus == Focus::Input {
-                Style::default().fg(Color::Cyan)
-            } else {
-                Style::default().fg(Color::DarkGray)
-            };
-            let input_widget = Paragraph::new(input.as_str())
-                .style(Style::default().fg(Color::White))
-                .block(
-                    Block::default()
-                        .borders(Borders::ALL)
-                        .border_style(input_border_style)
-                        .title(" Сообщение "),
-                );
-            f.render_widget(input_widget, chunks[2]);
-            if !pending && focus == Focus::Input {
-                f.set_cursor_position((
-                    chunks[2].x + 1 + input.chars().count() as u16,
-                    chunks[2].y + 1,
-                ));
-            }
-
-            let help = Paragraph::new(Line::from(Span::styled(
-                "Tab — переключить панель · Ctrl+P — настройки ответа · Ctrl+N — новый чат · Esc/Ctrl+C — выход",
-                Style::default().fg(Color::DarkGray),
-            )));
-            f.render_widget(help, chunks[3]);
-
-            if let Some(editor) = &settings {
-                render_settings_popup(f, editor);
-            }
-        })?;
+        terminal.draw(|f| render_ui(f, &mut state))?;
 
         tokio::select! {
             _ = tick.tick() => {
-                if pending {
-                    spinner_frame = (spinner_frame + 1) % SPINNER_FRAMES.len();
+                if state.pending {
+                    state.spinner_frame = (state.spinner_frame + 1) % SPINNER_FRAMES.len();
                 }
             }
             maybe_event = events.next() => {
                 let Some(Ok(event)) = maybe_event else { continue };
-                match event {
-                    Event::Key(key) if key.kind == KeyEventKind::Press => {
-                        if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
-                            break;
-                        }
-                        if key.code == KeyCode::Char('n') && key.modifiers.contains(KeyModifiers::CONTROL) {
-                            if pending || focus == Focus::Settings {
-                                continue;
-                            }
-                            chats.insert(0, ChatSession::new());
-                            active = 0;
-                            auto_scroll = true;
-                            focus = Focus::Input;
-                            continue;
-                        }
-                        if key.code == KeyCode::Char('p') && key.modifiers.contains(KeyModifiers::CONTROL) {
-                            if pending {
-                                continue;
-                            }
-                            if focus == Focus::Settings {
-                                settings = None;
-                                focus = Focus::Input;
-                            } else {
-                                settings = Some(SettingsEditor::from_format(
-                                    agent.response_format().as_ref(),
-                                    &agent.sampling(),
-                                ));
-                                focus = Focus::Settings;
-                            }
-                            continue;
-                        }
-                        if key.code == KeyCode::Tab && focus != Focus::Settings {
-                            focus = match focus {
-                                Focus::Input => Focus::Sidebar,
-                                Focus::Sidebar => Focus::Input,
-                                Focus::Settings => unreachable!(),
-                            };
-                            continue;
-                        }
-                        if pending {
-                            continue;
-                        }
-
-                        if focus == Focus::Settings {
-                            let editor = settings.as_mut().expect("settings focus implies editor");
-                            match key.code {
-                                KeyCode::Esc => {
-                                    settings = None;
-                                    focus = Focus::Input;
-                                }
-                                KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                                    match editor.build().and_then(|format| {
-                                        editor.build_sampling().map(|sampling| (format, sampling))
-                                    }) {
-                                        Ok((format, sampling)) => {
-                                            agent.set_response_format(format.clone());
-                                            agent.set_sampling(sampling.clone());
-                                            if let Ok(mut config) = Config::load() {
-                                                config.custom_response_mode = format.is_some();
-                                                config.response_format = format.unwrap_or_default();
-                                                config.sampling = sampling;
-                                                let _ = config.save();
-                                            }
-                                            settings = None;
-                                            focus = Focus::Input;
-                                        }
-                                        Err(err) => editor.error = Some(err),
-                                    }
-                                }
-                                KeyCode::Tab | KeyCode::Down => editor.move_focus(1),
-                                KeyCode::Up => editor.move_focus(-1),
-                                KeyCode::Left | KeyCode::Right
-                                    if editor.current_field() == FormatField::Mode =>
-                                {
-                                    editor.custom_mode = !editor.custom_mode;
-                                }
-                                KeyCode::Char(' ')
-                                    if editor.current_field() == FormatField::Mode =>
-                                {
-                                    editor.custom_mode = !editor.custom_mode;
-                                }
-                                KeyCode::Char(c) => {
-                                    if let Some(value) = editor.field_value_mut() {
-                                        value.push(c);
-                                    }
-                                }
-                                KeyCode::Backspace => {
-                                    if let Some(value) = editor.field_value_mut() {
-                                        value.pop();
-                                    }
-                                }
-                                _ => {}
-                            }
-                            continue;
-                        }
-
-                        if focus == Focus::Sidebar {
-                            match key.code {
-                                KeyCode::Up => {
-                                    if active > 0 {
-                                        active -= 1;
-                                    }
-                                }
-                                KeyCode::Down => {
-                                    if active + 1 < chats.len() {
-                                        active += 1;
-                                    }
-                                }
-                                KeyCode::Enter => {
-                                    focus = Focus::Input;
-                                    auto_scroll = true;
-                                }
-                                KeyCode::Esc => break,
-                                _ => {}
-                            }
-                            continue;
-                        }
-
-                        match key.code {
-                            KeyCode::Enter => {
-                                let line = input.trim().to_string();
-                                input.clear();
-                                if line.is_empty() {
-                                    continue;
-                                }
-                                if line == "exit" || line == "quit" {
-                                    break;
-                                }
-                                chats[active].messages.push(Message { role: Role::User, content: line });
-                                chats[active].touch();
-                                let _ = chats::save_chat(&chats[active]);
-                                pending = true;
-                                auto_scroll = true;
-                                scroll_to_message = None;
-
-                                let agent = agent.clone();
-                                let hist = chats[active].messages.clone();
-                                let tx = tx.clone();
-                                tokio::spawn(async move {
-                                    let result = agent.ask(&hist).await;
-                                    let _ = tx.send(ChatEvent::Response(result));
-                                });
-                            }
-                            KeyCode::Esc => break,
-                            KeyCode::Char(c) => input.push(c),
-                            KeyCode::Backspace => {
-                                input.pop();
-                            }
-                            KeyCode::Up => {
-                                scroll = scroll.saturating_sub(1);
-                                auto_scroll = false;
-                            }
-                            KeyCode::Down => {
-                                scroll = scroll.saturating_add(1);
-                            }
-                            KeyCode::PageUp => {
-                                scroll = scroll.saturating_sub(10);
-                                auto_scroll = false;
-                            }
-                            KeyCode::PageDown => {
-                                scroll = scroll.saturating_add(10);
-                            }
-                            _ => {}
-                        }
-                    }
-                    _ => {}
+                if let Event::Key(key) = event
+                    && key.kind == KeyEventKind::Press
+                    && matches!(handle_key(key, &mut state, &agent, &tx), LoopControl::Break)
+                {
+                    break;
                 }
             }
             Some(chat_event) = rx.recv() => {
-                match chat_event {
-                    ChatEvent::Response(Ok(answer)) => {
-                        chats[active].messages.push(Message { role: Role::Assistant, content: answer });
-                        chats[active].touch();
-                        let _ = chats::save_chat(&chats[active]);
-                        pending = false;
-                        auto_scroll = false;
-                        scroll_to_message = Some(chats[active].messages.len() - 1);
-                    }
-                    ChatEvent::Response(Err(err)) => {
-                        chats[active].messages.push(Message {
-                            role: Role::Assistant,
-                            content: format!("Ошибка: {err}"),
-                        });
-                        pending = false;
-                        auto_scroll = false;
-                        scroll_to_message = Some(chats[active].messages.len() - 1);
-                    }
-                }
+                handle_chat_event(chat_event, &mut state);
             }
         }
     }
 
     Ok(())
+}
+
+/// Глобальные сочетания клавиш, работающие вне зависимости от фокуса/состояния "pending".
+fn handle_global_key(key: crossterm::event::KeyEvent, state: &mut AppState) -> Option<LoopControl> {
+    if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+        return Some(LoopControl::Break);
+    }
+    if key.code == KeyCode::Char('n') && key.modifiers.contains(KeyModifiers::CONTROL) {
+        if state.pending || state.focus == Focus::Settings {
+            return Some(LoopControl::Continue);
+        }
+        state.chats.insert(0, ChatSession::new());
+        state.active = 0;
+        state.auto_scroll = true;
+        state.focus = Focus::Input;
+        return Some(LoopControl::Continue);
+    }
+    None
+}
+
+fn handle_key(
+    key: crossterm::event::KeyEvent,
+    state: &mut AppState,
+    agent: &Arc<HttpAgent>,
+    tx: &mpsc::UnboundedSender<ChatEvent>,
+) -> LoopControl {
+    if let Some(control) = handle_global_key(key, state) {
+        return control;
+    }
+    if key.code == KeyCode::Char('p') && key.modifiers.contains(KeyModifiers::CONTROL) {
+        if state.pending {
+            return LoopControl::Continue;
+        }
+        if state.focus == Focus::Settings {
+            state.settings = None;
+            state.focus = Focus::Input;
+        } else {
+            state.settings = Some(SettingsEditor::from_format(
+                agent.response_format().as_ref(),
+                &agent.sampling(),
+            ));
+            state.focus = Focus::Settings;
+        }
+        return LoopControl::Continue;
+    }
+    if key.code == KeyCode::Tab && state.focus != Focus::Settings {
+        state.focus = match state.focus {
+            Focus::Input => Focus::Sidebar,
+            Focus::Sidebar => Focus::Input,
+            Focus::Settings => unreachable!(),
+        };
+        return LoopControl::Continue;
+    }
+    if state.pending {
+        return LoopControl::Continue;
+    }
+
+    match state.focus {
+        Focus::Settings => handle_settings_key(key, state, agent),
+        Focus::Sidebar => handle_sidebar_key(key, state),
+        Focus::Input => handle_input_key(key, state, agent, tx),
+    }
+}
+
+fn handle_settings_key(
+    key: crossterm::event::KeyEvent,
+    state: &mut AppState,
+    agent: &Arc<HttpAgent>,
+) -> LoopControl {
+    let editor = state.settings.as_mut().expect("settings focus implies editor");
+    match key.code {
+        KeyCode::Esc => {
+            state.settings = None;
+            state.focus = Focus::Input;
+        }
+        KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            match editor
+                .build()
+                .and_then(|format| editor.build_sampling().map(|sampling| (format, sampling)))
+            {
+                Ok((format, sampling)) => {
+                    agent.set_response_format(format.clone());
+                    agent.set_sampling(sampling.clone());
+                    if let Ok(mut config) = Config::load() {
+                        config.custom_response_mode = format.is_some();
+                        config.response_format = format.unwrap_or_default();
+                        config.sampling = sampling;
+                        let _ = config.save();
+                    }
+                    state.settings = None;
+                    state.focus = Focus::Input;
+                }
+                Err(err) => editor.error = Some(err),
+            }
+        }
+        KeyCode::Tab | KeyCode::Down => editor.move_focus(1),
+        KeyCode::Up => editor.move_focus(-1),
+        KeyCode::Left | KeyCode::Right if editor.current_field() == FormatField::Mode => {
+            editor.custom_mode = !editor.custom_mode;
+        }
+        KeyCode::Char(' ') if editor.current_field() == FormatField::Mode => {
+            editor.custom_mode = !editor.custom_mode;
+        }
+        KeyCode::Char(c) => {
+            if let Some(value) = editor.field_value_mut() {
+                value.push(c);
+            }
+        }
+        KeyCode::Backspace => {
+            if let Some(value) = editor.field_value_mut() {
+                value.pop();
+            }
+        }
+        _ => {}
+    }
+    LoopControl::Continue
+}
+
+fn handle_sidebar_key(key: crossterm::event::KeyEvent, state: &mut AppState) -> LoopControl {
+    match key.code {
+        KeyCode::Up => {
+            if state.active > 0 {
+                state.active -= 1;
+            }
+        }
+        KeyCode::Down => {
+            if state.active + 1 < state.chats.len() {
+                state.active += 1;
+            }
+        }
+        KeyCode::Enter => {
+            state.focus = Focus::Input;
+            state.auto_scroll = true;
+        }
+        KeyCode::Esc => return LoopControl::Break,
+        _ => {}
+    }
+    LoopControl::Continue
+}
+
+fn handle_input_key(
+    key: crossterm::event::KeyEvent,
+    state: &mut AppState,
+    agent: &Arc<HttpAgent>,
+    tx: &mpsc::UnboundedSender<ChatEvent>,
+) -> LoopControl {
+    match key.code {
+        KeyCode::Enter => {
+            let line = state.input.trim().to_string();
+            state.input.clear();
+            if line.is_empty() {
+                return LoopControl::Continue;
+            }
+            if line == "exit" || line == "quit" {
+                return LoopControl::Break;
+            }
+            state.chats[state.active]
+                .messages
+                .push(Message { role: Role::User, content: line });
+            state.chats[state.active].touch();
+            let _ = chats::save_chat(&state.chats[state.active]);
+            state.pending = true;
+            state.auto_scroll = true;
+            state.scroll_to_message = None;
+
+            let agent = agent.clone();
+            let hist = state.chats[state.active].messages.clone();
+            let tx = tx.clone();
+            tokio::spawn(async move {
+                let result = agent.ask(&hist).await;
+                let _ = tx.send(ChatEvent::Response(result));
+            });
+        }
+        KeyCode::Esc => return LoopControl::Break,
+        KeyCode::Char(c) => state.input.push(c),
+        KeyCode::Backspace => {
+            state.input.pop();
+        }
+        KeyCode::Up => {
+            state.scroll = state.scroll.saturating_sub(1);
+            state.auto_scroll = false;
+        }
+        KeyCode::Down => {
+            state.scroll = state.scroll.saturating_add(1);
+        }
+        KeyCode::PageUp => {
+            state.scroll = state.scroll.saturating_sub(10);
+            state.auto_scroll = false;
+        }
+        KeyCode::PageDown => {
+            state.scroll = state.scroll.saturating_add(10);
+        }
+        _ => {}
+    }
+    LoopControl::Continue
+}
+
+fn handle_chat_event(chat_event: ChatEvent, state: &mut AppState) {
+    let content = match chat_event {
+        ChatEvent::Response(Ok(answer)) => answer,
+        ChatEvent::Response(Err(err)) => format!("Ошибка: {err}"),
+    };
+    state.chats[state.active]
+        .messages
+        .push(Message { role: Role::Assistant, content });
+    state.chats[state.active].touch();
+    let _ = chats::save_chat(&state.chats[state.active]);
+    state.pending = false;
+    state.auto_scroll = false;
+    state.scroll_to_message = Some(state.chats[state.active].messages.len() - 1);
+}
+
+fn render_ui(f: &mut Frame, state: &mut AppState) {
+    let outer = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Length(28), Constraint::Min(20)])
+        .split(f.area());
+
+    render_sidebar(f, state, outer[0]);
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Min(3),
+            Constraint::Length(3),
+            Constraint::Length(1),
+        ])
+        .split(outer[1]);
+
+    render_title(f, state, chunks[0]);
+    render_history(f, state, chunks[1]);
+    render_input(f, state, chunks[2]);
+    render_help(f, chunks[3]);
+
+    if let Some(editor) = &state.settings {
+        render_settings_popup(f, editor);
+    }
+}
+
+fn render_sidebar(f: &mut Frame, state: &AppState, area: Rect) {
+    let sidebar_items: Vec<ListItem> = state
+        .chats
+        .iter()
+        .enumerate()
+        .map(|(i, chat)| {
+            let is_active = i == state.active;
+            let style = if is_active {
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::White)
+            };
+            let prefix = if is_active { "● " } else { "  " };
+            ListItem::new(Line::from(Span::styled(format!("{prefix}{}", chat.title), style)))
+        })
+        .collect();
+
+    let sidebar_border_style = if state.focus == Focus::Sidebar {
+        Style::default().fg(Color::Cyan)
+    } else {
+        Style::default().fg(Color::DarkGray)
+    };
+    let sidebar = List::new(sidebar_items).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(sidebar_border_style)
+            .title(" Чаты (Ctrl+N — новый) "),
+    );
+    f.render_widget(sidebar, area);
+}
+
+fn render_title(f: &mut Frame, state: &AppState, area: Rect) {
+    let title = Paragraph::new(Line::from(vec![
+        Span::styled(
+            " agentcli ",
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(format!("  {}", state.chats[state.active].title)),
+    ]));
+    f.render_widget(title, area);
+}
+
+fn render_history(f: &mut Frame, state: &mut AppState, area: Rect) {
+    let mut lines: Vec<Line> = Vec::new();
+    let mut target_line: Option<u16> = None;
+    if state.chats[state.active].messages.is_empty() {
+        if let Ok(text) = BILLY_ART.into_text() {
+            lines.extend(text.lines);
+        }
+        lines.push(Line::raw(""));
+        lines.push(Line::from(Span::styled(
+            "        agent-cli — консольный AI-агент",
+            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+        )));
+        lines.push(Line::raw(""));
+    }
+    for (i, entry) in state.chats[state.active].messages.iter().enumerate() {
+        if state.scroll_to_message == Some(i) {
+            target_line = Some(lines.len() as u16);
+        }
+        let (label, color) = match entry.role {
+            Role::User => ("Вы", Color::Green),
+            Role::Assistant => ("Агент", Color::Cyan),
+        };
+        lines.push(Line::from(Span::styled(
+            format!("● {label}"),
+            Style::default().fg(color).add_modifier(Modifier::BOLD),
+        )));
+        let rendered = agent_skin().term_text(&entry.content).to_string();
+        match rendered.into_text() {
+            Ok(text) => lines.extend(text.lines),
+            Err(_) => lines.push(Line::raw(entry.content.clone())),
+        }
+        lines.push(Line::raw(""));
+    }
+    if state.pending {
+        lines.push(Line::from(Span::styled(
+            format!("{} Агент думает...", SPINNER_FRAMES[state.spinner_frame]),
+            Style::default().fg(Color::Magenta),
+        )));
+    }
+
+    let total_lines = lines.len() as u16;
+    let visible = area.height.saturating_sub(2);
+    if state.auto_scroll {
+        state.scroll = total_lines.saturating_sub(visible);
+    } else if let Some(target) = target_line {
+        state.scroll = target.min(total_lines.saturating_sub(visible));
+        state.scroll_to_message = None;
+    } else {
+        state.scroll = state.scroll.min(total_lines.saturating_sub(visible));
+    }
+
+    let history_widget = Paragraph::new(Text::from(lines))
+        .block(Block::default().borders(Borders::ALL).title(" История "))
+        .wrap(Wrap { trim: false })
+        .scroll((state.scroll, 0));
+    f.render_widget(history_widget, area);
+}
+
+fn render_input(f: &mut Frame, state: &AppState, area: Rect) {
+    let input_border_style = if state.focus == Focus::Input {
+        Style::default().fg(Color::Cyan)
+    } else {
+        Style::default().fg(Color::DarkGray)
+    };
+    let input_widget = Paragraph::new(state.input.as_str())
+        .style(Style::default().fg(Color::White))
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(input_border_style)
+                .title(" Сообщение "),
+        );
+    f.render_widget(input_widget, area);
+    if !state.pending && state.focus == Focus::Input {
+        f.set_cursor_position((area.x + 1 + state.input.chars().count() as u16, area.y + 1));
+    }
+}
+
+fn render_help(f: &mut Frame, area: Rect) {
+    let help = Paragraph::new(Line::from(Span::styled(
+        "Tab — переключить панель · Ctrl+P — настройки ответа · Ctrl+N — новый чат · Esc/Ctrl+C — выход",
+        Style::default().fg(Color::DarkGray),
+    )));
+    f.render_widget(help, area);
 }
 
 fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {

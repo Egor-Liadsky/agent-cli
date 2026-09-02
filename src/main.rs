@@ -19,160 +19,183 @@ async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::Ask { prompt } => {
-            let config = Config::load()?;
-            let agent = HttpAgent::from_config(&config)?;
-            let history = vec![Message {
-                role: Role::User,
-                content: prompt,
-            }];
-            let answer = ask_with_spinner(&agent, &history).await?;
-            print_markdown(&answer);
-        }
-        Commands::Chat => {
-            let config = Config::load()?;
-            let agent = HttpAgent::from_config(&config)?;
-            tui::run(agent).await?;
-        }
-        Commands::Config { action } => match action {
-            ConfigAction::SetKey { key } => {
-                let mut config = Config::load()?;
-                config.api_key = Some(key);
-                config.save()?;
-                println!("{}", style("API key сохранён.").green().bold());
-            }
-            ConfigAction::Show => {
-                let config = Config::load()?;
-                println!(
-                    "{} {}",
-                    style("api_key: ").cyan().bold(),
-                    config.masked_api_key()
-                );
-                println!(
-                    "{} {}",
-                    style("base_url:").cyan().bold(),
-                    config.base_url.as_deref().unwrap_or("<не задан>")
-                );
-                println!(
-                    "{} {}",
-                    style("model:   ").cyan().bold(),
-                    config.model.as_deref().unwrap_or("<не задан>")
-                );
-                println!(
-                    "{} {}",
-                    style("режим ответа:").cyan().bold(),
-                    if config.custom_response_mode {
-                        "кастомный"
-                    } else {
-                        "дефолтный"
-                    }
-                );
-                print_response_format(&config.response_format);
-                print_sampling_params(&config.sampling);
-            }
-            ConfigAction::Format { action } => match action {
-                FormatAction::Set {
-                    description,
-                    max_length,
-                    stop,
-                    stop_instruction,
-                } => {
-                    let mut config = Config::load()?;
-                    if description.is_some() {
-                        config.response_format.description = description;
-                    }
-                    if max_length.is_some() {
-                        config.response_format.max_length = max_length;
-                    }
-                    if stop.is_some() {
-                        config.response_format.stop = stop;
-                    }
-                    if stop_instruction.is_some() {
-                        config.response_format.stop_instruction = stop_instruction;
-                    }
-                    config.custom_response_mode = true;
-                    config.save()?;
-                    println!(
-                        "{}",
-                        style("Настройки формата сохранены, кастомный режим включён.")
-                            .green()
-                            .bold()
-                    );
-                }
-                FormatAction::Enable => {
-                    let mut config = Config::load()?;
-                    config.custom_response_mode = true;
-                    config.save()?;
-                    println!("{}", style("Кастомный режим ответа включён.").green().bold());
-                }
-                FormatAction::Disable => {
-                    let mut config = Config::load()?;
-                    config.custom_response_mode = false;
-                    config.save()?;
-                    println!("{}", style("Кастомный режим ответа выключен.").green().bold());
-                }
-                FormatAction::Reset => {
-                    let mut config = Config::load()?;
-                    config.response_format = Default::default();
-                    config.custom_response_mode = false;
-                    config.save()?;
-                    println!("{}", style("Настройки формата сброшены.").green().bold());
-                }
-                FormatAction::Show => {
-                    let config = Config::load()?;
-                    println!(
-                        "{} {}",
-                        style("режим ответа:").cyan().bold(),
-                        if config.custom_response_mode {
-                            "кастомный"
-                        } else {
-                            "дефолтный"
-                        }
-                    );
-                    print_response_format(&config.response_format);
-                }
-            },
-            ConfigAction::Sampling { action } => match action {
-                SamplingAction::Set {
-                    temperature,
-                    top_p,
-                    top_k,
-                    frequency_penalty,
-                    presence_penalty,
-                } => {
-                    let mut config = Config::load()?;
-                    if temperature.is_some() {
-                        config.sampling.temperature = temperature;
-                    }
-                    if top_p.is_some() {
-                        config.sampling.top_p = top_p;
-                    }
-                    if top_k.is_some() {
-                        config.sampling.top_k = top_k;
-                    }
-                    if frequency_penalty.is_some() {
-                        config.sampling.frequency_penalty = frequency_penalty;
-                    }
-                    if presence_penalty.is_some() {
-                        config.sampling.presence_penalty = presence_penalty;
-                    }
-                    config.save()?;
-                    println!("{}", style("Параметры сэмплирования сохранены.").green().bold());
-                }
-                SamplingAction::Reset => {
-                    let mut config = Config::load()?;
-                    config.sampling = Default::default();
-                    config.save()?;
-                    println!("{}", style("Параметры сэмплирования сброшены.").green().bold());
-                }
-                SamplingAction::Show => {
-                    let config = Config::load()?;
-                    print_sampling_params(&config.sampling);
-                }
-            },
-        },
+        Commands::Ask { prompt } => run_ask(prompt).await?,
+        Commands::Chat => run_chat().await?,
+        Commands::Config { action } => run_config(action)?,
     }
 
+    Ok(())
+}
+
+async fn run_ask(prompt: String) -> anyhow::Result<()> {
+    let config = Config::load()?;
+    let agent = HttpAgent::from_config(&config)?;
+    let history = vec![Message {
+        role: Role::User,
+        content: prompt,
+    }];
+    let answer = ask_with_spinner(&agent, &history).await?;
+    print_markdown(&answer);
+    Ok(())
+}
+
+async fn run_chat() -> anyhow::Result<()> {
+    let config = Config::load()?;
+    let agent = HttpAgent::from_config(&config)?;
+    tui::run(agent).await
+}
+
+fn run_config(action: ConfigAction) -> anyhow::Result<()> {
+    match action {
+        ConfigAction::SetKey { key } => {
+            let mut config = Config::load()?;
+            config.api_key = Some(key);
+            config.save()?;
+            println!("{}", style("API key сохранён.").green().bold());
+        }
+        ConfigAction::Show => show_config()?,
+        ConfigAction::Format { action } => run_format_action(action)?,
+        ConfigAction::Sampling { action } => run_sampling_action(action)?,
+    }
+    Ok(())
+}
+
+fn show_config() -> anyhow::Result<()> {
+    let config = Config::load()?;
+    println!(
+        "{} {}",
+        style("api_key: ").cyan().bold(),
+        config.masked_api_key()
+    );
+    println!(
+        "{} {}",
+        style("base_url:").cyan().bold(),
+        config.base_url.as_deref().unwrap_or("<не задан>")
+    );
+    println!(
+        "{} {}",
+        style("model:   ").cyan().bold(),
+        config.model.as_deref().unwrap_or("<не задан>")
+    );
+    println!(
+        "{} {}",
+        style("режим ответа:").cyan().bold(),
+        if config.custom_response_mode {
+            "кастомный"
+        } else {
+            "дефолтный"
+        }
+    );
+    print_response_format(&config.response_format);
+    print_sampling_params(&config.sampling);
+    Ok(())
+}
+
+fn run_format_action(action: FormatAction) -> anyhow::Result<()> {
+    match action {
+        FormatAction::Set {
+            description,
+            max_length,
+            stop,
+            stop_instruction,
+        } => {
+            let mut config = Config::load()?;
+            if description.is_some() {
+                config.response_format.description = description;
+            }
+            if max_length.is_some() {
+                config.response_format.max_length = max_length;
+            }
+            if stop.is_some() {
+                config.response_format.stop = stop;
+            }
+            if stop_instruction.is_some() {
+                config.response_format.stop_instruction = stop_instruction;
+            }
+            config.custom_response_mode = true;
+            config.save()?;
+            println!(
+                "{}",
+                style("Настройки формата сохранены, кастомный режим включён.")
+                    .green()
+                    .bold()
+            );
+        }
+        FormatAction::Enable => {
+            let mut config = Config::load()?;
+            config.custom_response_mode = true;
+            config.save()?;
+            println!("{}", style("Кастомный режим ответа включён.").green().bold());
+        }
+        FormatAction::Disable => {
+            let mut config = Config::load()?;
+            config.custom_response_mode = false;
+            config.save()?;
+            println!("{}", style("Кастомный режим ответа выключен.").green().bold());
+        }
+        FormatAction::Reset => {
+            let mut config = Config::load()?;
+            config.response_format = Default::default();
+            config.custom_response_mode = false;
+            config.save()?;
+            println!("{}", style("Настройки формата сброшены.").green().bold());
+        }
+        FormatAction::Show => {
+            let config = Config::load()?;
+            println!(
+                "{} {}",
+                style("режим ответа:").cyan().bold(),
+                if config.custom_response_mode {
+                    "кастомный"
+                } else {
+                    "дефолтный"
+                }
+            );
+            print_response_format(&config.response_format);
+        }
+    }
+    Ok(())
+}
+
+fn run_sampling_action(action: SamplingAction) -> anyhow::Result<()> {
+    match action {
+        SamplingAction::Set {
+            temperature,
+            top_p,
+            top_k,
+            frequency_penalty,
+            presence_penalty,
+        } => {
+            let mut config = Config::load()?;
+            if temperature.is_some() {
+                config.sampling.temperature = temperature;
+            }
+            if top_p.is_some() {
+                config.sampling.top_p = top_p;
+            }
+            if top_k.is_some() {
+                config.sampling.top_k = top_k;
+            }
+            if frequency_penalty.is_some() {
+                config.sampling.frequency_penalty = frequency_penalty;
+            }
+            if presence_penalty.is_some() {
+                config.sampling.presence_penalty = presence_penalty;
+            }
+            config.save()?;
+            println!("{}", style("Параметры сэмплирования сохранены.").green().bold());
+        }
+        SamplingAction::Reset => {
+            let mut config = Config::load()?;
+            config.sampling = Default::default();
+            config.save()?;
+            println!("{}", style("Параметры сэмплирования сброшены.").green().bold());
+        }
+        SamplingAction::Show => {
+            let config = Config::load()?;
+            print_sampling_params(&config.sampling);
+        }
+    }
     Ok(())
 }
 
