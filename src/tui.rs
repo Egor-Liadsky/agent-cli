@@ -25,6 +25,7 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 
 const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+const BILLY_ART: &str = include_str!("assets/billy.ans");
 
 enum ChatEvent {
     Response(anyhow::Result<String>),
@@ -63,9 +64,7 @@ async fn run_app(
     agent: Arc<HttpAgent>,
 ) -> anyhow::Result<()> {
     let mut chats: Vec<ChatSession> = chats::list_chats().unwrap_or_default();
-    if chats.is_empty() {
-        chats.push(ChatSession::new());
-    }
+    chats.insert(0, ChatSession::new());
     let mut active: usize = 0;
 
     let mut input = String::new();
@@ -145,6 +144,17 @@ async fn run_app(
 
             let mut lines: Vec<Line> = Vec::new();
             let mut target_line: Option<u16> = None;
+            if chats[active].messages.is_empty() {
+                if let Ok(text) = BILLY_ART.into_text() {
+                    lines.extend(text.lines);
+                }
+                lines.push(Line::raw(""));
+                lines.push(Line::from(Span::styled(
+                    "        agent-cli — консольный AI-агент",
+                    Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                )));
+                lines.push(Line::raw(""));
+            }
             for (i, entry) in chats[active].messages.iter().enumerate() {
                 if scroll_to_message == Some(i) {
                     target_line = Some(lines.len() as u16);
