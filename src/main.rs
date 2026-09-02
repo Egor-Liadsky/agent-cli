@@ -7,7 +7,7 @@ mod tui;
 
 use agent::{Agent, HttpAgent, Message, Role};
 use clap::Parser;
-use cli::{Cli, Commands, ConfigAction, FormatAction};
+use cli::{Cli, Commands, ConfigAction, FormatAction, SamplingAction};
 use config::Config;
 use console::style;
 use indicatif::{ProgressBar, ProgressStyle};
@@ -68,6 +68,7 @@ async fn main() -> anyhow::Result<()> {
                     }
                 );
                 print_response_format(&config.response_format);
+                print_sampling_params(&config.sampling);
             }
             ConfigAction::Format { action } => match action {
                 FormatAction::Set {
@@ -131,6 +132,44 @@ async fn main() -> anyhow::Result<()> {
                     print_response_format(&config.response_format);
                 }
             },
+            ConfigAction::Sampling { action } => match action {
+                SamplingAction::Set {
+                    temperature,
+                    top_p,
+                    top_k,
+                    frequency_penalty,
+                    presence_penalty,
+                } => {
+                    let mut config = Config::load()?;
+                    if temperature.is_some() {
+                        config.sampling.temperature = temperature;
+                    }
+                    if top_p.is_some() {
+                        config.sampling.top_p = top_p;
+                    }
+                    if top_k.is_some() {
+                        config.sampling.top_k = top_k;
+                    }
+                    if frequency_penalty.is_some() {
+                        config.sampling.frequency_penalty = frequency_penalty;
+                    }
+                    if presence_penalty.is_some() {
+                        config.sampling.presence_penalty = presence_penalty;
+                    }
+                    config.save()?;
+                    println!("{}", style("Параметры сэмплирования сохранены.").green().bold());
+                }
+                SamplingAction::Reset => {
+                    let mut config = Config::load()?;
+                    config.sampling = Default::default();
+                    config.save()?;
+                    println!("{}", style("Параметры сэмплирования сброшены.").green().bold());
+                }
+                SamplingAction::Show => {
+                    let config = Config::load()?;
+                    print_sampling_params(&config.sampling);
+                }
+            },
         },
     }
 
@@ -168,6 +207,49 @@ fn print_response_format(format: &config::ResponseFormat) {
         "{} {}",
         style("stop-инструкция:").cyan().bold(),
         format.stop_instruction.as_deref().unwrap_or("<не задано>")
+    );
+}
+
+fn print_sampling_params(sampling: &config::SamplingParams) {
+    println!(
+        "{} {}",
+        style("temperature:       ").cyan().bold(),
+        sampling
+            .temperature
+            .map(|v| v.to_string())
+            .unwrap_or_else(|| "<не задано>".to_string())
+    );
+    println!(
+        "{} {}",
+        style("top_p:             ").cyan().bold(),
+        sampling
+            .top_p
+            .map(|v| v.to_string())
+            .unwrap_or_else(|| "<не задано>".to_string())
+    );
+    println!(
+        "{} {}",
+        style("top_k:             ").cyan().bold(),
+        sampling
+            .top_k
+            .map(|v| v.to_string())
+            .unwrap_or_else(|| "<не задано>".to_string())
+    );
+    println!(
+        "{} {}",
+        style("frequency_penalty: ").cyan().bold(),
+        sampling
+            .frequency_penalty
+            .map(|v| v.to_string())
+            .unwrap_or_else(|| "<не задано>".to_string())
+    );
+    println!(
+        "{} {}",
+        style("presence_penalty:  ").cyan().bold(),
+        sampling
+            .presence_penalty
+            .map(|v| v.to_string())
+            .unwrap_or_else(|| "<не задано>".to_string())
     );
 }
 

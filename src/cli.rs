@@ -37,6 +37,37 @@ pub enum ConfigAction {
         #[command(subcommand)]
         action: FormatAction,
     },
+    /// Настройка параметров сэмплирования (temperature, top_p, top_k и т.д.)
+    Sampling {
+        #[command(subcommand)]
+        action: SamplingAction,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum SamplingAction {
+    /// Задать параметры сэмплирования (обновляет только переданные поля)
+    Set {
+        /// Температура сэмплирования (обычно 0.0 - 2.0)
+        #[arg(long)]
+        temperature: Option<f32>,
+        /// Top-p (nucleus sampling), 0.0 - 1.0
+        #[arg(long = "top-p")]
+        top_p: Option<f32>,
+        /// Top-k сэмплирование
+        #[arg(long = "top-k")]
+        top_k: Option<u32>,
+        /// Штраф за частоту повторения токенов
+        #[arg(long = "frequency-penalty")]
+        frequency_penalty: Option<f32>,
+        /// Штраф за присутствие токена в тексте
+        #[arg(long = "presence-penalty")]
+        presence_penalty: Option<f32>,
+    },
+    /// Сбросить все параметры сэмплирования (вернуться к дефолтным значениям API)
+    Reset,
+    /// Показать текущие параметры сэмплирования
+    Show,
 }
 
 #[derive(Subcommand)]

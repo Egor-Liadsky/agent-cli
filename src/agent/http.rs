@@ -1,5 +1,5 @@
 use super::{Agent, Message, Role};
-use crate::config::{Config, ResponseFormat};
+use crate::config::{Config, ResponseFormat, SamplingParams};
 use anyhow::{bail, Context, Result};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -16,6 +16,7 @@ pub struct HttpAgent {
     base_url: String,
     model: String,
     response_format: RwLock<Option<ResponseFormat>>,
+    sampling: RwLock<SamplingParams>,
 }
 
 impl HttpAgent {
@@ -37,6 +38,7 @@ impl HttpAgent {
                 .clone()
                 .unwrap_or_else(|| DEFAULT_MODEL.to_string()),
             response_format: RwLock::new(config.active_response_format().cloned()),
+            sampling: RwLock::new(config.sampling.clone()),
         })
     }
 
@@ -48,6 +50,16 @@ impl HttpAgent {
     /// Обновить режим ответа "на лету", без перезапуска.
     pub fn set_response_format(&self, format: Option<ResponseFormat>) {
         *self.response_format.write().unwrap() = format;
+    }
+
+    /// Текущие параметры сэмплирования (temperature, top_p, top_k и т.д.).
+    pub fn sampling(&self) -> SamplingParams {
+        self.sampling.read().unwrap().clone()
+    }
+
+    /// Обновить параметры сэмплирования "на лету", без перезапуска.
+    pub fn set_sampling(&self, sampling: SamplingParams) {
+        *self.sampling.write().unwrap() = sampling;
     }
 
     /// Системный промпт с описанием формата и условием завершения ответа
@@ -78,6 +90,16 @@ struct ChatRequest<'a> {
     max_tokens: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     stop: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    temperature: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    top_p: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    top_k: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    frequency_penalty: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    presence_penalty: Option<f32>,
 }
 
 #[derive(Serialize)]
@@ -187,11 +209,17 @@ impl Agent for HttpAgent {
         let url = format!("{}/chat/completions", self.base_url.trim_end_matches('/'));
 
         let active_format = self.response_format();
+        let sampling = self.sampling();
         let request_body = ChatRequest {
             model: &self.model,
             messages,
             max_tokens: active_format.as_ref().and_then(|f| f.max_length),
             stop: active_format.as_ref().and_then(|f| f.stop.clone()),
+            temperature: sampling.temperature,
+            top_p: sampling.top_p,
+            top_k: sampling.top_k,
+            frequency_penalty: sampling.frequency_penalty,
+            presence_penalty: sampling.presence_penalty,
         };
         let request_json =
             serde_json::to_value(&request_body).unwrap_or(serde_json::Value::Null);

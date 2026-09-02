@@ -14,6 +14,20 @@ pub struct ResponseFormat {
     pub stop_instruction: Option<String>,
 }
 
+#[derive(Serialize, Deserialize, Default, Debug, Clone)]
+pub struct SamplingParams {
+    /// Температура сэмплирования (обычно 0.0 - 2.0)
+    pub temperature: Option<f32>,
+    /// Top-p (nucleus sampling), 0.0 - 1.0
+    pub top_p: Option<f32>,
+    /// Top-k сэмплирование
+    pub top_k: Option<u32>,
+    /// Штраф за частоту повторения токенов
+    pub frequency_penalty: Option<f32>,
+    /// Штраф за присутствие токена в тексте
+    pub presence_penalty: Option<f32>,
+}
+
 #[derive(Serialize, Deserialize, Default, Debug)]
 pub struct Config {
     pub api_key: Option<String>,
@@ -24,6 +38,9 @@ pub struct Config {
     pub custom_response_mode: bool,
     #[serde(default)]
     pub response_format: ResponseFormat,
+    /// Параметры сэмплирования модели (temperature, top_p, top_k и т.д.)
+    #[serde(default)]
+    pub sampling: SamplingParams,
 }
 
 impl Config {

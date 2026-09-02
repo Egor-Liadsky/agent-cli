@@ -1,6 +1,6 @@
 use crate::agent::{Agent, HttpAgent, Message, Role};
 use crate::chats::{self, ChatSession};
-use crate::config::{Config, ResponseFormat};
+use crate::config::{Config, ResponseFormat, SamplingParams};
 use crate::markdown::agent_skin;
 use ansi_to_tui::IntoText;
 use crossterm::{
@@ -46,15 +46,25 @@ enum FormatField {
     MaxLength,
     Stop,
     StopInstruction,
+    Temperature,
+    TopP,
+    TopK,
+    FrequencyPenalty,
+    PresencePenalty,
 }
 
 impl FormatField {
-    const ALL: [FormatField; 5] = [
+    const ALL: [FormatField; 10] = [
         FormatField::Mode,
         FormatField::Description,
         FormatField::MaxLength,
         FormatField::Stop,
         FormatField::StopInstruction,
+        FormatField::Temperature,
+        FormatField::TopP,
+        FormatField::TopK,
+        FormatField::FrequencyPenalty,
+        FormatField::PresencePenalty,
     ];
 
     fn label(self) -> &'static str {
@@ -64,7 +74,24 @@ impl FormatField {
             FormatField::MaxLength => "Макс. длина ответа (токены)",
             FormatField::Stop => "Stop-последовательности (через запятую)",
             FormatField::StopInstruction => "Инструкция завершения ответа",
+            FormatField::Temperature => "Temperature",
+            FormatField::TopP => "Top-p",
+            FormatField::TopK => "Top-k",
+            FormatField::FrequencyPenalty => "Frequency penalty",
+            FormatField::PresencePenalty => "Presence penalty",
         }
+    }
+
+    /// Поля, не зависящие от режима формата (доступны всегда).
+    fn is_sampling(self) -> bool {
+        matches!(
+            self,
+            FormatField::Temperature
+                | FormatField::TopP
+                | FormatField::TopK
+                | FormatField::FrequencyPenalty
+                | FormatField::PresencePenalty
+        )
     }
 }
 
@@ -75,12 +102,17 @@ struct SettingsEditor {
     max_length: String,
     stop: String,
     stop_instruction: String,
+    temperature: String,
+    top_p: String,
+    top_k: String,
+    frequency_penalty: String,
+    presence_penalty: String,
     field: usize,
     error: Option<String>,
 }
 
 impl SettingsEditor {
-    fn from_format(format: Option<&ResponseFormat>) -> Self {
+    fn from_format(format: Option<&ResponseFormat>, sampling: &SamplingParams) -> Self {
         let custom_mode = format.is_some();
         let format = format.cloned().unwrap_or_default();
         Self {
@@ -89,6 +121,17 @@ impl SettingsEditor {
             max_length: format.max_length.map(|v| v.to_string()).unwrap_or_default(),
             stop: format.stop.map(|v| v.join(", ")).unwrap_or_default(),
             stop_instruction: format.stop_instruction.unwrap_or_default(),
+            temperature: sampling.temperature.map(|v| v.to_string()).unwrap_or_default(),
+            top_p: sampling.top_p.map(|v| v.to_string()).unwrap_or_default(),
+            top_k: sampling.top_k.map(|v| v.to_string()).unwrap_or_default(),
+            frequency_penalty: sampling
+                .frequency_penalty
+                .map(|v| v.to_string())
+                .unwrap_or_default(),
+            presence_penalty: sampling
+                .presence_penalty
+                .map(|v| v.to_string())
+                .unwrap_or_default(),
             field: 0,
             error: None,
         }
@@ -111,6 +154,11 @@ impl SettingsEditor {
             FormatField::MaxLength => Some(&mut self.max_length),
             FormatField::Stop => Some(&mut self.stop),
             FormatField::StopInstruction => Some(&mut self.stop_instruction),
+            FormatField::Temperature => Some(&mut self.temperature),
+            FormatField::TopP => Some(&mut self.top_p),
+            FormatField::TopK => Some(&mut self.top_k),
+            FormatField::FrequencyPenalty => Some(&mut self.frequency_penalty),
+            FormatField::PresencePenalty => Some(&mut self.presence_penalty),
         }
     }
 
@@ -145,6 +193,45 @@ impl SettingsEditor {
             stop: if stop.is_empty() { None } else { Some(stop) },
             stop_instruction,
         }))
+    }
+
+    /// Собрать SamplingParams из введённых значений. Возвращает ошибку текстом,
+    /// если одно из числовых полей не парсится.
+    fn build_sampling(&mut self) -> Result<SamplingParams, String> {
+        fn parse_field(value: &str, label: &str) -> Result<Option<f32>, String> {
+            if value.trim().is_empty() {
+                Ok(None)
+            } else {
+                value
+                    .trim()
+                    .parse::<f32>()
+                    .map(Some)
+                    .map_err(|_| format!("{label} должно быть числом"))
+            }
+        }
+
+        let temperature = parse_field(&self.temperature, "Temperature")?;
+        let top_p = parse_field(&self.top_p, "Top-p")?;
+        let top_k = if self.top_k.trim().is_empty() {
+            None
+        } else {
+            Some(
+                self.top_k
+                    .trim()
+                    .parse::<u32>()
+                    .map_err(|_| "Top-k должно быть целым числом".to_string())?,
+            )
+        };
+        let frequency_penalty = parse_field(&self.frequency_penalty, "Frequency penalty")?;
+        let presence_penalty = parse_field(&self.presence_penalty, "Presence penalty")?;
+
+        Ok(SamplingParams {
+            temperature,
+            top_p,
+            top_k,
+            frequency_penalty,
+            presence_penalty,
+        })
     }
 }
 
@@ -385,6 +472,7 @@ async fn run_app(
                             } else {
                                 settings = Some(SettingsEditor::from_format(
                                     agent.response_format().as_ref(),
+                                    &agent.sampling(),
                                 ));
                                 focus = Focus::Settings;
                             }
@@ -410,12 +498,16 @@ async fn run_app(
                                     focus = Focus::Input;
                                 }
                                 KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                                    match editor.build() {
-                                        Ok(format) => {
+                                    match editor.build().and_then(|format| {
+                                        editor.build_sampling().map(|sampling| (format, sampling))
+                                    }) {
+                                        Ok((format, sampling)) => {
                                             agent.set_response_format(format.clone());
+                                            agent.set_sampling(sampling.clone());
                                             if let Ok(mut config) = Config::load() {
                                                 config.custom_response_mode = format.is_some();
                                                 config.response_format = format.unwrap_or_default();
+                                                config.sampling = sampling;
                                                 let _ = config.save();
                                             }
                                             settings = None;
@@ -559,13 +651,13 @@ fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {
 }
 
 fn render_settings_popup(f: &mut Frame, editor: &SettingsEditor) {
-    let area = centered_rect(70, 14, f.area());
+    let area = centered_rect(76, 26, f.area());
     f.render_widget(Clear, area);
 
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::Cyan))
-        .title(" Настройки формата ответа (Ctrl+S — сохранить, Esc — отмена) ");
+        .title(" Настройки ответа (Ctrl+S — сохранить, Esc — отмена) ");
     let inner = block.inner(area);
     f.render_widget(block, area);
 
@@ -593,17 +685,19 @@ fn render_settings_popup(f: &mut Frame, editor: &SettingsEditor) {
             FormatField::MaxLength => editor.max_length.clone(),
             FormatField::Stop => editor.stop.clone(),
             FormatField::StopInstruction => editor.stop_instruction.clone(),
+            FormatField::Temperature => editor.temperature.clone(),
+            FormatField::TopP => editor.top_p.clone(),
+            FormatField::TopK => editor.top_k.clone(),
+            FormatField::FrequencyPenalty => editor.frequency_penalty.clone(),
+            FormatField::PresencePenalty => editor.presence_penalty.clone(),
         };
         let cursor = if selected && field != FormatField::Mode { "▏" } else { "" };
+        let enabled = field.is_sampling() || field == FormatField::Mode || editor.custom_mode;
 
         lines.push(Line::from(Span::styled(format!(" {} ", field.label()), label_style)));
         lines.push(Line::from(Span::styled(
             format!("   {value}{cursor}"),
-            Style::default().fg(if editor.custom_mode || field == FormatField::Mode {
-                Color::White
-            } else {
-                Color::DarkGray
-            }),
+            Style::default().fg(if enabled { Color::White } else { Color::DarkGray }),
         )));
     }
     if let Some(err) = &editor.error {
