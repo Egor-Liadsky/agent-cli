@@ -20,6 +20,7 @@ use ratatui::{
     widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap},
     Frame, Terminal,
 };
+use std::collections::HashMap;
 use std::io;
 use std::sync::Arc;
 use std::time::Duration;
@@ -27,9 +28,11 @@ use tokio::sync::mpsc;
 
 const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 const BILLY_ART: &str = include_str!("assets/billy.ans");
+/// Максимум одновременно открытых на экране чатов (панелей).
+const MAX_PANES: usize = 3;
 
 enum ChatEvent {
-    Response(anyhow::Result<String>),
+    Response(String, anyhow::Result<String>),
 }
 
 #[derive(PartialEq)]
@@ -272,17 +275,59 @@ enum LoopControl {
     Break,
 }
 
-struct AppState {
-    chats: Vec<ChatSession>,
-    active: usize,
+/// Состояние ввода/прокрутки, привязанное к конкретному чату (по его id),
+/// а не к панели — так каждый открытый чат ведёт себя независимо.
+struct ChatUi {
     input: String,
     pending: bool,
-    spinner_frame: usize,
     scroll: u16,
     auto_scroll: bool,
     scroll_to_message: Option<usize>,
+}
+
+impl Default for ChatUi {
+    fn default() -> Self {
+        Self {
+            input: String::new(),
+            pending: false,
+            scroll: 0,
+            auto_scroll: true,
+            scroll_to_message: None,
+        }
+    }
+}
+
+struct AppState {
+    chats: Vec<ChatSession>,
+    chat_ui: HashMap<String, ChatUi>,
+    /// Id чатов, открытых сейчас на экране, по одной панели на элемент.
+    panes: Vec<String>,
+    active_pane: usize,
+    sidebar_selected: usize,
+    spinner_frame: usize,
     focus: Focus,
     settings: Option<SettingsEditor>,
+}
+
+impl AppState {
+    fn active_chat_id(&self) -> String {
+        self.panes[self.active_pane].clone()
+    }
+
+    fn chat_index(&self, id: &str) -> usize {
+        self.chats
+            .iter()
+            .position(|c| c.id == id)
+            .expect("панель ссылается на существующий чат")
+    }
+
+    fn is_pending(&self, id: &str) -> bool {
+        self.chat_ui.get(id).map(|u| u.pending).unwrap_or(false)
+    }
+
+    fn any_pane_pending(&self) -> bool {
+        self.panes.iter().any(|id| self.is_pending(id))
+    }
 }
 
 async fn run_app(
@@ -292,15 +337,19 @@ async fn run_app(
     let mut chats: Vec<ChatSession> = chats::list_chats().unwrap_or_default();
     chats.insert(0, ChatSession::new());
 
+    let mut chat_ui: HashMap<String, ChatUi> = HashMap::new();
+    for chat in &chats {
+        chat_ui.insert(chat.id.clone(), ChatUi::default());
+    }
+    let first_id = chats[0].id.clone();
+
     let mut state = AppState {
         chats,
-        active: 0,
-        input: String::new(),
-        pending: false,
+        chat_ui,
+        panes: vec![first_id],
+        active_pane: 0,
+        sidebar_selected: 0,
         spinner_frame: 0,
-        scroll: 0,
-        auto_scroll: true,
-        scroll_to_message: None,
         focus: Focus::Input,
         settings: None,
     };
@@ -314,7 +363,7 @@ async fn run_app(
 
         tokio::select! {
             _ = tick.tick() => {
-                if state.pending {
+                if state.any_pane_pending() {
                     state.spinner_frame = (state.spinner_frame + 1) % SPINNER_FRAMES.len();
                 }
             }
@@ -342,14 +391,46 @@ fn handle_global_key(key: crossterm::event::KeyEvent, state: &mut AppState) -> O
         return Some(LoopControl::Break);
     }
     if key.code == KeyCode::Char('n') && key.modifiers.contains(KeyModifiers::CONTROL) {
-        if state.pending || state.focus == Focus::Settings {
+        if state.focus == Focus::Settings || state.is_pending(&state.active_chat_id()) {
             return Some(LoopControl::Continue);
         }
-        state.chats.insert(0, ChatSession::new());
-        state.active = 0;
-        state.auto_scroll = true;
+        let chat = ChatSession::new();
+        let id = chat.id.clone();
+        state.chats.insert(0, chat);
+        state.chat_ui.insert(id.clone(), ChatUi::default());
+        state.panes[state.active_pane] = id;
+        state.sidebar_selected = 0;
         state.focus = Focus::Input;
         return Some(LoopControl::Continue);
+    }
+    if state.focus == Focus::Settings {
+        return None;
+    }
+    if key.code == KeyCode::Char('w') && key.modifiers.contains(KeyModifiers::CONTROL) {
+        if state.panes.len() > 1 {
+            state.panes.remove(state.active_pane);
+            if state.active_pane >= state.panes.len() {
+                state.active_pane = state.panes.len() - 1;
+            }
+        }
+        return Some(LoopControl::Continue);
+    }
+    if key.modifiers.contains(KeyModifiers::ALT) || key.modifiers.contains(KeyModifiers::SUPER) {
+        match key.code {
+            KeyCode::Right => {
+                if state.panes.len() > 1 {
+                    state.active_pane = (state.active_pane + 1) % state.panes.len();
+                }
+                return Some(LoopControl::Continue);
+            }
+            KeyCode::Left => {
+                if state.panes.len() > 1 {
+                    state.active_pane = (state.active_pane + state.panes.len() - 1) % state.panes.len();
+                }
+                return Some(LoopControl::Continue);
+            }
+            _ => {}
+        }
     }
     None
 }
@@ -364,9 +445,6 @@ fn handle_key(
         return control;
     }
     if key.code == KeyCode::Char('p') && key.modifiers.contains(KeyModifiers::CONTROL) {
-        if state.pending {
-            return LoopControl::Continue;
-        }
         if state.focus == Focus::Settings {
             state.settings = None;
             state.focus = Focus::Input;
@@ -387,14 +465,17 @@ fn handle_key(
         };
         return LoopControl::Continue;
     }
-    if state.pending {
-        return LoopControl::Continue;
-    }
 
     match state.focus {
         Focus::Settings => handle_settings_key(key, state, agent),
         Focus::Sidebar => handle_sidebar_key(key, state),
-        Focus::Input => handle_input_key(key, state, agent, tx),
+        Focus::Input => {
+            if state.is_pending(&state.active_chat_id()) {
+                LoopControl::Continue
+            } else {
+                handle_input_key(key, state, agent, tx)
+            }
+        }
     }
 }
 
@@ -455,18 +536,39 @@ fn handle_settings_key(
 fn handle_sidebar_key(key: crossterm::event::KeyEvent, state: &mut AppState) -> LoopControl {
     match key.code {
         KeyCode::Up => {
-            if state.active > 0 {
-                state.active -= 1;
+            if state.sidebar_selected > 0 {
+                state.sidebar_selected -= 1;
             }
         }
         KeyCode::Down => {
-            if state.active + 1 < state.chats.len() {
-                state.active += 1;
+            if state.sidebar_selected + 1 < state.chats.len() {
+                state.sidebar_selected += 1;
+            }
+        }
+        KeyCode::Left => {
+            if state.panes.len() > 1 {
+                state.active_pane = (state.active_pane + state.panes.len() - 1) % state.panes.len();
+            }
+        }
+        KeyCode::Right => {
+            if state.panes.len() > 1 {
+                state.active_pane = (state.active_pane + 1) % state.panes.len();
             }
         }
         KeyCode::Enter => {
+            let id = state.chats[state.sidebar_selected].id.clone();
+            state.panes[state.active_pane] = id;
             state.focus = Focus::Input;
-            state.auto_scroll = true;
+        }
+        KeyCode::Char('s') => {
+            let id = state.chats[state.sidebar_selected].id.clone();
+            if let Some(existing) = state.panes.iter().position(|p| p == &id) {
+                state.active_pane = existing;
+            } else if state.panes.len() < MAX_PANES {
+                state.panes.push(id);
+                state.active_pane = state.panes.len() - 1;
+            }
+            state.focus = Focus::Input;
         }
         KeyCode::Esc => return LoopControl::Break,
         _ => {}
@@ -480,51 +582,66 @@ fn handle_input_key(
     agent: &Arc<HttpAgent>,
     tx: &mpsc::UnboundedSender<ChatEvent>,
 ) -> LoopControl {
+    let chat_id = state.active_chat_id();
     match key.code {
         KeyCode::Enter => {
-            let line = state.input.trim().to_string();
-            state.input.clear();
+            let line = {
+                let ui = state.chat_ui.entry(chat_id.clone()).or_default();
+                let line = ui.input.trim().to_string();
+                ui.input.clear();
+                line
+            };
             if line.is_empty() {
                 return LoopControl::Continue;
             }
             if line == "exit" || line == "quit" {
                 return LoopControl::Break;
             }
-            state.chats[state.active]
+            let chat_index = state.chat_index(&chat_id);
+            state.chats[chat_index]
                 .messages
                 .push(Message { role: Role::User, content: line });
-            state.chats[state.active].touch();
-            let _ = chats::save_chat(&state.chats[state.active]);
-            state.pending = true;
-            state.auto_scroll = true;
-            state.scroll_to_message = None;
+            state.chats[chat_index].touch();
+            let _ = chats::save_chat(&state.chats[chat_index]);
+            {
+                let ui = state.chat_ui.entry(chat_id.clone()).or_default();
+                ui.pending = true;
+                ui.auto_scroll = true;
+                ui.scroll_to_message = None;
+            }
 
             let agent = agent.clone();
-            let hist = state.chats[state.active].messages.clone();
+            let hist = state.chats[chat_index].messages.clone();
             let tx = tx.clone();
+            let event_chat_id = chat_id.clone();
             tokio::spawn(async move {
                 let result = agent.ask(&hist).await;
-                let _ = tx.send(ChatEvent::Response(result));
+                let _ = tx.send(ChatEvent::Response(event_chat_id, result));
             });
         }
         KeyCode::Esc => return LoopControl::Break,
-        KeyCode::Char(c) => state.input.push(c),
+        KeyCode::Char(c) => {
+            state.chat_ui.entry(chat_id).or_default().input.push(c);
+        }
         KeyCode::Backspace => {
-            state.input.pop();
+            state.chat_ui.entry(chat_id).or_default().input.pop();
         }
         KeyCode::Up => {
-            state.scroll = state.scroll.saturating_sub(1);
-            state.auto_scroll = false;
+            let ui = state.chat_ui.entry(chat_id).or_default();
+            ui.scroll = ui.scroll.saturating_sub(1);
+            ui.auto_scroll = false;
         }
         KeyCode::Down => {
-            state.scroll = state.scroll.saturating_add(1);
+            state.chat_ui.entry(chat_id).or_default().scroll += 1;
         }
         KeyCode::PageUp => {
-            state.scroll = state.scroll.saturating_sub(10);
-            state.auto_scroll = false;
+            let ui = state.chat_ui.entry(chat_id).or_default();
+            ui.scroll = ui.scroll.saturating_sub(10);
+            ui.auto_scroll = false;
         }
         KeyCode::PageDown => {
-            state.scroll = state.scroll.saturating_add(10);
+            let ui = state.chat_ui.entry(chat_id).or_default();
+            ui.scroll = ui.scroll.saturating_add(10);
         }
         _ => {}
     }
@@ -532,18 +649,24 @@ fn handle_input_key(
 }
 
 fn handle_chat_event(chat_event: ChatEvent, state: &mut AppState) {
-    let content = match chat_event {
-        ChatEvent::Response(Ok(answer)) => answer,
-        ChatEvent::Response(Err(err)) => format!("Ошибка: {err}"),
+    let ChatEvent::Response(chat_id, result) = chat_event;
+    let content = match result {
+        Ok(answer) => answer,
+        Err(err) => format!("Ошибка: {err}"),
     };
-    state.chats[state.active]
+    let Some(chat_index) = state.chats.iter().position(|c| c.id == chat_id) else {
+        return;
+    };
+    state.chats[chat_index]
         .messages
         .push(Message { role: Role::Assistant, content });
-    state.chats[state.active].touch();
-    let _ = chats::save_chat(&state.chats[state.active]);
-    state.pending = false;
-    state.auto_scroll = false;
-    state.scroll_to_message = Some(state.chats[state.active].messages.len() - 1);
+    state.chats[chat_index].touch();
+    let _ = chats::save_chat(&state.chats[chat_index]);
+    let last_index = state.chats[chat_index].messages.len() - 1;
+    let ui = state.chat_ui.entry(chat_id).or_default();
+    ui.pending = false;
+    ui.auto_scroll = false;
+    ui.scroll_to_message = Some(last_index);
 }
 
 fn render_ui(f: &mut Frame, state: &mut AppState) {
@@ -554,24 +677,43 @@ fn render_ui(f: &mut Frame, state: &mut AppState) {
 
     render_sidebar(f, state, outer[0]);
 
-    let chunks = Layout::default()
+    let main = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(1),
-            Constraint::Min(3),
-            Constraint::Length(3),
-            Constraint::Length(1),
-        ])
+        .constraints([Constraint::Min(3), Constraint::Length(1)])
         .split(outer[1]);
 
-    render_title(f, state, chunks[0]);
-    render_history(f, state, chunks[1]);
-    render_input(f, state, chunks[2]);
-    render_help(f, chunks[3]);
+    let pane_count = state.panes.len().max(1) as u32;
+    let pane_constraints: Vec<Constraint> =
+        (0..pane_count).map(|_| Constraint::Ratio(1, pane_count)).collect();
+    let pane_areas = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints(pane_constraints)
+        .split(main[0]);
+
+    for (i, area) in pane_areas.iter().enumerate() {
+        render_pane(f, state, i, *area);
+    }
+
+    render_help(f, main[1]);
 
     if let Some(editor) = &state.settings {
         render_settings_popup(f, editor);
     }
+}
+
+fn render_pane(f: &mut Frame, state: &mut AppState, pane_idx: usize, area: Rect) {
+    let chat_id = state.panes[pane_idx].clone();
+    let chat_index = state.chat_index(&chat_id);
+    let is_active_pane = pane_idx == state.active_pane;
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(1), Constraint::Min(3), Constraint::Length(3)])
+        .split(area);
+
+    render_pane_title(f, state, chat_index, is_active_pane, chunks[0]);
+    render_history(f, state, &chat_id, chat_index, chunks[1]);
+    render_input(f, state, &chat_id, is_active_pane, chunks[2]);
 }
 
 fn render_sidebar(f: &mut Frame, state: &AppState, area: Rect) {
@@ -580,16 +722,23 @@ fn render_sidebar(f: &mut Frame, state: &AppState, area: Rect) {
         .iter()
         .enumerate()
         .map(|(i, chat)| {
-            let is_active = i == state.active;
-            let style = if is_active {
+            let pane_pos = state.panes.iter().position(|id| id == &chat.id);
+            let is_cursor = i == state.sidebar_selected;
+            let style = if is_cursor && state.focus == Focus::Sidebar {
                 Style::default()
                     .fg(Color::Black)
                     .bg(Color::Cyan)
                     .add_modifier(Modifier::BOLD)
+            } else if pane_pos.is_some() {
+                Style::default().fg(Color::Cyan)
             } else {
                 Style::default().fg(Color::White)
             };
-            let prefix = if is_active { "● " } else { "  " };
+            let prefix = match pane_pos {
+                Some(p) if p == state.active_pane => "● ",
+                Some(_) => "○ ",
+                None => "  ",
+            };
             ListItem::new(Line::from(Span::styled(format!("{prefix}{}", chat.title), style)))
         })
         .collect();
@@ -603,29 +752,49 @@ fn render_sidebar(f: &mut Frame, state: &AppState, area: Rect) {
         Block::default()
             .borders(Borders::ALL)
             .border_style(sidebar_border_style)
-            .title(" Чаты (Ctrl+N — новый) "),
+            .title(" Чаты (Enter — открыть, s — сплит) "),
     );
     f.render_widget(sidebar, area);
 }
 
-fn render_title(f: &mut Frame, state: &AppState, area: Rect) {
+fn render_pane_title(
+    f: &mut Frame,
+    state: &AppState,
+    chat_index: usize,
+    is_active_pane: bool,
+    area: Rect,
+) {
+    let badge_style = if is_active_pane {
+        Style::default()
+            .fg(Color::Black)
+            .bg(Color::Cyan)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default()
+            .fg(Color::Black)
+            .bg(Color::DarkGray)
+            .add_modifier(Modifier::BOLD)
+    };
     let title = Paragraph::new(Line::from(vec![
-        Span::styled(
-            " agentcli ",
-            Style::default()
-                .fg(Color::Black)
-                .bg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::raw(format!("  {}", state.chats[state.active].title)),
+        Span::styled(" agentcli ", badge_style),
+        Span::raw(format!("  {}", state.chats[chat_index].title)),
     ]));
     f.render_widget(title, area);
 }
 
-fn render_history(f: &mut Frame, state: &mut AppState, area: Rect) {
+fn render_history(
+    f: &mut Frame,
+    state: &mut AppState,
+    chat_id: &str,
+    chat_index: usize,
+    area: Rect,
+) {
+    let pending = state.is_pending(chat_id);
+    let scroll_to_message = state.chat_ui.get(chat_id).and_then(|u| u.scroll_to_message);
+
     let mut lines: Vec<Line> = Vec::new();
     let mut target_line: Option<u16> = None;
-    if state.chats[state.active].messages.is_empty() {
+    if state.chats[chat_index].messages.is_empty() && state.panes.len() == 1 {
         if let Ok(text) = BILLY_ART.into_text() {
             lines.extend(text.lines);
         }
@@ -636,8 +805,8 @@ fn render_history(f: &mut Frame, state: &mut AppState, area: Rect) {
         )));
         lines.push(Line::raw(""));
     }
-    for (i, entry) in state.chats[state.active].messages.iter().enumerate() {
-        if state.scroll_to_message == Some(i) {
+    for (i, entry) in state.chats[chat_index].messages.iter().enumerate() {
+        if scroll_to_message == Some(i) {
             target_line = Some(lines.len() as u16);
         }
         let (label, color) = match entry.role {
@@ -655,7 +824,7 @@ fn render_history(f: &mut Frame, state: &mut AppState, area: Rect) {
         }
         lines.push(Line::raw(""));
     }
-    if state.pending {
+    if pending {
         lines.push(Line::from(Span::styled(
             format!("{} Агент думает...", SPINNER_FRAMES[state.spinner_frame]),
             Style::default().fg(Color::Magenta),
@@ -664,45 +833,52 @@ fn render_history(f: &mut Frame, state: &mut AppState, area: Rect) {
 
     let total_lines = lines.len() as u16;
     let visible = area.height.saturating_sub(2);
-    if state.auto_scroll {
-        state.scroll = total_lines.saturating_sub(visible);
+    let ui = state.chat_ui.entry(chat_id.to_string()).or_default();
+    if ui.auto_scroll {
+        ui.scroll = total_lines.saturating_sub(visible);
     } else if let Some(target) = target_line {
-        state.scroll = target.min(total_lines.saturating_sub(visible));
-        state.scroll_to_message = None;
+        ui.scroll = target.min(total_lines.saturating_sub(visible));
+        ui.scroll_to_message = None;
     } else {
-        state.scroll = state.scroll.min(total_lines.saturating_sub(visible));
+        ui.scroll = ui.scroll.min(total_lines.saturating_sub(visible));
     }
+    let scroll = ui.scroll;
 
     let history_widget = Paragraph::new(Text::from(lines))
         .block(Block::default().borders(Borders::ALL).title(" История "))
         .wrap(Wrap { trim: false })
-        .scroll((state.scroll, 0));
+        .scroll((scroll, 0));
     f.render_widget(history_widget, area);
 }
 
-fn render_input(f: &mut Frame, state: &AppState, area: Rect) {
-    let input_border_style = if state.focus == Focus::Input {
+fn render_input(f: &mut Frame, state: &AppState, chat_id: &str, is_active_pane: bool, area: Rect) {
+    let typing = is_active_pane && state.focus == Focus::Input;
+    let input_border_style = if is_active_pane {
         Style::default().fg(Color::Cyan)
     } else {
         Style::default().fg(Color::DarkGray)
     };
-    let input_widget = Paragraph::new(state.input.as_str())
+    let ui = state.chat_ui.get(chat_id);
+    let input_text = ui.map(|u| u.input.as_str()).unwrap_or("");
+    let pending = ui.map(|u| u.pending).unwrap_or(false);
+    let title = if pending { " Сообщение (ожидание ответа...) " } else { " Сообщение " };
+    let input_widget = Paragraph::new(input_text)
         .style(Style::default().fg(Color::White))
         .block(
             Block::default()
                 .borders(Borders::ALL)
                 .border_style(input_border_style)
-                .title(" Сообщение "),
+                .title(title),
         );
     f.render_widget(input_widget, area);
-    if !state.pending && state.focus == Focus::Input {
-        f.set_cursor_position((area.x + 1 + state.input.chars().count() as u16, area.y + 1));
+    if !pending && typing {
+        f.set_cursor_position((area.x + 1 + input_text.chars().count() as u16, area.y + 1));
     }
 }
 
 fn render_help(f: &mut Frame, area: Rect) {
     let help = Paragraph::new(Line::from(Span::styled(
-        "Tab — переключить панель · Ctrl+P — настройки ответа · Ctrl+N — новый чат · Esc/Ctrl+C — выход",
+        "Tab — панель · в чатах ←/→ — окно, s — сплит · Ctrl+W — закрыть окно · Ctrl+P — настройки · Ctrl+N — новый чат · Esc/Ctrl+C — выход",
         Style::default().fg(Color::DarkGray),
     )));
     f.render_widget(help, area);
