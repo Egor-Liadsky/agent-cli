@@ -1,14 +1,15 @@
 mod agent;
 mod chats;
+mod clipboard;
 mod cli;
 mod config;
 mod markdown;
 mod tui;
 
-use agent::{Agent, HttpAgent, Message, Role};
+use agent::{Agent, AgentReply, HttpAgent, Message, MessageMeta};
 use clap::Parser;
 use cli::{Cli, Commands, ConfigAction, FormatAction, SamplingAction};
-use config::{Config, ReasoningMode};
+use config::{Config, ReasoningMode, ThinkingMode};
 use console::style;
 use indicatif::{ProgressBar, ProgressStyle};
 use markdown::agent_skin;
@@ -30,21 +31,23 @@ async fn main() -> anyhow::Result<()> {
 async fn run_ask(prompt: String) -> anyhow::Result<()> {
     let config = Config::load()?;
     let agent = HttpAgent::from_config(&config)?;
-    let history = vec![Message {
-        role: Role::User,
-        content: prompt,
-    }];
+    let history = vec![Message::user(prompt)];
     let settings = config.default_chat_settings();
-    let answer = ask_with_spinner(&agent, &history, &settings).await?;
-    print_markdown(&answer);
+    let reply = ask_with_spinner(&agent, &history, &settings).await?;
+    if let Some(reasoning) = &reply.reasoning {
+        println!("{}", style("Рассуждение:").magenta().bold());
+        print_markdown(reasoning);
+        println!();
+    }
+    print_markdown(&reply.content);
+    println!("{}", style(format_stats_line(&reply.meta)).dim());
     Ok(())
 }
 
 async fn run_chat() -> anyhow::Result<()> {
     let config = Config::load()?;
     let agent = HttpAgent::from_config(&config)?;
-    let defaults = config.default_chat_settings();
-    tui::run(agent, defaults).await
+    tui::run(agent).await
 }
 
 fn run_config(action: ConfigAction) -> anyhow::Result<()> {
@@ -58,7 +61,11 @@ fn run_config(action: ConfigAction) -> anyhow::Result<()> {
         ConfigAction::Show => show_config()?,
         ConfigAction::Format { action } => run_format_action(action)?,
         ConfigAction::Sampling { action } => run_sampling_action(action)?,
-        ConfigAction::Reasoning { mode, experts } => run_reasoning_action(mode, experts)?,
+        ConfigAction::Reasoning {
+            mode,
+            experts,
+            thinking,
+        } => run_reasoning_action(mode, experts, thinking)?,
     }
     Ok(())
 }
@@ -164,11 +171,17 @@ fn run_format_action(action: FormatAction) -> anyhow::Result<()> {
 fn run_reasoning_action(
     mode: Option<String>,
     experts: Option<Vec<String>>,
+    thinking: Option<String>,
 ) -> anyhow::Result<()> {
     let mut config = Config::load()?;
-    if mode.is_none() && experts.is_none() {
+    if mode.is_none() && experts.is_none() && thinking.is_none() {
         print_reasoning(&config);
         return Ok(());
+    }
+    if let Some(value) = thinking {
+        config.thinking = ThinkingMode::parse(&value).ok_or_else(|| {
+            anyhow::anyhow!("неизвестный режим thinking «{value}». Доступны: auto, on, off")
+        })?;
     }
     if let Some(value) = mode {
         config.reasoning = ReasoningMode::parse(&value).ok_or_else(|| {
@@ -196,6 +209,11 @@ fn print_reasoning(config: &Config) {
         "{} {}",
         style("стратегия рассуждения:").cyan().bold(),
         config.reasoning.label()
+    );
+    println!(
+        "{} {}",
+        style("режим thinking:      ").cyan().bold(),
+        config.thinking.label()
     );
     println!(
         "{} {}",
@@ -330,11 +348,57 @@ fn print_sampling_params(sampling: &config::SamplingParams) {
     );
 }
 
+/// Однострочная сводка: время отправки/получения, длительность, токены, скорость.
+fn format_stats_line(meta: &MessageMeta) -> String {
+    let mut parts = Vec::new();
+    if let (Some(sent), Some(received)) = (meta.sent_at, meta.received_at) {
+        parts.push(format!(
+            "{} → {}",
+            format_clock(sent),
+            format_clock(received)
+        ));
+    }
+    if let Some(ms) = meta.duration_ms {
+        parts.push(format!("{:.1} с", ms as f64 / 1000.0));
+    }
+    match (meta.prompt_tokens, meta.completion_tokens) {
+        (Some(prompt), Some(completion)) => {
+            parts.push(format!("токены ↑{prompt} ↓{completion}"))
+        }
+        (Some(prompt), None) => parts.push(format!("токены ↑{prompt}")),
+        (None, Some(completion)) => parts.push(format!("токены ↓{completion}")),
+        (None, None) => {}
+    }
+    if let Some(total) = meta.total_tokens {
+        parts.push(format!("всего {total}"));
+    }
+    if let Some(reasoning) = meta.reasoning_tokens {
+        parts.push(format!("рассуждение {reasoning}"));
+    }
+    if let Some(speed) = meta.tokens_per_second() {
+        parts.push(format!("{speed:.0} ток/с"));
+    }
+    if parts.is_empty() {
+        String::new()
+    } else {
+        parts.join(" · ")
+    }
+}
+
+fn format_clock(timestamp: i64) -> String {
+    use chrono::{Local, TimeZone};
+    Local
+        .timestamp_opt(timestamp, 0)
+        .single()
+        .map(|t| t.format("%H:%M:%S").to_string())
+        .unwrap_or_default()
+}
+
 async fn ask_with_spinner(
     agent: &HttpAgent,
     history: &[Message],
     settings: &config::ChatSettings,
-) -> anyhow::Result<String> {
+) -> anyhow::Result<AgentReply> {
     let spinner = ProgressBar::new_spinner();
     spinner.set_style(
         ProgressStyle::with_template("{spinner:.cyan} {msg}")

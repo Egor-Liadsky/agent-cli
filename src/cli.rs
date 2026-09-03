@@ -51,6 +51,9 @@ pub enum ConfigAction {
         /// "аналитик, инженер, критик". Пустая строка — состав по умолчанию
         #[arg(long, value_delimiter = ',')]
         experts: Option<Vec<String>>,
+        /// Встроенный режим thinking у модели: auto | on | off
+        #[arg(long)]
+        thinking: Option<String>,
     },
 }
 

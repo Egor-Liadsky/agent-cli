@@ -28,6 +28,56 @@ pub struct SamplingParams {
     pub presence_penalty: Option<f32>,
 }
 
+/// Встроенный режим размышления модели (thinking / reasoning_content).
+/// Это не стратегия промпта, а параметр запроса к API.
+#[derive(Serialize, Deserialize, Default, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum ThinkingMode {
+    /// Ничего не отправлять — модель решает сама (поведение API по умолчанию)
+    #[default]
+    Auto,
+    /// Явно включить размышление
+    Enabled,
+    /// Явно выключить размышление: ответ без цепочки рассуждений и без
+    /// токенов на неё
+    Disabled,
+}
+
+impl ThinkingMode {
+    pub const ALL: [ThinkingMode; 3] = [
+        ThinkingMode::Auto,
+        ThinkingMode::Enabled,
+        ThinkingMode::Disabled,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            ThinkingMode::Auto => "Авто (как решит модель)",
+            ThinkingMode::Enabled => "Включено",
+            ThinkingMode::Disabled => "Выключено",
+        }
+    }
+
+    /// Значение поля `thinking.type` в запросе. `None` — поле не отправляется,
+    /// чтобы не ломать провайдеров, которые его не знают.
+    pub fn api_value(self) -> Option<&'static str> {
+        match self {
+            ThinkingMode::Auto => None,
+            ThinkingMode::Enabled => Some("enabled"),
+            ThinkingMode::Disabled => Some("disabled"),
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<ThinkingMode> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "auto" | "авто" => Some(ThinkingMode::Auto),
+            "on" | "enabled" | "true" | "вкл" => Some(ThinkingMode::Enabled),
+            "off" | "disabled" | "false" | "выкл" => Some(ThinkingMode::Disabled),
+            _ => None,
+        }
+    }
+}
+
 /// Стратегия рассуждения агента: подмешивается в системный промпт чата.
 #[derive(Serialize, Deserialize, Default, Debug, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
@@ -127,6 +177,9 @@ pub struct ChatSettings {
     /// Стратегия рассуждения агента для этого чата
     #[serde(default)]
     pub reasoning: ReasoningMode,
+    /// Встроенное размышление модели для этого чата
+    #[serde(default)]
+    pub thinking: ThinkingMode,
     /// Состав группы экспертов для режима «Группа экспертов».
     /// Пустой список — состав по умолчанию (аналитик, инженер, критик).
     #[serde(default)]
@@ -165,6 +218,9 @@ pub struct Config {
     /// Стратегия рассуждения по умолчанию для новых чатов
     #[serde(default)]
     pub reasoning: ReasoningMode,
+    /// Режим встроенного размышления модели по умолчанию для новых чатов
+    #[serde(default)]
+    pub thinking: ThinkingMode,
     /// Состав группы экспертов по умолчанию для новых чатов
     #[serde(default)]
     pub experts: Vec<String>,
@@ -208,6 +264,7 @@ impl Config {
             response_format: self.response_format.clone(),
             sampling: self.sampling.clone(),
             reasoning: self.reasoning,
+            thinking: self.thinking,
             experts: self.experts.clone(),
         }
     }

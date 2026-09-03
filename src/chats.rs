@@ -29,8 +29,14 @@ impl ChatSession {
         }
     }
 
-    pub fn touch(&mut self) {
+    /// Обновить время изменения, не трогая заголовок: импортированный контекст
+    /// не должен становиться названием чата.
+    pub fn touch_quietly(&mut self) {
         self.updated_at = now();
+    }
+
+    pub fn touch(&mut self) {
+        self.touch_quietly();
         if self.title == DEFAULT_TITLE {
             if let Some(first_user) = self.messages.iter().find(|m| matches!(m.role, Role::User)) {
                 let mut title: String = first_user.content.chars().take(40).collect();
@@ -101,4 +107,44 @@ pub fn list_chats() -> Result<Vec<ChatSession>> {
     }
     chats.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
     Ok(chats)
+}
+
+/// Текст, которым история другого чата переносится в текущий одним блоком.
+pub fn context_block(chat: &ChatSession) -> String {
+    let mut block = format!("[Контекст из чата «{}»]\n", chat.title);
+    for message in &chat.messages {
+        let label = match message.role {
+            Role::User => "Вы",
+            Role::Assistant => "Агент",
+        };
+        block.push_str(&format!("{label}: {}\n", message.content));
+    }
+    block
+}
+
+pub fn delete_chat(id: &str) -> Result<()> {
+    let dir = chats_dir()?;
+    let path = chat_path(&dir, id);
+    if path.exists() {
+        std::fs::remove_file(&path)
+            .with_context(|| format!("не удалось удалить чат {}", path.display()))?;
+    }
+    Ok(())
+}
+
+/// Короткая метка времени последнего сообщения: время для сегодняшних чатов,
+/// дата — для более старых.
+pub fn last_activity_label(updated_at: u64) -> String {
+    use chrono::{Datelike, Local, TimeZone};
+    let Some(moment) = Local.timestamp_opt(updated_at as i64, 0).single() else {
+        return String::new();
+    };
+    let now = Local::now();
+    if moment.date_naive() == now.date_naive() {
+        moment.format("%H:%M").to_string()
+    } else if moment.year() == now.year() {
+        moment.format("%d.%m %H:%M").to_string()
+    } else {
+        moment.format("%d.%m.%y").to_string()
+    }
 }

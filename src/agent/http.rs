@@ -1,4 +1,4 @@
-use super::{Agent, Message, Role};
+use super::{Agent, AgentReply, Message, MessageMeta, Role};
 use crate::config::{ChatSettings, Config, ResponseFormat};
 use anyhow::{bail, Context, Result};
 use async_trait::async_trait;
@@ -85,6 +85,16 @@ struct ChatRequest<'a> {
     frequency_penalty: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     presence_penalty: Option<f32>,
+    /// Явное включение/выключение встроенного размышления модели.
+    /// Не отправляется в режиме «Авто»: не все провайдеры знают это поле.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    thinking: Option<Thinking>,
+}
+
+#[derive(Serialize)]
+struct Thinking {
+    #[serde(rename = "type")]
+    kind: &'static str,
 }
 
 #[derive(Serialize)]
@@ -96,6 +106,8 @@ struct ChatMessage {
 #[derive(Deserialize)]
 struct ChatResponse {
     choices: Vec<ChatChoice>,
+    #[serde(default)]
+    usage: Option<Usage>,
 }
 
 #[derive(Deserialize)]
@@ -106,6 +118,30 @@ struct ChatChoice {
 #[derive(Deserialize)]
 struct ChatResponseMessage {
     content: String,
+    /// Цепочка рассуждений: DeepSeek отдаёт её в `reasoning_content`,
+    /// OpenAI-совместимые прокси — в `reasoning`.
+    #[serde(default)]
+    reasoning_content: Option<String>,
+    #[serde(default)]
+    reasoning: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct Usage {
+    #[serde(default)]
+    prompt_tokens: Option<u32>,
+    #[serde(default)]
+    completion_tokens: Option<u32>,
+    #[serde(default)]
+    total_tokens: Option<u32>,
+    #[serde(default)]
+    completion_tokens_details: Option<CompletionTokensDetails>,
+}
+
+#[derive(Deserialize)]
+struct CompletionTokensDetails {
+    #[serde(default)]
+    reasoning_tokens: Option<u32>,
 }
 
 #[derive(Deserialize)]
@@ -229,10 +265,15 @@ impl HttpAgent {
             top_k: sampling.top_k,
             frequency_penalty: sampling.frequency_penalty,
             presence_penalty: sampling.presence_penalty,
+            thinking: settings.thinking.api_value().map(|kind| Thinking { kind }),
         }
     }
 
-    async fn send_request(&self, url: &str, request_body: &ChatRequest<'_>) -> Result<String> {
+    async fn send_request(
+        &self,
+        url: &str,
+        request_body: &ChatRequest<'_>,
+    ) -> Result<(String, MessageMeta)> {
         let id = request_id();
         let request_json = serde_json::to_value(request_body).unwrap_or(serde_json::Value::Null);
         log_request(&RequestLogEntry {
@@ -244,6 +285,7 @@ impl HttpAgent {
         });
 
         let started_at = Instant::now();
+        let sent_at = unix_timestamp() as i64;
         let response = self
             .client
             .post(url)
@@ -274,30 +316,57 @@ impl HttpAgent {
             bail!(parse_api_error(status, &body));
         }
 
-        Ok(body)
+        let meta = MessageMeta {
+            duration_ms: Some(duration_ms as u64),
+            sent_at: Some(sent_at),
+            received_at: Some(unix_timestamp() as i64),
+            ..MessageMeta::default()
+        };
+        Ok((body, meta))
     }
 }
 
-fn extract_answer(body: &str) -> Result<String> {
+fn extract_answer(body: &str, mut meta: MessageMeta) -> Result<AgentReply> {
     let parsed: ChatResponse =
         serde_json::from_str(body).context("не удалось разобрать ответ API")?;
 
-    parsed
+    if let Some(usage) = parsed.usage {
+        meta.prompt_tokens = usage.prompt_tokens;
+        meta.completion_tokens = usage.completion_tokens;
+        meta.total_tokens = usage.total_tokens;
+        meta.reasoning_tokens = usage
+            .completion_tokens_details
+            .and_then(|d| d.reasoning_tokens);
+    }
+
+    let message = parsed
         .choices
         .into_iter()
         .next()
-        .map(|c| c.message.content)
-        .context("ответ API не содержит вариантов")
+        .map(|c| c.message)
+        .context("ответ API не содержит вариантов")?;
+
+    let reasoning = message
+        .reasoning_content
+        .or(message.reasoning)
+        .map(|r| r.trim().to_string())
+        .filter(|r| !r.is_empty());
+
+    Ok(AgentReply {
+        content: message.content,
+        reasoning,
+        meta,
+    })
 }
 
 #[async_trait]
 impl Agent for HttpAgent {
-    async fn ask(&self, history: &[Message], settings: &ChatSettings) -> Result<String> {
+    async fn ask(&self, history: &[Message], settings: &ChatSettings) -> Result<AgentReply> {
         let messages = self.build_messages(history, settings);
         let url = format!("{}/chat/completions", self.base_url.trim_end_matches('/'));
         let request_body = self.build_request(messages, settings);
 
-        let body = self.send_request(&url, &request_body).await?;
-        extract_answer(&body)
+        let (body, meta) = self.send_request(&url, &request_body).await?;
+        extract_answer(&body, meta)
     }
 }

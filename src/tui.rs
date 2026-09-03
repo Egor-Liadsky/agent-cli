@@ -1,6 +1,6 @@
-use crate::agent::{Agent, HttpAgent, Message, Role};
+use crate::agent::{Agent, AgentReply, HttpAgent, Message, MessageMeta, Role};
 use crate::chats::{self, ChatSession};
-use crate::config::{ChatSettings, ReasoningMode, ResponseFormat, SamplingParams};
+use crate::config::{ChatSettings, ReasoningMode, ResponseFormat, SamplingParams, ThinkingMode};
 use crate::markdown::agent_skin;
 use ansi_to_tui::IntoText;
 use crossterm::{
@@ -23,7 +23,7 @@ use ratatui::{
 use std::collections::HashMap;
 use std::io;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 
 const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
@@ -32,7 +32,7 @@ const BILLY_ART: &str = include_str!("assets/billy.ans");
 const MAX_PANES: usize = 3;
 
 enum ChatEvent {
-    Response(String, anyhow::Result<String>),
+    Response(String, anyhow::Result<AgentReply>),
 }
 
 #[derive(PartialEq)]
@@ -40,12 +40,21 @@ enum Focus {
     Input,
     Sidebar,
     Settings,
+    Import,
+    Confirm,
+}
+
+/// Запрос подтверждения на удаление чата.
+struct DeleteConfirm {
+    chat_id: String,
+    chat_title: String,
 }
 
 #[derive(Clone, Copy, PartialEq)]
 enum FormatField {
     Mode,
     Reasoning,
+    Thinking,
     Experts,
     Description,
     MaxLength,
@@ -90,7 +99,11 @@ impl SettingsSection {
                 FormatField::Stop,
                 FormatField::StopInstruction,
             ],
-            SettingsSection::Reasoning => &[FormatField::Reasoning, FormatField::Experts],
+            SettingsSection::Reasoning => &[
+                FormatField::Thinking,
+                FormatField::Reasoning,
+                FormatField::Experts,
+            ],
             SettingsSection::Sampling => &[
                 FormatField::Temperature,
                 FormatField::TopP,
@@ -109,11 +122,73 @@ enum SettingsPane {
     Fields,
 }
 
+/// Один чат-кандидат в окне импорта контекста.
+struct ImportCandidate {
+    id: String,
+    title: String,
+    messages: usize,
+    selected: bool,
+}
+
+/// Состояние окна «импортировать контекст других чатов в текущий».
+struct ImportPicker {
+    /// Чат, в который переносится контекст.
+    target_id: String,
+    target_title: String,
+    candidates: Vec<ImportCandidate>,
+    cursor: usize,
+}
+
+impl ImportPicker {
+    /// Кандидаты — все чаты с историей, кроме самого целевого.
+    fn new(target: &ChatSession, chats: &[ChatSession]) -> Self {
+        let candidates = chats
+            .iter()
+            .filter(|chat| chat.id != target.id && !chat.messages.is_empty())
+            .map(|chat| ImportCandidate {
+                id: chat.id.clone(),
+                title: chat.title.clone(),
+                messages: chat.messages.len(),
+                selected: false,
+            })
+            .collect();
+        Self {
+            target_id: target.id.clone(),
+            target_title: target.title.clone(),
+            candidates,
+            cursor: 0,
+        }
+    }
+
+    fn move_cursor(&mut self, delta: i32) {
+        let len = self.candidates.len() as i32;
+        if len == 0 {
+            return;
+        }
+        self.cursor = (self.cursor as i32 + delta).rem_euclid(len) as usize;
+    }
+
+    fn toggle_current(&mut self) {
+        if let Some(candidate) = self.candidates.get_mut(self.cursor) {
+            candidate.selected = !candidate.selected;
+        }
+    }
+
+    fn selected_ids(&self) -> Vec<String> {
+        self.candidates
+            .iter()
+            .filter(|c| c.selected)
+            .map(|c| c.id.clone())
+            .collect()
+    }
+}
+
 impl FormatField {
     fn label(self) -> &'static str {
         match self {
             FormatField::Mode => "Режим",
             FormatField::Reasoning => "Стратегия рассуждения",
+            FormatField::Thinking => "Режим thinking у модели",
             FormatField::Experts => "Эксперты (через запятую, пусто — состав по умолчанию)",
             FormatField::Description => "Описание формата",
             FormatField::MaxLength => "Макс. длина ответа (токены)",
@@ -134,7 +209,10 @@ impl FormatField {
 
     /// Поля-переключатели: редактируются стрелками/пробелом, а не вводом текста.
     fn is_toggle(self) -> bool {
-        matches!(self, FormatField::Mode | FormatField::Reasoning)
+        matches!(
+            self,
+            FormatField::Mode | FormatField::Reasoning | FormatField::Thinking
+        )
     }
 
     /// Поля, не зависящие от режима формата (доступны всегда).
@@ -157,6 +235,7 @@ struct SettingsEditor {
     chat_title: String,
     custom_mode: bool,
     reasoning: ReasoningMode,
+    thinking: ThinkingMode,
     experts: String,
     description: String,
     max_length: String,
@@ -187,6 +266,7 @@ impl SettingsEditor {
             chat_title: chat.title.clone(),
             custom_mode,
             reasoning: settings.reasoning,
+            thinking: settings.thinking,
             experts: settings.experts.join(", "),
             description: format.description.unwrap_or_default(),
             max_length: format.max_length.map(|v| v.to_string()).unwrap_or_default(),
@@ -288,11 +368,19 @@ impl SettingsEditor {
         self.field = self.field.min(len.saturating_sub(1));
     }
 
+    fn cycle_thinking(&mut self, delta: i32) {
+        let modes = ThinkingMode::ALL;
+        let len = modes.len() as i32;
+        let current = modes.iter().position(|m| *m == self.thinking).unwrap_or(0) as i32;
+        self.thinking = modes[(current + delta).rem_euclid(len) as usize];
+    }
+
     /// Сбросить текущее поле к значению по умолчанию.
     fn reset_field(&mut self) {
         match self.current_field() {
             Some(FormatField::Mode) => self.custom_mode = false,
             Some(FormatField::Reasoning) => self.reasoning = ReasoningMode::default(),
+            Some(FormatField::Thinking) => self.thinking = ThinkingMode::default(),
             _ => {
                 if let Some(value) = self.field_value_mut() {
                     value.clear();
@@ -303,7 +391,7 @@ impl SettingsEditor {
 
     fn field_value_mut(&mut self) -> Option<&mut String> {
         match self.current_field()? {
-            FormatField::Mode | FormatField::Reasoning => None,
+            FormatField::Mode | FormatField::Reasoning | FormatField::Thinking => None,
             FormatField::Experts => Some(&mut self.experts),
             FormatField::Description => Some(&mut self.description),
             FormatField::MaxLength => Some(&mut self.max_length),
@@ -416,7 +504,7 @@ fn non_empty(s: &str) -> Option<String> {
     }
 }
 
-pub async fn run(agent: HttpAgent, default_settings: ChatSettings) -> anyhow::Result<()> {
+pub async fn run(agent: HttpAgent) -> anyhow::Result<()> {
     let agent = Arc::new(agent);
 
     enable_raw_mode()?;
@@ -425,7 +513,7 @@ pub async fn run(agent: HttpAgent, default_settings: ChatSettings) -> anyhow::Re
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    let result = run_app(&mut terminal, agent, default_settings).await;
+    let result = run_app(&mut terminal, agent).await;
 
     disable_raw_mode()?;
     execute!(
@@ -449,7 +537,10 @@ enum LoopControl {
 struct ChatUi {
     input: String,
     pending: bool,
+    /// Момент отправки запроса: из него считается таймер ожидания ответа.
+    pending_since: Option<Instant>,
     scroll: u16,
+    max_scroll: u16,
     auto_scroll: bool,
     scroll_to_message: Option<usize>,
 }
@@ -459,7 +550,9 @@ impl Default for ChatUi {
         Self {
             input: String::new(),
             pending: false,
+            pending_since: None,
             scroll: 0,
+            max_scroll: 0,
             auto_scroll: true,
             scroll_to_message: None,
         }
@@ -476,8 +569,14 @@ struct AppState {
     spinner_frame: usize,
     focus: Focus,
     settings: Option<SettingsEditor>,
-    /// Параметры для новых чатов (из глобального конфига).
-    default_settings: ChatSettings,
+    /// Окно импорта контекста, если оно открыто.
+    import: Option<ImportPicker>,
+    /// Запрос подтверждения удаления чата, если он открыт.
+    delete_confirm: Option<DeleteConfirm>,
+    /// Короткое уведомление внизу экрана (например, «скопировано»).
+    notice: Option<(String, Instant)>,
+    /// Показывать ли цепочку рассуждений модели в истории.
+    show_reasoning: bool,
 }
 
 impl AppState {
@@ -499,15 +598,44 @@ impl AppState {
     fn any_pane_pending(&self) -> bool {
         self.panes.iter().any(|id| self.is_pending(id))
     }
+
+    fn notify(&mut self, text: impl Into<String>) {
+        self.notice = Some((text.into(), Instant::now()));
+    }
+
+    /// Уведомление живёт пару секунд, дальше снова показываем подсказки.
+    fn active_notice(&self) -> Option<&str> {
+        self.notice
+            .as_ref()
+            .filter(|(_, at)| at.elapsed() < Duration::from_secs(2))
+            .map(|(text, _)| text.as_str())
+    }
+
+    /// Текст, введённый пользователем в активной панели.
+    fn active_input(&self) -> &str {
+        self.chat_ui.get(&self.panes[self.active_pane]).map(|u| u.input.as_str()).unwrap_or("")
+    }
+
+    fn insert_into_input(&mut self, text: &str) {
+        if matches!(self.focus, Focus::Settings | Focus::Import | Focus::Confirm) {
+            return;
+        }
+        let chat_id = self.active_chat_id();
+        if self.is_pending(&chat_id) {
+            return;
+        }
+        // многострочная вставка схлопывается в пробелы: поле ввода однострочное
+        let flat = text.replace(['\n', '\r'], " ");
+        self.chat_ui.entry(chat_id).or_default().input.push_str(&flat);
+    }
 }
 
 async fn run_app(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     agent: Arc<HttpAgent>,
-    default_settings: ChatSettings,
 ) -> anyhow::Result<()> {
     let mut chats: Vec<ChatSession> = chats::list_chats().unwrap_or_default();
-    chats.insert(0, ChatSession::new(default_settings.clone()));
+    chats.insert(0, ChatSession::new(ChatSettings::default()));
 
     let mut chat_ui: HashMap<String, ChatUi> = HashMap::new();
     for chat in &chats {
@@ -524,7 +652,10 @@ async fn run_app(
         spinner_frame: 0,
         focus: Focus::Input,
         settings: None,
-        default_settings,
+        import: None,
+        delete_confirm: None,
+        notice: None,
+        show_reasoning: true,
     };
 
     let (tx, mut rx) = mpsc::unbounded_channel::<ChatEvent>();
@@ -542,11 +673,15 @@ async fn run_app(
             }
             maybe_event = events.next() => {
                 let Some(Ok(event)) = maybe_event else { continue };
-                if let Event::Key(key) = event
-                    && key.kind == KeyEventKind::Press
-                    && matches!(handle_key(key, &mut state, &agent, &tx), LoopControl::Break)
-                {
-                    break;
+                match event {
+                    Event::Key(key) if key.kind == KeyEventKind::Press => {
+                        if matches!(handle_key(key, &mut state, &agent, &tx), LoopControl::Break) {
+                            break;
+                        }
+                    }
+                    // вставка из буфера обмена приходит одним событием (bracketed paste)
+                    Event::Paste(text) => state.insert_into_input(&text),
+                    _ => {}
                 }
             }
             Some(chat_event) = rx.recv() => {
@@ -564,10 +699,12 @@ fn handle_global_key(key: crossterm::event::KeyEvent, state: &mut AppState) -> O
         return Some(LoopControl::Break);
     }
     if key.code == KeyCode::Char('n') && key.modifiers.contains(KeyModifiers::CONTROL) {
-        if state.focus == Focus::Settings || state.is_pending(&state.active_chat_id()) {
+        if matches!(state.focus, Focus::Settings | Focus::Import | Focus::Confirm)
+            || state.is_pending(&state.active_chat_id())
+        {
             return Some(LoopControl::Continue);
         }
-        let chat = ChatSession::new(state.default_settings.clone());
+        let chat = ChatSession::new(ChatSettings::default());
         let id = chat.id.clone();
         state.chats.insert(0, chat);
         state.chat_ui.insert(id.clone(), ChatUi::default());
@@ -576,7 +713,28 @@ fn handle_global_key(key: crossterm::event::KeyEvent, state: &mut AppState) -> O
         state.focus = Focus::Input;
         return Some(LoopControl::Continue);
     }
-    if state.focus == Focus::Settings {
+    if key.code == KeyCode::Char('y') && key.modifiers.contains(KeyModifiers::CONTROL) {
+        let text = state.active_input().to_string();
+        if text.is_empty() {
+            state.notify("Поле ввода пустое — копировать нечего");
+        } else {
+            match crate::clipboard::copy(&text) {
+                Ok(()) => state.notify("Текст ввода скопирован в буфер обмена"),
+                Err(err) => state.notify(format!("Не удалось скопировать: {err}")),
+            }
+        }
+        return Some(LoopControl::Continue);
+    }
+    if key.code == KeyCode::Char('r') && key.modifiers.contains(KeyModifiers::CONTROL) {
+        state.show_reasoning = !state.show_reasoning;
+        state.notify(if state.show_reasoning {
+            "Рассуждение модели показано"
+        } else {
+            "Рассуждение модели скрыто"
+        });
+        return Some(LoopControl::Continue);
+    }
+    if matches!(state.focus, Focus::Settings | Focus::Import | Focus::Confirm) {
         return None;
     }
     if key.code == KeyCode::Char('w') && key.modifiers.contains(KeyModifiers::CONTROL) {
@@ -617,7 +775,21 @@ fn handle_key(
     if let Some(control) = handle_global_key(key, state) {
         return control;
     }
+    if key.code == KeyCode::Char('o') && key.modifiers.contains(KeyModifiers::CONTROL) {
+        if state.focus == Focus::Import {
+            state.import = None;
+            state.focus = Focus::Input;
+        } else if !matches!(state.focus, Focus::Settings | Focus::Confirm) {
+            let chat_index = state.chat_index(&state.active_chat_id());
+            state.import = Some(ImportPicker::new(&state.chats[chat_index], &state.chats));
+            state.focus = Focus::Import;
+        }
+        return LoopControl::Continue;
+    }
     if key.code == KeyCode::Char('p') && key.modifiers.contains(KeyModifiers::CONTROL) {
+        if matches!(state.focus, Focus::Import | Focus::Confirm) {
+            return LoopControl::Continue;
+        }
         if state.focus == Focus::Settings {
             state.settings = None;
             state.focus = Focus::Input;
@@ -628,17 +800,19 @@ fn handle_key(
         }
         return LoopControl::Continue;
     }
-    if key.code == KeyCode::Tab && state.focus != Focus::Settings {
+    if key.code == KeyCode::Tab && !matches!(state.focus, Focus::Settings | Focus::Import | Focus::Confirm) {
         state.focus = match state.focus {
             Focus::Input => Focus::Sidebar,
             Focus::Sidebar => Focus::Input,
-            Focus::Settings => unreachable!(),
+            Focus::Settings | Focus::Import | Focus::Confirm => unreachable!(),
         };
         return LoopControl::Continue;
     }
 
     match state.focus {
         Focus::Settings => handle_settings_key(key, state),
+        Focus::Import => handle_import_key(key, state),
+        Focus::Confirm => handle_confirm_key(key, state),
         Focus::Sidebar => handle_sidebar_key(key, state),
         Focus::Input => {
             if state.is_pending(&state.active_chat_id()) {
@@ -664,6 +838,7 @@ fn handle_settings_key(key: crossterm::event::KeyEvent, state: &mut AppState) ->
             {
                 Ok((format, sampling)) => {
                     let reasoning = editor.reasoning;
+                    let thinking = editor.thinking;
                     // состав сохраняем всегда: при возврате к «Группе экспертов»
                     // ранее введённый список не теряется
                     let experts = split_list(&editor.experts);
@@ -676,6 +851,7 @@ fn handle_settings_key(key: crossterm::event::KeyEvent, state: &mut AppState) ->
                             response_format: format.unwrap_or_default(),
                             sampling,
                             reasoning,
+                            thinking,
                             experts,
                         };
                         let _ = chats::save_chat(chat);
@@ -711,6 +887,18 @@ fn handle_settings_key(key: crossterm::event::KeyEvent, state: &mut AppState) ->
         {
             editor.cycle_reasoning(1);
         }
+        KeyCode::Left
+            if editor.pane == SettingsPane::Fields
+                && editor.current_field() == Some(FormatField::Thinking) =>
+        {
+            editor.cycle_thinking(-1);
+        }
+        KeyCode::Right | KeyCode::Char(' ')
+            if editor.pane == SettingsPane::Fields
+                && editor.current_field() == Some(FormatField::Thinking) =>
+        {
+            editor.cycle_thinking(1);
+        }
         KeyCode::Left | KeyCode::Right | KeyCode::Char(' ')
             if editor.pane == SettingsPane::Fields
                 && editor.current_field() == Some(FormatField::Mode) =>
@@ -734,6 +922,58 @@ fn handle_settings_key(key: crossterm::event::KeyEvent, state: &mut AppState) ->
         _ => {}
     }
     LoopControl::Continue
+}
+
+/// Клавиши окна импорта: ↑/↓ — выбор чата, Space — отметить, Enter — перенести.
+fn handle_import_key(key: crossterm::event::KeyEvent, state: &mut AppState) -> LoopControl {
+    let picker = state.import.as_mut().expect("import focus implies picker");
+    match key.code {
+        KeyCode::Esc => {
+            state.import = None;
+            state.focus = Focus::Input;
+        }
+        KeyCode::Up => picker.move_cursor(-1),
+        KeyCode::Down => picker.move_cursor(1),
+        KeyCode::Char(' ') => picker.toggle_current(),
+        KeyCode::Enter => {
+            let ids = picker.selected_ids();
+            let target_id = picker.target_id.clone();
+            state.import = None;
+            state.focus = Focus::Input;
+            if !ids.is_empty() {
+                import_context(state, &target_id, &ids);
+            }
+        }
+        _ => {}
+    }
+    LoopControl::Continue
+}
+
+/// Перенести историю выбранных чатов в целевой одним сообщением-контекстом.
+fn import_context(state: &mut AppState, target_id: &str, source_ids: &[String]) {
+    let mut blocks: Vec<String> = Vec::new();
+    for id in source_ids {
+        if let Some(chat) = state.chats.iter().find(|c| &c.id == id) {
+            blocks.push(chats::context_block(chat));
+        }
+    }
+    if blocks.is_empty() {
+        return;
+    }
+    let content = format!(
+        "Ниже — контекст из других чатов. Используй его как справочную информацию \
+и подтверди, что он учтён.\n\n{}",
+        blocks.join("\n")
+    );
+    let Some(chat_index) = state.chats.iter().position(|c| c.id == target_id) else {
+        return;
+    };
+    state.chats[chat_index].messages.push(Message::user(content));
+    state.chats[chat_index].touch_quietly();
+    let _ = chats::save_chat(&state.chats[chat_index]);
+    let ui = state.chat_ui.entry(target_id.to_string()).or_default();
+    ui.auto_scroll = true;
+    ui.scroll_to_message = None;
 }
 
 fn handle_sidebar_key(key: crossterm::event::KeyEvent, state: &mut AppState) -> LoopControl {
@@ -773,10 +1013,71 @@ fn handle_sidebar_key(key: crossterm::event::KeyEvent, state: &mut AppState) -> 
             }
             state.focus = Focus::Input;
         }
+        KeyCode::Char('d') => {
+            let chat = &state.chats[state.sidebar_selected];
+            if !state.is_pending(&chat.id) {
+                state.delete_confirm = Some(DeleteConfirm {
+                    chat_id: chat.id.clone(),
+                    chat_title: chat.title.clone(),
+                });
+                state.focus = Focus::Confirm;
+            }
+        }
         KeyCode::Esc => return LoopControl::Break,
         _ => {}
     }
     LoopControl::Continue
+}
+
+/// Клавиши окна подтверждения удаления: y/Enter — удалить, n/Esc — отмена.
+fn handle_confirm_key(key: crossterm::event::KeyEvent, state: &mut AppState) -> LoopControl {
+    match key.code {
+        KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Char('д') | KeyCode::Enter => {
+            let confirm = state.delete_confirm.take().expect("confirm focus implies request");
+            delete_chat(state, &confirm.chat_id);
+            state.focus = Focus::Sidebar;
+        }
+        KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Char('н') | KeyCode::Esc => {
+            state.delete_confirm = None;
+            state.focus = Focus::Sidebar;
+        }
+        _ => {}
+    }
+    LoopControl::Continue
+}
+
+/// Удалить чат с диска и из состояния, освободив панели, где он был открыт.
+fn delete_chat(state: &mut AppState, chat_id: &str) {
+    let Some(index) = state.chats.iter().position(|c| c.id == chat_id) else {
+        return;
+    };
+    let _ = chats::delete_chat(chat_id);
+    state.chats.remove(index);
+    state.chat_ui.remove(chat_id);
+
+    // в списке всегда должен остаться хотя бы один чат, куда можно писать
+    if state.chats.is_empty() {
+        let chat = ChatSession::new(ChatSettings::default());
+        state.chat_ui.insert(chat.id.clone(), ChatUi::default());
+        state.chats.push(chat);
+    }
+
+    let fallback_id = state.chats[0].id.clone();
+    let mut removed_panes = false;
+    if state.panes.iter().any(|id| id == chat_id) {
+        if state.panes.len() > 1 {
+            state.panes.retain(|id| id != chat_id);
+            removed_panes = true;
+        } else {
+            state.panes[0] = fallback_id;
+        }
+    }
+    if removed_panes && state.active_pane >= state.panes.len() {
+        state.active_pane = state.panes.len() - 1;
+    }
+    if state.sidebar_selected >= state.chats.len() {
+        state.sidebar_selected = state.chats.len() - 1;
+    }
 }
 
 fn handle_input_key(
@@ -801,14 +1102,13 @@ fn handle_input_key(
                 return LoopControl::Break;
             }
             let chat_index = state.chat_index(&chat_id);
-            state.chats[chat_index]
-                .messages
-                .push(Message { role: Role::User, content: line });
+            state.chats[chat_index].messages.push(Message::user(line));
             state.chats[chat_index].touch();
             let _ = chats::save_chat(&state.chats[chat_index]);
             {
                 let ui = state.chat_ui.entry(chat_id.clone()).or_default();
                 ui.pending = true;
+                ui.pending_since = Some(Instant::now());
                 ui.auto_scroll = true;
                 ui.scroll_to_message = None;
             }
@@ -836,7 +1136,9 @@ fn handle_input_key(
             ui.auto_scroll = false;
         }
         KeyCode::Down => {
-            state.chat_ui.entry(chat_id).or_default().scroll += 1;
+            let ui = state.chat_ui.entry(chat_id).or_default();
+            ui.scroll = ui.scroll.saturating_add(1).min(ui.max_scroll);
+            ui.auto_scroll = ui.scroll >= ui.max_scroll;
         }
         KeyCode::PageUp => {
             let ui = state.chat_ui.entry(chat_id).or_default();
@@ -845,7 +1147,8 @@ fn handle_input_key(
         }
         KeyCode::PageDown => {
             let ui = state.chat_ui.entry(chat_id).or_default();
-            ui.scroll = ui.scroll.saturating_add(10);
+            ui.scroll = ui.scroll.saturating_add(10).min(ui.max_scroll);
+            ui.auto_scroll = ui.scroll >= ui.max_scroll;
         }
         _ => {}
     }
@@ -854,21 +1157,32 @@ fn handle_input_key(
 
 fn handle_chat_event(chat_event: ChatEvent, state: &mut AppState) {
     let ChatEvent::Response(chat_id, result) = chat_event;
-    let content = match result {
-        Ok(answer) => answer,
-        Err(err) => format!("Ошибка: {err}"),
+    let mut message = match result {
+        Ok(reply) => {
+            let mut message = Message::assistant(reply.content);
+            message.reasoning = reply.reasoning;
+            message.meta = Some(reply.meta);
+            message
+        }
+        Err(err) => Message::assistant(format!("Ошибка: {err}")),
     };
     let Some(chat_index) = state.chats.iter().position(|c| c.id == chat_id) else {
         return;
     };
-    state.chats[chat_index]
-        .messages
-        .push(Message { role: Role::Assistant, content });
+    // у ошибки телеметрии нет — оставляем хотя бы время получения
+    if message.meta.is_none() {
+        message.meta = Some(MessageMeta {
+            received_at: Some(crate::agent::now_secs()),
+            ..MessageMeta::default()
+        });
+    }
+    state.chats[chat_index].messages.push(message);
     state.chats[chat_index].touch();
     let _ = chats::save_chat(&state.chats[chat_index]);
     let last_index = state.chats[chat_index].messages.len() - 1;
     let ui = state.chat_ui.entry(chat_id).or_default();
     ui.pending = false;
+    ui.pending_since = None;
     ui.auto_scroll = false;
     ui.scroll_to_message = Some(last_index);
 }
@@ -883,7 +1197,7 @@ fn render_ui(f: &mut Frame, state: &mut AppState) {
 
     let main = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Min(3), Constraint::Length(1)])
+        .constraints([Constraint::Min(3), Constraint::Length(2)])
         .split(outer[1]);
 
     let pane_count = state.panes.len().max(1) as u32;
@@ -898,11 +1212,47 @@ fn render_ui(f: &mut Frame, state: &mut AppState) {
         render_pane(f, state, i, *area);
     }
 
-    render_help(f, main[1]);
+    render_help(f, state, main[1]);
 
     if let Some(editor) = &state.settings {
         render_settings_popup(f, editor);
     }
+    if let Some(picker) = &state.import {
+        render_import_popup(f, picker);
+    }
+    if let Some(confirm) = &state.delete_confirm {
+        render_delete_popup(f, confirm);
+    }
+}
+
+/// Подтверждение удаления чата: удаление необратимо, поэтому спрашиваем явно.
+fn render_delete_popup(f: &mut Frame, confirm: &DeleteConfirm) {
+    let area = centered_rect(60, 7, f.area());
+    f.render_widget(Clear, area);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Red))
+        .title(" Удалить чат ");
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    let lines = vec![
+        Line::from(Span::styled(
+            format!(" Удалить чат «{}»?", confirm.chat_title),
+            Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+        )),
+        Line::from(Span::styled(
+            " История будет стёрта с диска без возможности восстановления.",
+            Style::default().fg(Color::DarkGray),
+        )),
+        Line::raw(""),
+        Line::from(Span::styled(
+            " y / Enter — удалить · n / Esc — отмена",
+            Style::default().fg(Color::DarkGray),
+        )),
+    ];
+    f.render_widget(Paragraph::new(Text::from(lines)).wrap(Wrap { trim: false }), inner);
 }
 
 fn render_pane(f: &mut Frame, state: &mut AppState, pane_idx: usize, area: Rect) {
@@ -921,6 +1271,27 @@ fn render_pane(f: &mut Frame, state: &mut AppState, pane_idx: usize, area: Rect)
 }
 
 fn render_sidebar(f: &mut Frame, state: &AppState, area: Rect) {
+    let sidebar_border_style = if state.focus == Focus::Sidebar {
+        Style::default().fg(Color::Cyan)
+    } else {
+        Style::default().fg(Color::DarkGray)
+    };
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(sidebar_border_style)
+        .title(" Чаты ");
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    // подсказки живут отдельной строкой снизу и переносятся по ширине панели,
+    // поэтому больше не обрезаются заголовком рамки
+    let hint_lines = 2u16;
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(0), Constraint::Length(hint_lines)])
+        .split(inner);
+
+    let width = rows[0].width as usize;
     let sidebar_items: Vec<ListItem> = state
         .chats
         .iter()
@@ -943,22 +1314,44 @@ fn render_sidebar(f: &mut Frame, state: &AppState, area: Rect) {
                 Some(_) => "○ ",
                 None => "  ",
             };
-            ListItem::new(Line::from(Span::styled(format!("{prefix}{}", chat.title), style)))
+            let title = truncate(&chat.title, width.saturating_sub(prefix.chars().count()));
+            let stamp_style = if is_cursor && state.focus == Focus::Sidebar {
+                style
+            } else {
+                Style::default().fg(Color::DarkGray)
+            };
+            ListItem::new(vec![
+                Line::from(Span::styled(format!("{prefix}{title}"), style)),
+                Line::from(Span::styled(
+                    format!("    {}", chats::last_activity_label(chat.updated_at)),
+                    stamp_style,
+                )),
+            ])
         })
         .collect();
 
-    let sidebar_border_style = if state.focus == Focus::Sidebar {
-        Style::default().fg(Color::Cyan)
-    } else {
-        Style::default().fg(Color::DarkGray)
-    };
-    let sidebar = List::new(sidebar_items).block(
-        Block::default()
-            .borders(Borders::ALL)
-            .border_style(sidebar_border_style)
-            .title(" Чаты (Enter — открыть, s — сплит) "),
+    f.render_widget(List::new(sidebar_items), rows[0]);
+    f.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            "Enter — открыть · s — сплит · d — удалить",
+            Style::default().fg(Color::DarkGray),
+        )))
+        .wrap(Wrap { trim: true }),
+        rows[1],
     );
-    f.render_widget(sidebar, area);
+}
+
+/// Обрезать строку по видимой ширине, добавив многоточие.
+fn truncate(text: &str, width: usize) -> String {
+    if width == 0 {
+        return String::new();
+    }
+    if text.chars().count() <= width {
+        return text.to_string();
+    }
+    let mut result: String = text.chars().take(width.saturating_sub(1)).collect();
+    result.push('…');
+    result
 }
 
 fn render_pane_title(
@@ -986,6 +1379,40 @@ fn render_pane_title(
     f.render_widget(title, area);
 }
 
+/// Компактная телеметрия сообщения для заголовка: время, длительность,
+/// токены и скорость генерации.
+fn meta_summary(meta: &MessageMeta) -> String {
+    let mut parts = Vec::new();
+    if let Some(received) = meta.received_at.or(meta.sent_at) {
+        parts.push(format_clock(received));
+    }
+    if let Some(ms) = meta.duration_ms {
+        parts.push(format!("{:.1} с", ms as f64 / 1000.0));
+    }
+    match (meta.prompt_tokens, meta.completion_tokens) {
+        (Some(prompt), Some(completion)) => parts.push(format!("↑{prompt} ↓{completion} ток.")),
+        (Some(prompt), None) => parts.push(format!("↑{prompt} ток.")),
+        (None, Some(completion)) => parts.push(format!("↓{completion} ток.")),
+        (None, None) => {}
+    }
+    if let Some(reasoning) = meta.reasoning_tokens {
+        parts.push(format!("рассужд. {reasoning} ток."));
+    }
+    if let Some(speed) = meta.tokens_per_second() {
+        parts.push(format!("{speed:.0} ток/с"));
+    }
+    parts.join(" · ")
+}
+
+fn format_clock(timestamp: i64) -> String {
+    use chrono::{Local, TimeZone};
+    Local
+        .timestamp_opt(timestamp, 0)
+        .single()
+        .map(|t| t.format("%H:%M:%S").to_string())
+        .unwrap_or_default()
+}
+
 fn render_history(
     f: &mut Frame,
     state: &mut AppState,
@@ -994,10 +1421,12 @@ fn render_history(
     area: Rect,
 ) {
     let pending = state.is_pending(chat_id);
+    let pending_since = state.chat_ui.get(chat_id).and_then(|u| u.pending_since);
+    let show_reasoning = state.show_reasoning;
     let scroll_to_message = state.chat_ui.get(chat_id).and_then(|u| u.scroll_to_message);
 
     let mut lines: Vec<Line> = Vec::new();
-    let mut target_line: Option<u16> = None;
+    let mut target_line: Option<usize> = None;
     if state.chats[chat_index].messages.is_empty() && state.panes.len() == 1 {
         if let Ok(text) = BILLY_ART.into_text() {
             lines.extend(text.lines);
@@ -1011,16 +1440,49 @@ fn render_history(
     }
     for (i, entry) in state.chats[chat_index].messages.iter().enumerate() {
         if scroll_to_message == Some(i) {
-            target_line = Some(lines.len() as u16);
+            target_line = Some(lines.len());
         }
         let (label, color) = match entry.role {
             Role::User => ("Вы", Color::Green),
             Role::Assistant => ("Агент", Color::Cyan),
         };
-        lines.push(Line::from(Span::styled(
+        let mut header = vec![Span::styled(
             format!("● {label}"),
             Style::default().fg(color).add_modifier(Modifier::BOLD),
-        )));
+        )];
+        if let Some(stats) = entry.meta.as_ref().map(meta_summary).filter(|s| !s.is_empty()) {
+            header.push(Span::styled(
+                format!("  {stats}"),
+                Style::default().fg(Color::DarkGray),
+            ));
+        }
+        lines.push(Line::from(header));
+        if let Some(reasoning) = entry.reasoning.as_ref() {
+            if show_reasoning {
+                lines.push(Line::from(Span::styled(
+                    "  ┌ Рассуждение",
+                    Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD),
+                )));
+                for reasoning_line in reasoning.lines() {
+                    lines.push(Line::from(Span::styled(
+                        format!("  │ {reasoning_line}"),
+                        Style::default()
+                            .fg(Color::Magenta)
+                            .add_modifier(Modifier::DIM | Modifier::ITALIC),
+                    )));
+                }
+                lines.push(Line::from(Span::styled(
+                    "  └",
+                    Style::default().fg(Color::Magenta),
+                )));
+            } else {
+                let count = reasoning.lines().count();
+                lines.push(Line::from(Span::styled(
+                    format!("  ▸ Рассуждение скрыто ({count} стр.) — Ctrl+R"),
+                    Style::default().fg(Color::Magenta).add_modifier(Modifier::DIM),
+                )));
+            }
+        }
         let rendered = agent_skin().term_text(&entry.content).to_string();
         match rendered.into_text() {
             Ok(text) => lines.extend(text.lines),
@@ -1029,30 +1491,64 @@ fn render_history(
         lines.push(Line::raw(""));
     }
     if pending {
+        let elapsed = pending_since
+            .map(|since| format!(" {:.1} с", since.elapsed().as_secs_f64()))
+            .unwrap_or_default();
         lines.push(Line::from(Span::styled(
-            format!("{} Агент думает...", SPINNER_FRAMES[state.spinner_frame]),
+            format!(
+                "{} Агент думает...{elapsed}",
+                SPINNER_FRAMES[state.spinner_frame]
+            ),
             Style::default().fg(Color::Magenta),
         )));
     }
 
-    let total_lines = lines.len() as u16;
+    // Ширина/высота содержимого внутри рамки.
+    let inner_width = area.width.saturating_sub(2);
     let visible = area.height.saturating_sub(2);
+
+    // Смещение прокрутки у Paragraph считается по строкам ПОСЛЕ переноса,
+    // поэтому длину истории тоже надо мерить с учётом Wrap, иначе низ
+    // длинных сообщений становится недостижим.
+    let target_offset = target_line.map(|idx| {
+        wrapped_line_count(Text::from(lines[..idx].to_vec()), inner_width)
+    });
+    let history_widget = Paragraph::new(Text::from(lines))
+        .block(Block::default().borders(Borders::ALL).title(" История "))
+        .wrap(Wrap { trim: false });
+    let total_lines = if inner_width == 0 {
+        0
+    } else {
+        clamp_u16(history_widget.line_count(inner_width))
+    };
+    let max_scroll = total_lines.saturating_sub(visible);
+
     let ui = state.chat_ui.entry(chat_id.to_string()).or_default();
+    ui.max_scroll = max_scroll;
     if ui.auto_scroll {
-        ui.scroll = total_lines.saturating_sub(visible);
-    } else if let Some(target) = target_line {
-        ui.scroll = target.min(total_lines.saturating_sub(visible));
+        ui.scroll = max_scroll;
+    } else if let Some(target) = target_offset {
+        ui.scroll = clamp_u16(target).min(max_scroll);
         ui.scroll_to_message = None;
     } else {
-        ui.scroll = ui.scroll.min(total_lines.saturating_sub(visible));
+        ui.scroll = ui.scroll.min(max_scroll);
     }
     let scroll = ui.scroll;
 
-    let history_widget = Paragraph::new(Text::from(lines))
-        .block(Block::default().borders(Borders::ALL).title(" История "))
+    f.render_widget(history_widget.scroll((scroll, 0)), area);
+}
+
+fn clamp_u16(value: usize) -> u16 {
+    u16::try_from(value).unwrap_or(u16::MAX)
+}
+
+fn wrapped_line_count(text: Text<'_>, width: u16) -> usize {
+    if width == 0 {
+        return 0;
+    }
+    Paragraph::new(text)
         .wrap(Wrap { trim: false })
-        .scroll((scroll, 0));
-    f.render_widget(history_widget, area);
+        .line_count(width)
 }
 
 fn render_input(f: &mut Frame, state: &AppState, chat_id: &str, is_active_pane: bool, area: Rect) {
@@ -1080,11 +1576,16 @@ fn render_input(f: &mut Frame, state: &AppState, chat_id: &str, is_active_pane: 
     }
 }
 
-fn render_help(f: &mut Frame, area: Rect) {
-    let help = Paragraph::new(Line::from(Span::styled(
-        "Tab — панель · в чатах ←/→ — окно, s — сплит · Ctrl+W — закрыть окно · Ctrl+P — настройки · Ctrl+N — новый чат · Esc/Ctrl+C — выход",
-        Style::default().fg(Color::DarkGray),
-    )));
+fn render_help(f: &mut Frame, state: &AppState, area: Rect) {
+    let (text, color) = match state.active_notice() {
+        Some(notice) => (notice, Color::Green),
+        None => (
+            "Tab — панель · ←/→ — окно · Ctrl+W — закрыть · Ctrl+P — настройки · Ctrl+O — импорт контекста · Ctrl+N — новый чат · Ctrl+Y — копировать ввод · Ctrl+R — рассуждение · Esc/Ctrl+C — выход",
+            Color::DarkGray,
+        ),
+    };
+    let help = Paragraph::new(Line::from(Span::styled(text, Style::default().fg(color))))
+    .wrap(Wrap { trim: true });
     f.render_widget(help, area);
 }
 
@@ -1193,6 +1694,10 @@ fn render_settings_fields(f: &mut Frame, editor: &SettingsEditor, area: Rect) {
                 "{} (◀/▶ или Space — переключить)",
                 editor.reasoning.label()
             ),
+            FormatField::Thinking => format!(
+                "{} (◀/▶ или Space — переключить)",
+                editor.thinking.label()
+            ),
             FormatField::Experts => editor.experts.clone(),
             FormatField::Description => editor.description.clone(),
             FormatField::MaxLength => editor.max_length.clone(),
@@ -1240,3 +1745,65 @@ fn render_settings_fields(f: &mut Frame, editor: &SettingsEditor, area: Rect) {
     );
 }
 
+/// Окно выбора чатов, чей контекст переносится в текущий.
+fn render_import_popup(f: &mut Frame, picker: &ImportPicker) {
+    let area = centered_rect(72, 20, f.area());
+    f.render_widget(Clear, area);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan))
+        .title(format!(
+            " Импорт контекста в «{}» (Space — выбрать, Enter — перенести) ",
+            picker.target_title
+        ));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(0), Constraint::Length(1)])
+        .split(inner);
+
+    let lines: Vec<Line> = if picker.candidates.is_empty() {
+        vec![Line::from(Span::styled(
+            " Нет других чатов с историей",
+            Style::default().fg(Color::DarkGray),
+        ))]
+    } else {
+        picker
+            .candidates
+            .iter()
+            .enumerate()
+            .map(|(index, candidate)| {
+                let style = if index == picker.cursor {
+                    Style::default()
+                        .fg(Color::Black)
+                        .bg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD)
+                } else if candidate.selected {
+                    Style::default().fg(Color::Cyan)
+                } else {
+                    Style::default().fg(Color::White)
+                };
+                let mark = if candidate.selected { "[x]" } else { "[ ]" };
+                Line::from(Span::styled(
+                    format!(" {mark} {} ({} сообщ.)", candidate.title, candidate.messages),
+                    style,
+                ))
+            })
+            .collect()
+    };
+
+    f.render_widget(
+        Paragraph::new(Text::from(lines)).wrap(Wrap { trim: false }),
+        rows[0],
+    );
+    f.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            " ↑/↓ — выбор · Space — отметить · Enter — перенести · Esc — отмена",
+            Style::default().fg(Color::DarkGray),
+        ))),
+        rows[1],
+    );
+}
