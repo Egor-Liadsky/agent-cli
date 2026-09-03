@@ -8,7 +8,7 @@ mod tui;
 use agent::{Agent, HttpAgent, Message, Role};
 use clap::Parser;
 use cli::{Cli, Commands, ConfigAction, FormatAction, SamplingAction};
-use config::Config;
+use config::{Config, ReasoningMode};
 use console::style;
 use indicatif::{ProgressBar, ProgressStyle};
 use markdown::agent_skin;
@@ -34,7 +34,8 @@ async fn run_ask(prompt: String) -> anyhow::Result<()> {
         role: Role::User,
         content: prompt,
     }];
-    let answer = ask_with_spinner(&agent, &history).await?;
+    let settings = config.default_chat_settings();
+    let answer = ask_with_spinner(&agent, &history, &settings).await?;
     print_markdown(&answer);
     Ok(())
 }
@@ -42,7 +43,8 @@ async fn run_ask(prompt: String) -> anyhow::Result<()> {
 async fn run_chat() -> anyhow::Result<()> {
     let config = Config::load()?;
     let agent = HttpAgent::from_config(&config)?;
-    tui::run(agent).await
+    let defaults = config.default_chat_settings();
+    tui::run(agent, defaults).await
 }
 
 fn run_config(action: ConfigAction) -> anyhow::Result<()> {
@@ -56,6 +58,7 @@ fn run_config(action: ConfigAction) -> anyhow::Result<()> {
         ConfigAction::Show => show_config()?,
         ConfigAction::Format { action } => run_format_action(action)?,
         ConfigAction::Sampling { action } => run_sampling_action(action)?,
+        ConfigAction::Reasoning { mode, experts } => run_reasoning_action(mode, experts)?,
     }
     Ok(())
 }
@@ -79,13 +82,14 @@ fn show_config() -> anyhow::Result<()> {
     );
     println!(
         "{} {}",
-        style("режим ответа:").cyan().bold(),
+        style("режим ответа (по умолчанию для новых чатов):").cyan().bold(),
         if config.custom_response_mode {
             "кастомный"
         } else {
             "дефолтный"
         }
     );
+    print_reasoning(&config);
     print_response_format(&config.response_format);
     print_sampling_params(&config.sampling);
     Ok(())
@@ -155,6 +159,56 @@ fn run_format_action(action: FormatAction) -> anyhow::Result<()> {
         }
     }
     Ok(())
+}
+
+fn run_reasoning_action(
+    mode: Option<String>,
+    experts: Option<Vec<String>>,
+) -> anyhow::Result<()> {
+    let mut config = Config::load()?;
+    if mode.is_none() && experts.is_none() {
+        print_reasoning(&config);
+        return Ok(());
+    }
+    if let Some(value) = mode {
+        config.reasoning = ReasoningMode::parse(&value).ok_or_else(|| {
+            anyhow::anyhow!(
+                "неизвестная стратегия «{value}». Доступны: default, step-by-step, \
+                 prompt-craft, expert-panel"
+            )
+        })?;
+    }
+    if let Some(experts) = experts {
+        config.experts = experts
+            .into_iter()
+            .map(|e| e.trim().to_string())
+            .filter(|e| !e.is_empty())
+            .collect();
+    }
+    config.save()?;
+    println!("{}", style("Настройки рассуждения сохранены.").green().bold());
+    print_reasoning(&config);
+    Ok(())
+}
+
+fn print_reasoning(config: &Config) {
+    println!(
+        "{} {}",
+        style("стратегия рассуждения:").cyan().bold(),
+        config.reasoning.label()
+    );
+    println!(
+        "{} {}",
+        style("эксперты:            ").cyan().bold(),
+        if config.experts.is_empty() {
+            format!(
+                "<по умолчанию: {}>",
+                ReasoningMode::DEFAULT_EXPERTS.join(", ")
+            )
+        } else {
+            config.experts.join(", ")
+        }
+    );
 }
 
 fn run_sampling_action(action: SamplingAction) -> anyhow::Result<()> {
@@ -276,7 +330,11 @@ fn print_sampling_params(sampling: &config::SamplingParams) {
     );
 }
 
-async fn ask_with_spinner(agent: &HttpAgent, history: &[Message]) -> anyhow::Result<String> {
+async fn ask_with_spinner(
+    agent: &HttpAgent,
+    history: &[Message],
+    settings: &config::ChatSettings,
+) -> anyhow::Result<String> {
     let spinner = ProgressBar::new_spinner();
     spinner.set_style(
         ProgressStyle::with_template("{spinner:.cyan} {msg}")
@@ -286,7 +344,7 @@ async fn ask_with_spinner(agent: &HttpAgent, history: &[Message]) -> anyhow::Res
     spinner.set_message(style("Агент думает...").magenta().to_string());
     spinner.enable_steady_tick(Duration::from_millis(80));
 
-    let result = agent.ask(history).await;
+    let result = agent.ask(history, settings).await;
 
     spinner.finish_and_clear();
     result

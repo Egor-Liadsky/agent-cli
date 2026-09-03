@@ -2,6 +2,7 @@ mod http;
 
 pub use http::HttpAgent;
 
+use crate::config::ChatSettings;
 use anyhow::Result;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -21,5 +22,5 @@ pub enum Role {
 
 #[async_trait]
 pub trait Agent {
-    async fn ask(&self, history: &[Message]) -> Result<String>;
+    async fn ask(&self, history: &[Message], settings: &ChatSettings) -> Result<String>;
 }

@@ -1,6 +1,6 @@
 use crate::agent::{Agent, HttpAgent, Message, Role};
 use crate::chats::{self, ChatSession};
-use crate::config::{Config, ResponseFormat, SamplingParams};
+use crate::config::{ChatSettings, ReasoningMode, ResponseFormat, SamplingParams};
 use crate::markdown::agent_skin;
 use ansi_to_tui::IntoText;
 use crossterm::{
@@ -45,6 +45,8 @@ enum Focus {
 #[derive(Clone, Copy, PartialEq)]
 enum FormatField {
     Mode,
+    Reasoning,
+    Experts,
     Description,
     MaxLength,
     Stop,
@@ -56,23 +58,63 @@ enum FormatField {
     PresencePenalty,
 }
 
-impl FormatField {
-    const ALL: [FormatField; 10] = [
-        FormatField::Mode,
-        FormatField::Description,
-        FormatField::MaxLength,
-        FormatField::Stop,
-        FormatField::StopInstruction,
-        FormatField::Temperature,
-        FormatField::TopP,
-        FormatField::TopK,
-        FormatField::FrequencyPenalty,
-        FormatField::PresencePenalty,
+/// Раздел настроек: группирует поля по смыслу.
+#[derive(Clone, Copy, PartialEq)]
+enum SettingsSection {
+    Format,
+    Reasoning,
+    Sampling,
+}
+
+impl SettingsSection {
+    const ALL: [SettingsSection; 3] = [
+        SettingsSection::Format,
+        SettingsSection::Reasoning,
+        SettingsSection::Sampling,
     ];
 
     fn label(self) -> &'static str {
         match self {
+            SettingsSection::Format => "Формат ответа",
+            SettingsSection::Reasoning => "Рассуждение",
+            SettingsSection::Sampling => "Сэмплинг",
+        }
+    }
+
+    fn fields(self) -> &'static [FormatField] {
+        match self {
+            SettingsSection::Format => &[
+                FormatField::Mode,
+                FormatField::Description,
+                FormatField::MaxLength,
+                FormatField::Stop,
+                FormatField::StopInstruction,
+            ],
+            SettingsSection::Reasoning => &[FormatField::Reasoning, FormatField::Experts],
+            SettingsSection::Sampling => &[
+                FormatField::Temperature,
+                FormatField::TopP,
+                FormatField::TopK,
+                FormatField::FrequencyPenalty,
+                FormatField::PresencePenalty,
+            ],
+        }
+    }
+}
+
+/// Активная панель попапа настроек: список разделов либо поля раздела.
+#[derive(Clone, Copy, PartialEq)]
+enum SettingsPane {
+    Sections,
+    Fields,
+}
+
+impl FormatField {
+    fn label(self) -> &'static str {
+        match self {
             FormatField::Mode => "Режим",
+            FormatField::Reasoning => "Стратегия рассуждения",
+            FormatField::Experts => "Эксперты (через запятую, пусто — состав по умолчанию)",
             FormatField::Description => "Описание формата",
             FormatField::MaxLength => "Макс. длина ответа (токены)",
             FormatField::Stop => "Stop-последовательности (через запятую)",
@@ -83,6 +125,16 @@ impl FormatField {
             FormatField::FrequencyPenalty => "Frequency penalty",
             FormatField::PresencePenalty => "Presence penalty",
         }
+    }
+
+    /// Поля стратегии рассуждения: не зависят от режима формата ответа.
+    fn is_reasoning_detail(self) -> bool {
+        matches!(self, FormatField::Experts)
+    }
+
+    /// Поля-переключатели: редактируются стрелками/пробелом, а не вводом текста.
+    fn is_toggle(self) -> bool {
+        matches!(self, FormatField::Mode | FormatField::Reasoning)
     }
 
     /// Поля, не зависящие от режима формата (доступны всегда).
@@ -98,9 +150,14 @@ impl FormatField {
     }
 }
 
-/// Состояние редактора настроек формата ответа.
+/// Состояние редактора настроек формата ответа для конкретного чата.
 struct SettingsEditor {
+    /// Чат, чьи параметры редактируются.
+    chat_id: String,
+    chat_title: String,
     custom_mode: bool,
+    reasoning: ReasoningMode,
+    experts: String,
     description: String,
     max_length: String,
     stop: String,
@@ -110,16 +167,27 @@ struct SettingsEditor {
     top_k: String,
     frequency_penalty: String,
     presence_penalty: String,
+    /// Индекс активного раздела в SettingsSection::ALL.
+    section: usize,
+    /// Индекс поля внутри visible_fields() активного раздела.
     field: usize,
+    /// Панель, которая принимает ввод.
+    pane: SettingsPane,
     error: Option<String>,
 }
 
 impl SettingsEditor {
-    fn from_format(format: Option<&ResponseFormat>, sampling: &SamplingParams) -> Self {
-        let custom_mode = format.is_some();
-        let format = format.cloned().unwrap_or_default();
+    fn from_chat(chat: &ChatSession) -> Self {
+        let settings = &chat.settings;
+        let custom_mode = settings.custom_response_mode;
+        let format = settings.response_format.clone();
+        let sampling = &settings.sampling;
         Self {
+            chat_id: chat.id.clone(),
+            chat_title: chat.title.clone(),
             custom_mode,
+            reasoning: settings.reasoning,
+            experts: settings.experts.join(", "),
             description: format.description.unwrap_or_default(),
             max_length: format.max_length.map(|v| v.to_string()).unwrap_or_default(),
             stop: format.stop.map(|v| v.join(", ")).unwrap_or_default(),
@@ -135,24 +203,108 @@ impl SettingsEditor {
                 .presence_penalty
                 .map(|v| v.to_string())
                 .unwrap_or_default(),
+            section: 0,
             field: 0,
+            pane: SettingsPane::Sections,
             error: None,
         }
     }
 
-    fn current_field(&self) -> FormatField {
-        FormatField::ALL[self.field]
+    fn current_section(&self) -> SettingsSection {
+        SettingsSection::ALL[self.section.min(SettingsSection::ALL.len() - 1)]
     }
 
+    /// Поля активного раздела: «Эксперты» имеют смысл только для
+    /// стратегии «Группа экспертов».
+    fn visible_fields(&self) -> Vec<FormatField> {
+        self.current_section()
+            .fields()
+            .iter()
+            .copied()
+            .filter(|field| {
+                *field != FormatField::Experts || self.reasoning == ReasoningMode::ExpertPanel
+            })
+            .collect()
+    }
+
+    fn current_field(&self) -> Option<FormatField> {
+        let fields = self.visible_fields();
+        fields.get(self.field.min(fields.len().saturating_sub(1))).copied()
+    }
+
+    /// Переместить выделение внутри активной панели.
     fn move_focus(&mut self, delta: i32) {
-        let len = FormatField::ALL.len() as i32;
-        let next = (self.field as i32 + delta).rem_euclid(len);
-        self.field = next as usize;
+        match self.pane {
+            SettingsPane::Sections => {
+                let len = SettingsSection::ALL.len() as i32;
+                self.section = (self.section as i32 + delta).rem_euclid(len) as usize;
+                self.field = 0;
+            }
+            SettingsPane::Fields => {
+                let len = self.visible_fields().len() as i32;
+                if len == 0 {
+                    return;
+                }
+                let current = self.field.min(len as usize - 1) as i32;
+                self.field = (current + delta).rem_euclid(len) as usize;
+            }
+        }
+    }
+
+    /// Tab: список разделов → поля раздела → обратно к списку с последнего поля.
+    fn focus_next(&mut self) {
+        match self.pane {
+            SettingsPane::Sections => {
+                if self.visible_fields().is_empty() {
+                    self.move_focus(1);
+                } else {
+                    self.pane = SettingsPane::Fields;
+                    self.field = 0;
+                }
+            }
+            SettingsPane::Fields => {
+                let len = self.visible_fields().len();
+                if len == 0 || self.field + 1 >= len {
+                    self.pane = SettingsPane::Sections;
+                    self.field = 0;
+                } else {
+                    self.field += 1;
+                }
+            }
+        }
+    }
+
+    fn cycle_reasoning(&mut self, delta: i32) {
+        let modes = ReasoningMode::ALL;
+        let len = modes.len() as i32;
+        let current = modes
+            .iter()
+            .position(|m| *m == self.reasoning)
+            .unwrap_or(0) as i32;
+        self.reasoning = modes[(current + delta).rem_euclid(len) as usize];
+        // «Эксперты» появляются и исчезают вместе со стратегией — не даём
+        // курсору уехать за пределы списка полей
+        let len = self.visible_fields().len();
+        self.field = self.field.min(len.saturating_sub(1));
+    }
+
+    /// Сбросить текущее поле к значению по умолчанию.
+    fn reset_field(&mut self) {
+        match self.current_field() {
+            Some(FormatField::Mode) => self.custom_mode = false,
+            Some(FormatField::Reasoning) => self.reasoning = ReasoningMode::default(),
+            _ => {
+                if let Some(value) = self.field_value_mut() {
+                    value.clear();
+                }
+            }
+        }
     }
 
     fn field_value_mut(&mut self) -> Option<&mut String> {
-        match self.current_field() {
-            FormatField::Mode => None,
+        match self.current_field()? {
+            FormatField::Mode | FormatField::Reasoning => None,
+            FormatField::Experts => Some(&mut self.experts),
             FormatField::Description => Some(&mut self.description),
             FormatField::MaxLength => Some(&mut self.max_length),
             FormatField::Stop => Some(&mut self.stop),
@@ -174,19 +326,17 @@ impl SettingsEditor {
         let max_length = if self.max_length.trim().is_empty() {
             None
         } else {
-            Some(
-                self.max_length
-                    .trim()
-                    .parse::<u32>()
-                    .map_err(|_| "Макс. длина должна быть целым числом".to_string())?,
-            )
+            let parsed = self
+                .max_length
+                .trim()
+                .parse::<u32>()
+                .map_err(|_| "Макс. длина должна быть целым числом".to_string())?;
+            if parsed == 0 {
+                return Err("Макс. длина должна быть больше нуля".to_string());
+            }
+            Some(parsed)
         };
-        let stop: Vec<String> = self
-            .stop
-            .split(',')
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-            .collect();
+        let stop = split_list(&self.stop);
         let description = non_empty(&self.description);
         let stop_instruction = non_empty(&self.stop_instruction);
 
@@ -201,32 +351,42 @@ impl SettingsEditor {
     /// Собрать SamplingParams из введённых значений. Возвращает ошибку текстом,
     /// если одно из числовых полей не парсится.
     fn build_sampling(&mut self) -> Result<SamplingParams, String> {
-        fn parse_field(value: &str, label: &str) -> Result<Option<f32>, String> {
+        fn parse_range(
+            value: &str,
+            label: &str,
+            min: f32,
+            max: f32,
+        ) -> Result<Option<f32>, String> {
             if value.trim().is_empty() {
-                Ok(None)
-            } else {
-                value
-                    .trim()
-                    .parse::<f32>()
-                    .map(Some)
-                    .map_err(|_| format!("{label} должно быть числом"))
+                return Ok(None);
             }
+            let parsed = value
+                .trim()
+                .parse::<f32>()
+                .map_err(|_| format!("{label} должно быть числом"))?;
+            if !(min..=max).contains(&parsed) {
+                return Err(format!("{label}: допустим диапазон {min}..{max}"));
+            }
+            Ok(Some(parsed))
         }
 
-        let temperature = parse_field(&self.temperature, "Temperature")?;
-        let top_p = parse_field(&self.top_p, "Top-p")?;
+        let temperature = parse_range(&self.temperature, "Temperature", 0.0, 2.0)?;
+        let top_p = parse_range(&self.top_p, "Top-p", 0.0, 1.0)?;
         let top_k = if self.top_k.trim().is_empty() {
             None
         } else {
-            Some(
-                self.top_k
-                    .trim()
-                    .parse::<u32>()
-                    .map_err(|_| "Top-k должно быть целым числом".to_string())?,
-            )
+            let parsed = self
+                .top_k
+                .trim()
+                .parse::<u32>()
+                .map_err(|_| "Top-k должно быть целым числом".to_string())?;
+            if parsed == 0 {
+                return Err("Top-k должен быть больше нуля".to_string());
+            }
+            Some(parsed)
         };
-        let frequency_penalty = parse_field(&self.frequency_penalty, "Frequency penalty")?;
-        let presence_penalty = parse_field(&self.presence_penalty, "Presence penalty")?;
+        let frequency_penalty = parse_range(&self.frequency_penalty, "Frequency penalty", -2.0, 2.0)?;
+        let presence_penalty = parse_range(&self.presence_penalty, "Presence penalty", -2.0, 2.0)?;
 
         Ok(SamplingParams {
             temperature,
@@ -238,6 +398,15 @@ impl SettingsEditor {
     }
 }
 
+/// Разбор списка через запятую с отбрасыванием пустых элементов.
+fn split_list(value: &str) -> Vec<String> {
+    value
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect()
+}
+
 fn non_empty(s: &str) -> Option<String> {
     let trimmed = s.trim();
     if trimmed.is_empty() {
@@ -247,7 +416,7 @@ fn non_empty(s: &str) -> Option<String> {
     }
 }
 
-pub async fn run(agent: HttpAgent) -> anyhow::Result<()> {
+pub async fn run(agent: HttpAgent, default_settings: ChatSettings) -> anyhow::Result<()> {
     let agent = Arc::new(agent);
 
     enable_raw_mode()?;
@@ -256,7 +425,7 @@ pub async fn run(agent: HttpAgent) -> anyhow::Result<()> {
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    let result = run_app(&mut terminal, agent).await;
+    let result = run_app(&mut terminal, agent, default_settings).await;
 
     disable_raw_mode()?;
     execute!(
@@ -307,6 +476,8 @@ struct AppState {
     spinner_frame: usize,
     focus: Focus,
     settings: Option<SettingsEditor>,
+    /// Параметры для новых чатов (из глобального конфига).
+    default_settings: ChatSettings,
 }
 
 impl AppState {
@@ -333,9 +504,10 @@ impl AppState {
 async fn run_app(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     agent: Arc<HttpAgent>,
+    default_settings: ChatSettings,
 ) -> anyhow::Result<()> {
     let mut chats: Vec<ChatSession> = chats::list_chats().unwrap_or_default();
-    chats.insert(0, ChatSession::new());
+    chats.insert(0, ChatSession::new(default_settings.clone()));
 
     let mut chat_ui: HashMap<String, ChatUi> = HashMap::new();
     for chat in &chats {
@@ -352,6 +524,7 @@ async fn run_app(
         spinner_frame: 0,
         focus: Focus::Input,
         settings: None,
+        default_settings,
     };
 
     let (tx, mut rx) = mpsc::unbounded_channel::<ChatEvent>();
@@ -394,7 +567,7 @@ fn handle_global_key(key: crossterm::event::KeyEvent, state: &mut AppState) -> O
         if state.focus == Focus::Settings || state.is_pending(&state.active_chat_id()) {
             return Some(LoopControl::Continue);
         }
-        let chat = ChatSession::new();
+        let chat = ChatSession::new(state.default_settings.clone());
         let id = chat.id.clone();
         state.chats.insert(0, chat);
         state.chat_ui.insert(id.clone(), ChatUi::default());
@@ -449,10 +622,8 @@ fn handle_key(
             state.settings = None;
             state.focus = Focus::Input;
         } else {
-            state.settings = Some(SettingsEditor::from_format(
-                agent.response_format().as_ref(),
-                &agent.sampling(),
-            ));
+            let chat_index = state.chat_index(&state.active_chat_id());
+            state.settings = Some(SettingsEditor::from_chat(&state.chats[chat_index]));
             state.focus = Focus::Settings;
         }
         return LoopControl::Continue;
@@ -467,7 +638,7 @@ fn handle_key(
     }
 
     match state.focus {
-        Focus::Settings => handle_settings_key(key, state, agent),
+        Focus::Settings => handle_settings_key(key, state),
         Focus::Sidebar => handle_sidebar_key(key, state),
         Focus::Input => {
             if state.is_pending(&state.active_chat_id()) {
@@ -479,11 +650,7 @@ fn handle_key(
     }
 }
 
-fn handle_settings_key(
-    key: crossterm::event::KeyEvent,
-    state: &mut AppState,
-    agent: &Arc<HttpAgent>,
-) -> LoopControl {
+fn handle_settings_key(key: crossterm::event::KeyEvent, state: &mut AppState) -> LoopControl {
     let editor = state.settings.as_mut().expect("settings focus implies editor");
     match key.code {
         KeyCode::Esc => {
@@ -496,34 +663,70 @@ fn handle_settings_key(
                 .and_then(|format| editor.build_sampling().map(|sampling| (format, sampling)))
             {
                 Ok((format, sampling)) => {
-                    agent.set_response_format(format.clone());
-                    agent.set_sampling(sampling.clone());
-                    if let Ok(mut config) = Config::load() {
-                        config.custom_response_mode = format.is_some();
-                        config.response_format = format.unwrap_or_default();
-                        config.sampling = sampling;
-                        let _ = config.save();
-                    }
+                    let reasoning = editor.reasoning;
+                    // состав сохраняем всегда: при возврате к «Группе экспертов»
+                    // ранее введённый список не теряется
+                    let experts = split_list(&editor.experts);
+                    let chat_id = editor.chat_id.clone();
                     state.settings = None;
                     state.focus = Focus::Input;
+                    if let Some(chat) = state.chats.iter_mut().find(|c| c.id == chat_id) {
+                        chat.settings = ChatSettings {
+                            custom_response_mode: format.is_some(),
+                            response_format: format.unwrap_or_default(),
+                            sampling,
+                            reasoning,
+                            experts,
+                        };
+                        let _ = chats::save_chat(chat);
+                    }
                 }
                 Err(err) => editor.error = Some(err),
             }
         }
-        KeyCode::Tab | KeyCode::Down => editor.move_focus(1),
+        KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            if editor.pane == SettingsPane::Fields {
+                editor.reset_field();
+            }
+        }
+        KeyCode::Tab => editor.focus_next(),
+        KeyCode::Down => editor.move_focus(1),
         KeyCode::Up => editor.move_focus(-1),
-        KeyCode::Left | KeyCode::Right if editor.current_field() == FormatField::Mode => {
+        KeyCode::Right | KeyCode::Enter if editor.pane == SettingsPane::Sections => {
+            if !editor.visible_fields().is_empty() {
+                editor.pane = SettingsPane::Fields;
+                editor.field = 0;
+            }
+        }
+        KeyCode::Left if editor.pane == SettingsPane::Sections => {}
+        KeyCode::Left
+            if editor.pane == SettingsPane::Fields
+                && editor.current_field() == Some(FormatField::Reasoning) =>
+        {
+            editor.cycle_reasoning(-1);
+        }
+        KeyCode::Right | KeyCode::Char(' ')
+            if editor.pane == SettingsPane::Fields
+                && editor.current_field() == Some(FormatField::Reasoning) =>
+        {
+            editor.cycle_reasoning(1);
+        }
+        KeyCode::Left | KeyCode::Right | KeyCode::Char(' ')
+            if editor.pane == SettingsPane::Fields
+                && editor.current_field() == Some(FormatField::Mode) =>
+        {
             editor.custom_mode = !editor.custom_mode;
         }
-        KeyCode::Char(' ') if editor.current_field() == FormatField::Mode => {
-            editor.custom_mode = !editor.custom_mode;
+        KeyCode::Left => {
+            // из полей — обратно к списку разделов
+            editor.pane = SettingsPane::Sections;
         }
-        KeyCode::Char(c) => {
+        KeyCode::Char(c) if editor.pane == SettingsPane::Fields => {
             if let Some(value) = editor.field_value_mut() {
                 value.push(c);
             }
         }
-        KeyCode::Backspace => {
+        KeyCode::Backspace if editor.pane == SettingsPane::Fields => {
             if let Some(value) = editor.field_value_mut() {
                 value.pop();
             }
@@ -612,10 +815,11 @@ fn handle_input_key(
 
             let agent = agent.clone();
             let hist = state.chats[chat_index].messages.clone();
+            let settings = state.chats[chat_index].settings.clone();
             let tx = tx.clone();
             let event_chat_id = chat_id.clone();
             tokio::spawn(async move {
-                let result = agent.ask(&hist).await;
+                let result = agent.ask(&hist, &settings).await;
                 let _ = tx.send(ChatEvent::Response(event_chat_id, result));
             });
         }
@@ -893,19 +1097,81 @@ fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {
 }
 
 fn render_settings_popup(f: &mut Frame, editor: &SettingsEditor) {
-    let area = centered_rect(76, 26, f.area());
+    let area = centered_rect(88, 24, f.area());
     f.render_widget(Clear, area);
 
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::Cyan))
-        .title(" Настройки ответа (Ctrl+S — сохранить, Esc — отмена) ");
+        .title(format!(
+            " Настройки чата «{}» (Ctrl+S — сохранить, Esc — отмена) ",
+            editor.chat_title
+        ));
     let inner = block.inner(area);
     f.render_widget(block, area);
 
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(0), Constraint::Length(1)])
+        .split(inner);
+    let columns = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Length(24), Constraint::Min(0)])
+        .split(rows[0]);
+
+    render_settings_sections(f, editor, columns[0]);
+    render_settings_fields(f, editor, columns[1]);
+
+    f.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            " Tab — панель/поле · ↑/↓ — выбор · Ctrl+D — сброс · Ctrl+S — сохранить · Esc — отмена",
+            Style::default().fg(Color::DarkGray),
+        ))),
+        rows[1],
+    );
+}
+
+/// Левая панель попапа: список разделов настроек.
+fn render_settings_sections(f: &mut Frame, editor: &SettingsEditor, area: Rect) {
+    let block = Block::default()
+        .borders(Borders::RIGHT)
+        .border_style(Style::default().fg(Color::DarkGray));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    let active = editor.pane == SettingsPane::Sections;
+    let lines: Vec<Line> = SettingsSection::ALL
+        .iter()
+        .enumerate()
+        .map(|(index, section)| {
+            let selected = index == editor.section;
+            let style = match (selected, active) {
+                (true, true) => Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+                (true, false) => Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                _ => Style::default().fg(Color::White),
+            };
+            let marker = if selected { "▸" } else { " " };
+            Line::from(Span::styled(
+                format!(" {marker} {:<width$}", section.label(), width = 18),
+                style,
+            ))
+        })
+        .collect();
+
+    f.render_widget(Paragraph::new(Text::from(lines)), inner);
+}
+
+/// Правая панель попапа: поля активного раздела.
+fn render_settings_fields(f: &mut Frame, editor: &SettingsEditor, area: Rect) {
+    let active = editor.pane == SettingsPane::Fields;
+    let current = editor.current_field();
     let mut lines: Vec<Line> = Vec::new();
-    for field in FormatField::ALL {
-        let selected = field == editor.current_field();
+
+    for field in editor.visible_fields() {
+        let selected = active && Some(field) == current;
         let label_style = if selected {
             Style::default()
                 .fg(Color::Black)
@@ -915,7 +1181,7 @@ fn render_settings_popup(f: &mut Frame, editor: &SettingsEditor) {
             Style::default().fg(Color::White).add_modifier(Modifier::BOLD)
         };
 
-        let value = match field {
+        let raw = match field {
             FormatField::Mode => {
                 if editor.custom_mode {
                     "Кастомный (◀/▶ или Space — переключить)".to_string()
@@ -923,6 +1189,11 @@ fn render_settings_popup(f: &mut Frame, editor: &SettingsEditor) {
                     "Дефолтный (◀/▶ или Space — переключить)".to_string()
                 }
             }
+            FormatField::Reasoning => format!(
+                "{} (◀/▶ или Space — переключить)",
+                editor.reasoning.label()
+            ),
+            FormatField::Experts => editor.experts.clone(),
             FormatField::Description => editor.description.clone(),
             FormatField::MaxLength => editor.max_length.clone(),
             FormatField::Stop => editor.stop.clone(),
@@ -933,28 +1204,39 @@ fn render_settings_popup(f: &mut Frame, editor: &SettingsEditor) {
             FormatField::FrequencyPenalty => editor.frequency_penalty.clone(),
             FormatField::PresencePenalty => editor.presence_penalty.clone(),
         };
-        let cursor = if selected && field != FormatField::Mode { "▏" } else { "" };
-        let enabled = field.is_sampling() || field == FormatField::Mode || editor.custom_mode;
+        let cursor = if selected && !field.is_toggle() { "▏" } else { "" };
+        let enabled =
+            field.is_sampling() || field.is_toggle() || field.is_reasoning_detail() || editor.custom_mode;
+        let placeholder = raw.is_empty() && !field.is_toggle();
+        let value = if placeholder {
+            "не задано — используется значение модели".to_string()
+        } else {
+            raw
+        };
+        let value_color = if !enabled || placeholder {
+            Color::DarkGray
+        } else {
+            Color::White
+        };
 
         lines.push(Line::from(Span::styled(format!(" {} ", field.label()), label_style)));
         lines.push(Line::from(Span::styled(
             format!("   {value}{cursor}"),
-            Style::default().fg(if enabled { Color::White } else { Color::DarkGray }),
+            Style::default().fg(value_color),
         )));
     }
+
     if let Some(err) = &editor.error {
         lines.push(Line::raw(""));
         lines.push(Line::from(Span::styled(
-            format!("Ошибка: {err}"),
+            format!(" Ошибка: {err}"),
             Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
         )));
     }
-    lines.push(Line::raw(""));
-    lines.push(Line::from(Span::styled(
-        "Tab/↑/↓ — поле · буквы/Backspace — редактировать · Ctrl+S — сохранить · Esc — отмена",
-        Style::default().fg(Color::DarkGray),
-    )));
 
-    let content = Paragraph::new(Text::from(lines)).wrap(Wrap { trim: false });
-    f.render_widget(content, inner);
+    f.render_widget(
+        Paragraph::new(Text::from(lines)).wrap(Wrap { trim: false }),
+        area,
+    );
 }
+

@@ -1,4 +1,5 @@
 use crate::agent::{Message, Role};
+use crate::config::ChatSettings;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -12,15 +13,19 @@ pub struct ChatSession {
     pub title: String,
     pub messages: Vec<Message>,
     pub updated_at: u64,
+    /// Параметры агента этого чата: у каждого чата они свои.
+    #[serde(default)]
+    pub settings: ChatSettings,
 }
 
 impl ChatSession {
-    pub fn new() -> Self {
+    pub fn new(settings: ChatSettings) -> Self {
         Self {
             id: generate_id(),
             title: DEFAULT_TITLE.to_string(),
             messages: Vec::new(),
             updated_at: now(),
+            settings,
         }
     }
 

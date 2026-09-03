@@ -1,10 +1,9 @@
 use super::{Agent, Message, Role};
-use crate::config::{Config, ResponseFormat, SamplingParams};
+use crate::config::{ChatSettings, Config, ResponseFormat};
 use anyhow::{bail, Context, Result};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::io::Write;
-use std::sync::RwLock;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 const DEFAULT_BASE_URL: &str = "https://api.deepseek.com";
@@ -15,8 +14,6 @@ pub struct HttpAgent {
     api_key: String,
     base_url: String,
     model: String,
-    response_format: RwLock<Option<ResponseFormat>>,
-    sampling: RwLock<SamplingParams>,
 }
 
 impl HttpAgent {
@@ -37,36 +34,28 @@ impl HttpAgent {
                 .model
                 .clone()
                 .unwrap_or_else(|| DEFAULT_MODEL.to_string()),
-            response_format: RwLock::new(config.active_response_format().cloned()),
-            sampling: RwLock::new(config.sampling.clone()),
         })
     }
 
-    /// Текущие настройки формата ответа (`None` — дефолтный режим).
-    pub fn response_format(&self) -> Option<ResponseFormat> {
-        self.response_format.read().unwrap().clone()
+    /// Системный промпт: стратегия рассуждения плюс описание формата и
+    /// условие завершения ответа (последние — только в кастомном режиме).
+    fn system_prompt(settings: &ChatSettings) -> Option<String> {
+        let mut parts = Vec::new();
+        if let Some(reasoning) = settings.reasoning_prompt() {
+            parts.push(reasoning);
+        }
+        parts.extend(Self::format_prompt_parts(settings.active_response_format()));
+        if parts.is_empty() {
+            None
+        } else {
+            Some(parts.join("\n"))
+        }
     }
 
-    /// Обновить режим ответа "на лету", без перезапуска.
-    pub fn set_response_format(&self, format: Option<ResponseFormat>) {
-        *self.response_format.write().unwrap() = format;
-    }
-
-    /// Текущие параметры сэмплирования (temperature, top_p, top_k и т.д.).
-    pub fn sampling(&self) -> SamplingParams {
-        self.sampling.read().unwrap().clone()
-    }
-
-    /// Обновить параметры сэмплирования "на лету", без перезапуска.
-    pub fn set_sampling(&self, sampling: SamplingParams) {
-        *self.sampling.write().unwrap() = sampling;
-    }
-
-    /// Системный промпт с описанием формата и условием завершения ответа
-    /// (используется только в кастомном режиме).
-    fn system_prompt(&self) -> Option<String> {
-        let format = self.response_format.read().unwrap();
-        let format = format.as_ref()?;
+    fn format_prompt_parts(format: Option<&ResponseFormat>) -> Vec<String> {
+        let Some(format) = format else {
+            return Vec::new();
+        };
         let mut parts = Vec::new();
         if let Some(description) = &format.description {
             parts.push(format!("Формат ответа: {description}"));
@@ -74,11 +63,7 @@ impl HttpAgent {
         if let Some(instruction) = &format.stop_instruction {
             parts.push(format!("Условие завершения ответа: {instruction}"));
         }
-        if parts.is_empty() {
-            None
-        } else {
-            Some(parts.join("\n"))
-        }
+        parts
     }
 }
 
@@ -209,9 +194,9 @@ fn parse_api_error(status: reqwest::StatusCode, body: &str) -> anyhow::Error {
 }
 
 impl HttpAgent {
-    fn build_messages(&self, history: &[Message]) -> Vec<ChatMessage> {
+    fn build_messages(&self, history: &[Message], settings: &ChatSettings) -> Vec<ChatMessage> {
         let mut messages = Vec::with_capacity(history.len() + 1);
-        if let Some(system_content) = self.system_prompt() {
+        if let Some(system_content) = Self::system_prompt(settings) {
             messages.push(ChatMessage {
                 role: "system",
                 content: system_content,
@@ -227,14 +212,18 @@ impl HttpAgent {
         messages
     }
 
-    fn build_request(&self, messages: Vec<ChatMessage>) -> ChatRequest<'_> {
-        let active_format = self.response_format();
-        let sampling = self.sampling();
+    fn build_request<'a>(
+        &'a self,
+        messages: Vec<ChatMessage>,
+        settings: &ChatSettings,
+    ) -> ChatRequest<'a> {
+        let active_format = settings.active_response_format();
+        let sampling = &settings.sampling;
         ChatRequest {
             model: &self.model,
             messages,
-            max_tokens: active_format.as_ref().and_then(|f| f.max_length),
-            stop: active_format.as_ref().and_then(|f| f.stop.clone()),
+            max_tokens: active_format.and_then(|f| f.max_length),
+            stop: active_format.and_then(|f| f.stop.clone()),
             temperature: sampling.temperature,
             top_p: sampling.top_p,
             top_k: sampling.top_k,
@@ -303,10 +292,10 @@ fn extract_answer(body: &str) -> Result<String> {
 
 #[async_trait]
 impl Agent for HttpAgent {
-    async fn ask(&self, history: &[Message]) -> Result<String> {
-        let messages = self.build_messages(history);
+    async fn ask(&self, history: &[Message], settings: &ChatSettings) -> Result<String> {
+        let messages = self.build_messages(history, settings);
         let url = format!("{}/chat/completions", self.base_url.trim_end_matches('/'));
-        let request_body = self.build_request(messages);
+        let request_body = self.build_request(messages, settings);
 
         let body = self.send_request(&url, &request_body).await?;
         extract_answer(&body)

@@ -32,7 +32,7 @@ pub enum ConfigAction {
     },
     /// Показать текущий конфиг (ключ маскируется)
     Show,
-    /// Настройка формата ответа (второй, кастомный режим)
+    /// Настройка формата ответа по умолчанию для новых чатов (кастомный режим)
     Format {
         #[command(subcommand)]
         action: FormatAction,
@@ -41,6 +41,16 @@ pub enum ConfigAction {
     Sampling {
         #[command(subcommand)]
         action: SamplingAction,
+    },
+    /// Стратегия рассуждения по умолчанию для новых чатов
+    Reasoning {
+        /// default | step-by-step | prompt-craft | expert-panel
+        /// (без значения — показать текущую)
+        mode: Option<String>,
+        /// Состав группы экспертов через запятую, например:
+        /// "аналитик, инженер, критик". Пустая строка — состав по умолчанию
+        #[arg(long, value_delimiter = ',')]
+        experts: Option<Vec<String>>,
     },
 }
 
