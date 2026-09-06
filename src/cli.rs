@@ -21,6 +21,27 @@ pub enum Commands {
         #[command(subcommand)]
         action: ConfigAction,
     },
+    /// Локальные модели через Ollama
+    Ollama {
+        #[command(subcommand)]
+        action: OllamaAction,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum OllamaAction {
+    /// Показать локально скачанные модели (запрос к запущенному Ollama)
+    Models,
+    /// Сделать локальную модель моделью по умолчанию для новых чатов
+    Use {
+        /// Имя модели, например gemma4:26b
+        model: String,
+    },
+    /// Задать адрес сервера Ollama (по умолчанию http://localhost:11434)
+    SetUrl {
+        /// Адрес без /api/chat
+        url: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -29,6 +50,23 @@ pub enum ConfigAction {
     SetKey {
         /// Значение API key
         key: String,
+    },
+    /// Задать модель по умолчанию для новых чатов
+    SetModel {
+        /// Имя модели, например deepseek-chat
+        model: String,
+    },
+    /// Задать базовый URL API (например https://api.deepseek.com)
+    SetUrl {
+        /// Базовый URL без /chat/completions
+        url: String,
+    },
+    /// Показать модели, доступные для быстрого выбора в настройках чата
+    Models,
+    /// Задать провайдера по умолчанию для новых чатов: cloud | ollama
+    SetProvider {
+        /// cloud — облачный API, ollama — локальные модели
+        provider: String,
     },
     /// Показать текущий конфиг (ключ маскируется)
     Show,

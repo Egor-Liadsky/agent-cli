@@ -8,8 +8,8 @@ mod tui;
 
 use agent::{Agent, AgentReply, HttpAgent, Message, MessageMeta};
 use clap::Parser;
-use cli::{Cli, Commands, ConfigAction, FormatAction, SamplingAction};
-use config::{Config, ReasoningMode, ThinkingMode};
+use cli::{Cli, Commands, ConfigAction, FormatAction, OllamaAction, SamplingAction};
+use config::{Config, Provider, ReasoningMode, ThinkingMode};
 use console::style;
 use indicatif::{ProgressBar, ProgressStyle};
 use markdown::agent_skin;
@@ -23,6 +23,7 @@ async fn main() -> anyhow::Result<()> {
         Commands::Ask { prompt } => run_ask(prompt).await?,
         Commands::Chat => run_chat().await?,
         Commands::Config { action } => run_config(action)?,
+        Commands::Ollama { action } => run_ollama(action).await?,
     }
 
     Ok(())
@@ -47,7 +48,7 @@ async fn run_ask(prompt: String) -> anyhow::Result<()> {
 async fn run_chat() -> anyhow::Result<()> {
     let config = Config::load()?;
     let agent = HttpAgent::from_config(&config)?;
-    tui::run(agent).await
+    tui::run(agent, config).await
 }
 
 fn run_config(action: ConfigAction) -> anyhow::Result<()> {
@@ -57,6 +58,38 @@ fn run_config(action: ConfigAction) -> anyhow::Result<()> {
             config.api_key = Some(key);
             config.save()?;
             println!("{}", style("API key сохранён.").green().bold());
+        }
+        ConfigAction::SetModel { model } => {
+            let mut config = Config::load()?;
+            config.model = Some(model);
+            config.save()?;
+            println!("{}", style("Модель по умолчанию сохранена.").green().bold());
+        }
+        ConfigAction::SetUrl { url } => {
+            let mut config = Config::load()?;
+            config.base_url = Some(url);
+            config.save()?;
+            println!("{}", style("Базовый URL сохранён.").green().bold());
+        }
+        ConfigAction::Models => {
+            let config = Config::load()?;
+            let current = config.effective_model();
+            for model in config.model_choices() {
+                let marker = if model == current { "●" } else { " " };
+                println!("{marker} {model}");
+            }
+        }
+        ConfigAction::SetProvider { provider } => {
+            let mut config = Config::load()?;
+            config.provider = Provider::parse(&provider).ok_or_else(|| {
+                anyhow::anyhow!("неизвестный провайдер «{provider}». Доступны: cloud, ollama")
+            })?;
+            config.save()?;
+            println!(
+                "{} {}",
+                style("Провайдер по умолчанию:").green().bold(),
+                config.provider.label()
+            );
         }
         ConfigAction::Show => show_config()?,
         ConfigAction::Format { action } => run_format_action(action)?,
@@ -70,8 +103,55 @@ fn run_config(action: ConfigAction) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Команды локального Ollama: список моделей, выбор модели, адрес сервера.
+async fn run_ollama(action: OllamaAction) -> anyhow::Result<()> {
+    match action {
+        OllamaAction::Models => {
+            let config = Config::load()?;
+            let url = config.effective_ollama_url();
+            let models = agent::list_ollama_models(&url).await?;
+            if models.is_empty() {
+                println!(
+                    "{}",
+                    style("Локальных моделей нет. Скачайте модель: ollama pull <МОДЕЛЬ>").yellow()
+                );
+                return Ok(());
+            }
+            let current = config.ollama_model.unwrap_or_default();
+            for model in models {
+                let marker = if model == current { "●" } else { " " };
+                println!("{marker} {model}");
+            }
+        }
+        OllamaAction::Use { model } => {
+            let mut config = Config::load()?;
+            config.ollama_model = Some(model);
+            config.provider = Provider::Ollama;
+            config.save()?;
+            println!(
+                "{}",
+                style("Новые чаты будут отвечать локальной моделью через Ollama.")
+                    .green()
+                    .bold()
+            );
+        }
+        OllamaAction::SetUrl { url } => {
+            let mut config = Config::load()?;
+            config.ollama_url = Some(url);
+            config.save()?;
+            println!("{}", style("Адрес Ollama сохранён.").green().bold());
+        }
+    }
+    Ok(())
+}
+
 fn show_config() -> anyhow::Result<()> {
     let config = Config::load()?;
+    println!(
+        "{} {}",
+        style("провайдер:").cyan().bold(),
+        config.provider.label()
+    );
     println!(
         "{} {}",
         style("api_key: ").cyan().bold(),
@@ -80,12 +160,26 @@ fn show_config() -> anyhow::Result<()> {
     println!(
         "{} {}",
         style("base_url:").cyan().bold(),
-        config.base_url.as_deref().unwrap_or("<не задан>")
+        config.effective_base_url()
     );
     println!(
         "{} {}",
         style("model:   ").cyan().bold(),
-        config.model.as_deref().unwrap_or("<не задан>")
+        config.effective_model()
+    );
+    println!(
+        "{} {}",
+        style("ollama_url:  ").cyan().bold(),
+        config.effective_ollama_url()
+    );
+    println!(
+        "{} {}",
+        style("ollama_model:").cyan().bold(),
+        config
+            .ollama_model
+            .clone()
+            .filter(|m| !m.trim().is_empty())
+            .unwrap_or_else(|| "<не задана>".to_string())
     );
     println!(
         "{} {}",

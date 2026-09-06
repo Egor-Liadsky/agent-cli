@@ -1,45 +1,60 @@
 use super::{Agent, AgentReply, Message, MessageMeta, Role};
-use crate::config::{ChatSettings, Config, ResponseFormat};
+use crate::config::{ChatSettings, Config, Provider, ResponseFormat, DEFAULT_MODEL};
 use anyhow::{bail, Context, Result};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::io::Write;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
-const DEFAULT_BASE_URL: &str = "https://api.deepseek.com";
-const DEFAULT_MODEL: &str = "deepseek-v4-flash";
-
 pub struct HttpAgent {
     client: reqwest::Client,
+    /// Пустая строка означает «ключ не задан»: агент создаётся и без ключа,
+    /// чтобы его можно было ввести уже в настройках чата.
     api_key: String,
     base_url: String,
+    /// Модель по умолчанию: используется, если у чата нет своей.
     model: String,
+    /// Отдельный клиент для Ollama: без прокси из окружения.
+    ollama_client: reqwest::Client,
+    /// Адрес локального Ollama для чатов с провайдером `Ollama`.
+    ollama_url: String,
+    /// Локальная модель по умолчанию для чатов с провайдером `Ollama`.
+    ollama_model: String,
 }
 
 impl HttpAgent {
     pub fn from_config(config: &Config) -> Result<Self> {
-        let api_key = config
-            .api_key
-            .clone()
-            .context("API key не задан. Выполните: agentcli config set-key <KEY>")?;
-
         Ok(Self {
             client: reqwest::Client::new(),
-            api_key,
-            base_url: config
-                .base_url
-                .clone()
-                .unwrap_or_else(|| DEFAULT_BASE_URL.to_string()),
-            model: config
-                .model
-                .clone()
-                .unwrap_or_else(|| DEFAULT_MODEL.to_string()),
+            api_key: config.api_key.clone().unwrap_or_default(),
+            base_url: config.effective_base_url(),
+            model: config.effective_model(),
+            ollama_client: super::ollama::client(),
+            ollama_url: config.effective_ollama_url(),
+            ollama_model: config.ollama_model.clone().unwrap_or_default(),
         })
+    }
+
+    /// Модель запроса: своя у чата, иначе модель по умолчанию для его
+    /// провайдера. У Ollama своя модель по умолчанию и нет встроенной:
+    /// список локальных моделей зависит от того, что скачано.
+    fn model_for(&self, settings: &ChatSettings) -> String {
+        let chat_model = settings.model.clone().filter(|m| !m.trim().is_empty());
+        match settings.provider {
+            Provider::Cloud => chat_model.unwrap_or_else(|| {
+                if self.model.trim().is_empty() {
+                    DEFAULT_MODEL.to_string()
+                } else {
+                    self.model.clone()
+                }
+            }),
+            Provider::Ollama => chat_model.unwrap_or_else(|| self.ollama_model.clone()),
+        }
     }
 
     /// Системный промпт: стратегия рассуждения плюс описание формата и
     /// условие завершения ответа (последние — только в кастомном режиме).
-    fn system_prompt(settings: &ChatSettings) -> Option<String> {
+    pub(super) fn system_prompt(settings: &ChatSettings) -> Option<String> {
         let mut parts = Vec::new();
         if let Some(reasoning) = settings.reasoning_prompt() {
             parts.push(reasoning);
@@ -155,21 +170,21 @@ struct ApiErrorDetail {
 }
 
 #[derive(Serialize)]
-struct RequestLogEntry<'a> {
-    id: &'a str,
-    timestamp: u64,
-    url: &'a str,
-    model: &'a str,
-    request: serde_json::Value,
+pub(super) struct RequestLogEntry<'a> {
+    pub id: &'a str,
+    pub timestamp: u64,
+    pub url: &'a str,
+    pub model: &'a str,
+    pub request: serde_json::Value,
 }
 
 #[derive(Serialize)]
-struct ResponseLogEntry<'a> {
-    id: &'a str,
-    timestamp: u64,
-    status: u16,
-    duration_ms: u128,
-    response: serde_json::Value,
+pub(super) struct ResponseLogEntry<'a> {
+    pub id: &'a str,
+    pub timestamp: u64,
+    pub status: u16,
+    pub duration_ms: u128,
+    pub response: serde_json::Value,
 }
 
 fn logs_dir() -> Result<std::path::PathBuf> {
@@ -190,26 +205,26 @@ fn append_log_line(file_name: &str, line: &str) {
     }
 }
 
-fn log_request(entry: &RequestLogEntry) {
+pub(super) fn log_request(entry: &RequestLogEntry) {
     if let Ok(line) = serde_json::to_string(entry) {
         append_log_line("requests.jsonl", &line);
     }
 }
 
-fn log_response(entry: &ResponseLogEntry) {
+pub(super) fn log_response(entry: &ResponseLogEntry) {
     if let Ok(line) = serde_json::to_string(entry) {
         append_log_line("responses.jsonl", &line);
     }
 }
 
-fn unix_timestamp() -> u64 {
+pub(super) fn unix_timestamp() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
 }
 
-fn request_id() -> String {
+pub(super) fn request_id() -> String {
     format!(
         "{}-{:x}",
         unix_timestamp(),
@@ -249,14 +264,15 @@ impl HttpAgent {
     }
 
     fn build_request<'a>(
-        &'a self,
+        &self,
         messages: Vec<ChatMessage>,
         settings: &ChatSettings,
+        model: &'a str,
     ) -> ChatRequest<'a> {
         let active_format = settings.active_response_format();
         let sampling = &settings.sampling;
         ChatRequest {
-            model: &self.model,
+            model,
             messages,
             max_tokens: active_format.and_then(|f| f.max_length),
             stop: active_format.and_then(|f| f.stop.clone()),
@@ -274,13 +290,19 @@ impl HttpAgent {
         url: &str,
         request_body: &ChatRequest<'_>,
     ) -> Result<(String, MessageMeta)> {
+        if self.api_key.trim().is_empty() {
+            bail!(
+                "API key не задан. Введите его в настройках чата (Ctrl+P → «Подключение») \
+                 или выполните: agentcli config set-key <KEY>"
+            );
+        }
         let id = request_id();
         let request_json = serde_json::to_value(request_body).unwrap_or(serde_json::Value::Null);
         log_request(&RequestLogEntry {
             id: &id,
             timestamp: unix_timestamp(),
             url,
-            model: &self.model,
+            model: request_body.model,
             request: request_json,
         });
 
@@ -362,9 +384,21 @@ fn extract_answer(body: &str, mut meta: MessageMeta) -> Result<AgentReply> {
 #[async_trait]
 impl Agent for HttpAgent {
     async fn ask(&self, history: &[Message], settings: &ChatSettings) -> Result<AgentReply> {
+        if settings.provider == Provider::Ollama {
+            return super::ollama::chat(
+                &self.ollama_client,
+                &self.ollama_url,
+                &self.model_for(settings),
+                history,
+                settings,
+                Self::system_prompt(settings),
+            )
+            .await;
+        }
         let messages = self.build_messages(history, settings);
         let url = format!("{}/chat/completions", self.base_url.trim_end_matches('/'));
-        let request_body = self.build_request(messages, settings);
+        let model = self.model_for(settings);
+        let request_body = self.build_request(messages, settings, &model);
 
         let (body, meta) = self.send_request(&url, &request_body).await?;
         extract_answer(&body, meta)

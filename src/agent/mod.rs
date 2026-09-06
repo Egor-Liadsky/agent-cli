@@ -1,6 +1,8 @@
 mod http;
+mod ollama;
 
 pub use http::HttpAgent;
+pub use ollama::list_models as list_ollama_models;
 
 use crate::config::ChatSettings;
 use anyhow::Result;

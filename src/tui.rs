@@ -1,6 +1,8 @@
 use crate::agent::{Agent, AgentReply, HttpAgent, Message, MessageMeta, Role};
 use crate::chats::{self, ChatSession};
-use crate::config::{ChatSettings, ReasoningMode, ResponseFormat, SamplingParams, ThinkingMode};
+use crate::config::{
+    ChatSettings, Config, Provider, ReasoningMode, ResponseFormat, SamplingParams, ThinkingMode,
+};
 use crate::markdown::agent_skin;
 use ansi_to_tui::IntoText;
 use crossterm::{
@@ -33,6 +35,8 @@ const MAX_PANES: usize = 3;
 
 enum ChatEvent {
     Response(String, anyhow::Result<AgentReply>),
+    /// Список локальных моделей Ollama: пришёл фоновой задачей.
+    OllamaModels(Result<Vec<String>, String>),
 }
 
 #[derive(PartialEq)]
@@ -52,6 +56,11 @@ struct DeleteConfirm {
 
 #[derive(Clone, Copy, PartialEq)]
 enum FormatField {
+    Provider,
+    Model,
+    BaseUrl,
+    ApiKey,
+    OllamaUrl,
     Mode,
     Reasoning,
     Thinking,
@@ -70,13 +79,15 @@ enum FormatField {
 /// Раздел настроек: группирует поля по смыслу.
 #[derive(Clone, Copy, PartialEq)]
 enum SettingsSection {
+    Connection,
     Format,
     Reasoning,
     Sampling,
 }
 
 impl SettingsSection {
-    const ALL: [SettingsSection; 3] = [
+    const ALL: [SettingsSection; 4] = [
+        SettingsSection::Connection,
         SettingsSection::Format,
         SettingsSection::Reasoning,
         SettingsSection::Sampling,
@@ -84,6 +95,7 @@ impl SettingsSection {
 
     fn label(self) -> &'static str {
         match self {
+            SettingsSection::Connection => "Подключение",
             SettingsSection::Format => "Формат ответа",
             SettingsSection::Reasoning => "Рассуждение",
             SettingsSection::Sampling => "Сэмплинг",
@@ -92,6 +104,13 @@ impl SettingsSection {
 
     fn fields(self) -> &'static [FormatField] {
         match self {
+            SettingsSection::Connection => &[
+                FormatField::Provider,
+                FormatField::Model,
+                FormatField::BaseUrl,
+                FormatField::ApiKey,
+                FormatField::OllamaUrl,
+            ],
             SettingsSection::Format => &[
                 FormatField::Mode,
                 FormatField::Description,
@@ -186,6 +205,11 @@ impl ImportPicker {
 impl FormatField {
     fn label(self) -> &'static str {
         match self {
+            FormatField::Provider => "Провайдер (◀/▶ или Space — переключить)",
+            FormatField::Model => "Модель (◀/▶ — из списка, ввод — любое имя)",
+            FormatField::BaseUrl => "Base URL API",
+            FormatField::ApiKey => "API key (общий для всех чатов)",
+            FormatField::OllamaUrl => "Адрес Ollama (общий для всех чатов)",
             FormatField::Mode => "Режим",
             FormatField::Reasoning => "Стратегия рассуждения",
             FormatField::Thinking => "Режим thinking у модели",
@@ -211,7 +235,22 @@ impl FormatField {
     fn is_toggle(self) -> bool {
         matches!(
             self,
-            FormatField::Mode | FormatField::Reasoning | FormatField::Thinking
+            FormatField::Mode
+                | FormatField::Reasoning
+                | FormatField::Thinking
+                | FormatField::Provider
+        )
+    }
+
+    /// Поля подключения: модель, адрес API и ключ — доступны всегда.
+    fn is_connection(self) -> bool {
+        matches!(
+            self,
+            FormatField::Provider
+                | FormatField::Model
+                | FormatField::BaseUrl
+                | FormatField::ApiKey
+                | FormatField::OllamaUrl
         )
     }
 
@@ -233,6 +272,26 @@ struct SettingsEditor {
     /// Чат, чьи параметры редактируются.
     chat_id: String,
     chat_title: String,
+    /// Провайдер этого чата: облачный API или локальный Ollama.
+    provider: Provider,
+    /// Модель этого чата: пусто — модель по умолчанию из конфига.
+    model: String,
+    /// Адрес API и ключ — общие для всех чатов, живут в глобальном конфиге.
+    base_url: String,
+    api_key: String,
+    /// Адрес локального Ollama — тоже общий для всех чатов.
+    ollama_url: String,
+    /// Облачные модели для переключения стрелками в поле «Модель».
+    model_choices: Vec<String>,
+    /// Локально скачанные модели Ollama, полученные с `/api/tags`.
+    ollama_models: Vec<String>,
+    /// Модель, введённая для другого провайдера: при переключении провайдера
+    /// имя модели не теряется, а меняется местами с текущим.
+    stashed_model: String,
+    /// Модель по умолчанию из конфига — показывается, когда поле пустое.
+    default_model: String,
+    /// Модель Ollama по умолчанию из конфига.
+    default_ollama_model: String,
     custom_mode: bool,
     reasoning: ReasoningMode,
     thinking: ThinkingMode,
@@ -256,7 +315,7 @@ struct SettingsEditor {
 }
 
 impl SettingsEditor {
-    fn from_chat(chat: &ChatSession) -> Self {
+    fn from_chat(chat: &ChatSession, config: &Config, ollama_models: &[String]) -> Self {
         let settings = &chat.settings;
         let custom_mode = settings.custom_response_mode;
         let format = settings.response_format.clone();
@@ -264,6 +323,16 @@ impl SettingsEditor {
         Self {
             chat_id: chat.id.clone(),
             chat_title: chat.title.clone(),
+            provider: settings.provider,
+            model: settings.model.clone().unwrap_or_default(),
+            base_url: config.base_url.clone().unwrap_or_default(),
+            api_key: config.api_key.clone().unwrap_or_default(),
+            ollama_url: config.ollama_url.clone().unwrap_or_default(),
+            model_choices: config.model_choices(),
+            ollama_models: ollama_models.to_vec(),
+            stashed_model: String::new(),
+            default_model: config.effective_model(),
+            default_ollama_model: config.ollama_model.clone().unwrap_or_default(),
             custom_mode,
             reasoning: settings.reasoning,
             thinking: settings.thinking,
@@ -301,8 +370,13 @@ impl SettingsEditor {
             .fields()
             .iter()
             .copied()
-            .filter(|field| {
-                *field != FormatField::Experts || self.reasoning == ReasoningMode::ExpertPanel
+            .filter(|field| match field {
+                // состав экспертов имеет смысл только для своей стратегии
+                FormatField::Experts => self.reasoning == ReasoningMode::ExpertPanel,
+                // адрес и ключ облака не нужны локальным моделям, и наоборот
+                FormatField::BaseUrl | FormatField::ApiKey => self.provider == Provider::Cloud,
+                FormatField::OllamaUrl => self.provider == Provider::Ollama,
+                _ => true,
             })
             .collect()
     }
@@ -368,6 +442,30 @@ impl SettingsEditor {
         self.field = self.field.min(len.saturating_sub(1));
     }
 
+    /// Переключение провайдера: набор видимых полей и список моделей
+    /// для стрелок зависят от него.
+    fn cycle_provider(&mut self, delta: i32) {
+        let providers = Provider::ALL;
+        let len = providers.len() as i32;
+        let current = providers.iter().position(|p| *p == self.provider).unwrap_or(0) as i32;
+        let next = providers[(current + delta).rem_euclid(len) as usize];
+        if next != self.provider {
+            // имя облачной модели локальной не подходит и наоборот
+            std::mem::swap(&mut self.model, &mut self.stashed_model);
+            self.provider = next;
+        }
+        let len = self.visible_fields().len();
+        self.field = self.field.min(len.saturating_sub(1));
+    }
+
+    /// Модели, между которыми переключает поле «Модель» у текущего провайдера.
+    fn current_model_choices(&self) -> &[String] {
+        match self.provider {
+            Provider::Cloud => &self.model_choices,
+            Provider::Ollama => &self.ollama_models,
+        }
+    }
+
     fn cycle_thinking(&mut self, delta: i32) {
         let modes = ThinkingMode::ALL;
         let len = modes.len() as i32;
@@ -375,10 +473,27 @@ impl SettingsEditor {
         self.thinking = modes[(current + delta).rem_euclid(len) as usize];
     }
 
+    /// Перебор известных моделей стрелками. Если в поле введено что-то своё,
+    /// перебор начинается с первой модели списка.
+    fn cycle_model(&mut self, delta: i32) {
+        let choices = self.current_model_choices();
+        if choices.is_empty() {
+            return;
+        }
+        let len = choices.len() as i32;
+        let next = match choices.iter().position(|m| *m == self.model) {
+            Some(current) => (current as i32 + delta).rem_euclid(len),
+            None if delta >= 0 => 0,
+            None => len - 1,
+        };
+        self.model = choices[next as usize].clone();
+    }
+
     /// Сбросить текущее поле к значению по умолчанию.
     fn reset_field(&mut self) {
         match self.current_field() {
             Some(FormatField::Mode) => self.custom_mode = false,
+            Some(FormatField::Provider) => self.provider = Provider::default(),
             Some(FormatField::Reasoning) => self.reasoning = ReasoningMode::default(),
             Some(FormatField::Thinking) => self.thinking = ThinkingMode::default(),
             _ => {
@@ -391,7 +506,14 @@ impl SettingsEditor {
 
     fn field_value_mut(&mut self) -> Option<&mut String> {
         match self.current_field()? {
-            FormatField::Mode | FormatField::Reasoning | FormatField::Thinking => None,
+            FormatField::Mode
+            | FormatField::Reasoning
+            | FormatField::Thinking
+            | FormatField::Provider => None,
+            FormatField::Model => Some(&mut self.model),
+            FormatField::BaseUrl => Some(&mut self.base_url),
+            FormatField::ApiKey => Some(&mut self.api_key),
+            FormatField::OllamaUrl => Some(&mut self.ollama_url),
             FormatField::Experts => Some(&mut self.experts),
             FormatField::Description => Some(&mut self.description),
             FormatField::MaxLength => Some(&mut self.max_length),
@@ -504,7 +626,7 @@ fn non_empty(s: &str) -> Option<String> {
     }
 }
 
-pub async fn run(agent: HttpAgent) -> anyhow::Result<()> {
+pub async fn run(agent: HttpAgent, config: Config) -> anyhow::Result<()> {
     let agent = Arc::new(agent);
 
     enable_raw_mode()?;
@@ -513,7 +635,7 @@ pub async fn run(agent: HttpAgent) -> anyhow::Result<()> {
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    let result = run_app(&mut terminal, agent).await;
+    let result = run_app(&mut terminal, agent, config).await;
 
     disable_raw_mode()?;
     execute!(
@@ -560,6 +682,10 @@ impl Default for ChatUi {
 }
 
 struct AppState {
+    /// Глобальный конфиг: ключ API, адрес и модель по умолчанию.
+    config: Config,
+    /// Взведён, когда изменились ключ или адрес API: агента надо пересобрать.
+    agent_dirty: bool,
     chats: Vec<ChatSession>,
     chat_ui: HashMap<String, ChatUi>,
     /// Id чатов, открытых сейчас на экране, по одной панели на элемент.
@@ -577,6 +703,9 @@ struct AppState {
     notice: Option<(String, Instant)>,
     /// Показывать ли цепочку рассуждений модели в истории.
     show_reasoning: bool,
+    /// Локально скачанные модели Ollama: подгружаются фоном при старте
+    /// и обновляются по Ctrl+L в настройках.
+    ollama_models: Vec<String>,
 }
 
 impl AppState {
@@ -616,8 +745,22 @@ impl AppState {
         self.chat_ui.get(&self.panes[self.active_pane]).map(|u| u.input.as_str()).unwrap_or("")
     }
 
+    /// Вставка из буфера обмена: в настройках она идёт в активное поле
+    /// (ключ API удобнее вставлять, чем набирать), иначе — в поле ввода чата.
     fn insert_into_input(&mut self, text: &str) {
-        if matches!(self.focus, Focus::Settings | Focus::Import | Focus::Confirm) {
+        if self.focus == Focus::Settings {
+            let flat = text.replace(['\n', '\r'], "");
+            if let Some(value) = self
+                .settings
+                .as_mut()
+                .filter(|editor| editor.pane == SettingsPane::Fields)
+                .and_then(|editor| editor.field_value_mut())
+            {
+                value.push_str(&flat);
+            }
+            return;
+        }
+        if matches!(self.focus, Focus::Import | Focus::Confirm) {
             return;
         }
         let chat_id = self.active_chat_id();
@@ -632,10 +775,11 @@ impl AppState {
 
 async fn run_app(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
-    agent: Arc<HttpAgent>,
+    mut agent: Arc<HttpAgent>,
+    config: Config,
 ) -> anyhow::Result<()> {
     let mut chats: Vec<ChatSession> = chats::list_chats().unwrap_or_default();
-    chats.insert(0, ChatSession::new(ChatSettings::default()));
+    chats.insert(0, ChatSession::new(config.default_chat_settings()));
 
     let mut chat_ui: HashMap<String, ChatUi> = HashMap::new();
     for chat in &chats {
@@ -644,6 +788,8 @@ async fn run_app(
     let first_id = chats[0].id.clone();
 
     let mut state = AppState {
+        config,
+        agent_dirty: false,
         chats,
         chat_ui,
         panes: vec![first_id],
@@ -656,9 +802,13 @@ async fn run_app(
         delete_confirm: None,
         notice: None,
         show_reasoning: true,
+        ollama_models: Vec::new(),
     };
 
     let (tx, mut rx) = mpsc::unbounded_channel::<ChatEvent>();
+    // список локальных моделей тянем фоном: Ollama может быть не запущен,
+    // и ждать его на старте незачем
+    fetch_ollama_models(&state.config, &tx);
     let mut events = EventStream::new();
     let mut tick = tokio::time::interval(Duration::from_millis(80));
 
@@ -677,6 +827,17 @@ async fn run_app(
                     Event::Key(key) if key.kind == KeyEventKind::Press => {
                         if matches!(handle_key(key, &mut state, &agent, &tx), LoopControl::Break) {
                             break;
+                        }
+                        // ключ или адрес API поменяли — дальше шлём запросы
+                        // уже новым агентом (запущенные ждут на старом)
+                        if state.agent_dirty {
+                            state.agent_dirty = false;
+                            match HttpAgent::from_config(&state.config) {
+                                Ok(updated) => agent = Arc::new(updated),
+                                Err(err) => state.notify(format!(
+                                    "Не удалось применить настройки подключения: {err}"
+                                )),
+                            }
                         }
                     }
                     // вставка из буфера обмена приходит одним событием (bracketed paste)
@@ -704,7 +865,7 @@ fn handle_global_key(key: crossterm::event::KeyEvent, state: &mut AppState) -> O
         {
             return Some(LoopControl::Continue);
         }
-        let chat = ChatSession::new(ChatSettings::default());
+        let chat = ChatSession::new(state.config.default_chat_settings());
         let id = chat.id.clone();
         state.chats.insert(0, chat);
         state.chat_ui.insert(id.clone(), ChatUi::default());
@@ -795,7 +956,11 @@ fn handle_key(
             state.focus = Focus::Input;
         } else {
             let chat_index = state.chat_index(&state.active_chat_id());
-            state.settings = Some(SettingsEditor::from_chat(&state.chats[chat_index]));
+            state.settings = Some(SettingsEditor::from_chat(
+                &state.chats[chat_index],
+                &state.config,
+                &state.ollama_models,
+            ));
             state.focus = Focus::Settings;
         }
         return LoopControl::Continue;
@@ -810,7 +975,7 @@ fn handle_key(
     }
 
     match state.focus {
-        Focus::Settings => handle_settings_key(key, state),
+        Focus::Settings => handle_settings_key(key, state, tx),
         Focus::Import => handle_import_key(key, state),
         Focus::Confirm => handle_confirm_key(key, state),
         Focus::Sidebar => handle_sidebar_key(key, state),
@@ -824,7 +989,11 @@ fn handle_key(
     }
 }
 
-fn handle_settings_key(key: crossterm::event::KeyEvent, state: &mut AppState) -> LoopControl {
+fn handle_settings_key(
+    key: crossterm::event::KeyEvent,
+    state: &mut AppState,
+    tx: &mpsc::UnboundedSender<ChatEvent>,
+) -> LoopControl {
     let editor = state.settings.as_mut().expect("settings focus implies editor");
     match key.code {
         KeyCode::Esc => {
@@ -842,11 +1011,18 @@ fn handle_settings_key(key: crossterm::event::KeyEvent, state: &mut AppState) ->
                     // состав сохраняем всегда: при возврате к «Группе экспертов»
                     // ранее введённый список не теряется
                     let experts = split_list(&editor.experts);
+                    let model = non_empty(&editor.model);
+                    let provider = editor.provider;
                     let chat_id = editor.chat_id.clone();
+                    let base_url = non_empty(&editor.base_url);
+                    let api_key = non_empty(&editor.api_key);
+                    let ollama_url = non_empty(&editor.ollama_url);
                     state.settings = None;
                     state.focus = Focus::Input;
                     if let Some(chat) = state.chats.iter_mut().find(|c| c.id == chat_id) {
                         chat.settings = ChatSettings {
+                            provider,
+                            model,
                             custom_response_mode: format.is_some(),
                             response_format: format.unwrap_or_default(),
                             sampling,
@@ -856,6 +1032,7 @@ fn handle_settings_key(key: crossterm::event::KeyEvent, state: &mut AppState) ->
                         };
                         let _ = chats::save_chat(chat);
                     }
+                    save_connection(state, base_url, api_key, ollama_url);
                 }
                 Err(err) => editor.error = Some(err),
             }
@@ -886,6 +1063,35 @@ fn handle_settings_key(key: crossterm::event::KeyEvent, state: &mut AppState) ->
                 && editor.current_field() == Some(FormatField::Reasoning) =>
         {
             editor.cycle_reasoning(1);
+        }
+        KeyCode::Char('l') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            editor.error = None;
+            state.notify("Обновляю список моделей Ollama…");
+            fetch_ollama_models(&state.config, tx);
+        }
+        KeyCode::Left
+            if editor.pane == SettingsPane::Fields
+                && editor.current_field() == Some(FormatField::Provider) =>
+        {
+            editor.cycle_provider(-1);
+        }
+        KeyCode::Right | KeyCode::Char(' ')
+            if editor.pane == SettingsPane::Fields
+                && editor.current_field() == Some(FormatField::Provider) =>
+        {
+            editor.cycle_provider(1);
+        }
+        KeyCode::Left
+            if editor.pane == SettingsPane::Fields
+                && editor.current_field() == Some(FormatField::Model) =>
+        {
+            editor.cycle_model(-1);
+        }
+        KeyCode::Right
+            if editor.pane == SettingsPane::Fields
+                && editor.current_field() == Some(FormatField::Model) =>
+        {
+            editor.cycle_model(1);
         }
         KeyCode::Left
             if editor.pane == SettingsPane::Fields
@@ -922,6 +1128,32 @@ fn handle_settings_key(key: crossterm::event::KeyEvent, state: &mut AppState) ->
         _ => {}
     }
     LoopControl::Continue
+}
+
+/// Сохранить общие параметры подключения в конфиг. Ключ и адрес общие для всех
+/// чатов, поэтому после изменения агента нужно пересобрать.
+fn save_connection(
+    state: &mut AppState,
+    base_url: Option<String>,
+    api_key: Option<String>,
+    ollama_url: Option<String>,
+) {
+    if state.config.base_url == base_url
+        && state.config.api_key == api_key
+        && state.config.ollama_url == ollama_url
+    {
+        return;
+    }
+    state.config.base_url = base_url;
+    state.config.api_key = api_key;
+    state.config.ollama_url = ollama_url;
+    match state.config.save() {
+        Ok(()) => {
+            state.agent_dirty = true;
+            state.notify("Настройки подключения сохранены");
+        }
+        Err(err) => state.notify(format!("Не удалось сохранить конфиг: {err}")),
+    }
 }
 
 /// Клавиши окна импорта: ↑/↓ — выбор чата, Space — отметить, Enter — перенести.
@@ -1057,7 +1289,7 @@ fn delete_chat(state: &mut AppState, chat_id: &str) {
 
     // в списке всегда должен остаться хотя бы один чат, куда можно писать
     if state.chats.is_empty() {
-        let chat = ChatSession::new(ChatSettings::default());
+        let chat = ChatSession::new(state.config.default_chat_settings());
         state.chat_ui.insert(chat.id.clone(), ChatUi::default());
         state.chats.push(chat);
     }
@@ -1155,8 +1387,29 @@ fn handle_input_key(
     LoopControl::Continue
 }
 
+/// Фоновый запрос списка локальных моделей Ollama.
+fn fetch_ollama_models(config: &Config, tx: &mpsc::UnboundedSender<ChatEvent>) {
+    let url = config.effective_ollama_url();
+    let tx = tx.clone();
+    tokio::spawn(async move {
+        let result = crate::agent::list_ollama_models(&url)
+            .await
+            .map_err(|err| err.to_string());
+        let _ = tx.send(ChatEvent::OllamaModels(result));
+    });
+}
+
 fn handle_chat_event(chat_event: ChatEvent, state: &mut AppState) {
-    let ChatEvent::Response(chat_id, result) = chat_event;
+    let chat_event = match chat_event {
+        ChatEvent::OllamaModels(result) => {
+            handle_ollama_models(result, state);
+            return;
+        }
+        other => other,
+    };
+    let ChatEvent::Response(chat_id, result) = chat_event else {
+        return;
+    };
     let mut message = match result {
         Ok(reply) => {
             let mut message = Message::assistant(reply.content);
@@ -1185,6 +1438,33 @@ fn handle_chat_event(chat_event: ChatEvent, state: &mut AppState) {
     ui.pending_since = None;
     ui.auto_scroll = false;
     ui.scroll_to_message = Some(last_index);
+}
+
+/// Обновить список локальных моделей в состоянии и в открытом редакторе
+/// настроек. Ошибка не мешает работе: облачные чаты от неё не зависят.
+fn handle_ollama_models(result: Result<Vec<String>, String>, state: &mut AppState) {
+    match result {
+        Ok(models) => {
+            let count = models.len();
+            state.ollama_models = models.clone();
+            if let Some(editor) = state.settings.as_mut() {
+                editor.ollama_models = models;
+            }
+            if state.focus == Focus::Settings {
+                state.notify(format!("Ollama: найдено моделей — {count}"));
+            }
+        }
+        Err(err) => {
+            state.ollama_models.clear();
+            if let Some(editor) = state.settings.as_mut() {
+                editor.ollama_models.clear();
+                editor.error = Some(err.clone());
+            }
+            if state.focus == Focus::Settings {
+                state.notify(format!("Ollama недоступен: {err}"));
+            }
+        }
+    }
 }
 
 fn render_ui(f: &mut Frame, state: &mut AppState) {
@@ -1372,9 +1652,32 @@ fn render_pane_title(
             .bg(Color::DarkGray)
             .add_modifier(Modifier::BOLD)
     };
+    let settings = &state.chats[chat_index].settings;
+    let model = settings
+        .model
+        .clone()
+        .filter(|m| !m.trim().is_empty())
+        .unwrap_or_else(|| match settings.provider {
+            Provider::Cloud => state.config.effective_model(),
+            Provider::Ollama => state
+                .config
+                .ollama_model
+                .clone()
+                .filter(|m| !m.trim().is_empty())
+                .unwrap_or_else(|| "модель не выбрана".to_string()),
+        });
+    // локальные чаты помечаем: по имени модели провайдер не всегда очевиден
+    let model = match settings.provider {
+        Provider::Cloud => model,
+        Provider::Ollama => format!("ollama · {model}"),
+    };
     let title = Paragraph::new(Line::from(vec![
         Span::styled(" agentcli ", badge_style),
         Span::raw(format!("  {}", state.chats[chat_index].title)),
+        Span::styled(
+            format!("  [{model}]"),
+            Style::default().fg(Color::DarkGray),
+        ),
     ]));
     f.render_widget(title, area);
 }
@@ -1625,7 +1928,8 @@ fn render_settings_popup(f: &mut Frame, editor: &SettingsEditor) {
 
     f.render_widget(
         Paragraph::new(Line::from(Span::styled(
-            " Tab — панель/поле · ↑/↓ — выбор · Ctrl+D — сброс · Ctrl+S — сохранить · Esc — отмена",
+            " Tab — панель/поле · ↑/↓ — выбор · Ctrl+D — сброс · Ctrl+L — модели Ollama · \
+Ctrl+S — сохранить · Esc — отмена",
             Style::default().fg(Color::DarkGray),
         ))),
         rows[1],
@@ -1665,6 +1969,45 @@ fn render_settings_sections(f: &mut Frame, editor: &SettingsEditor, area: Rect) 
     f.render_widget(Paragraph::new(Text::from(lines)), inner);
 }
 
+/// Подсказка вместо пустого значения поля.
+fn empty_field_hint(field: FormatField, editor: &SettingsEditor) -> String {
+    match field {
+        FormatField::Model => match editor.provider {
+            Provider::Cloud => format!("не задана — {} из конфига", editor.default_model),
+            Provider::Ollama if !editor.default_ollama_model.is_empty() => format!(
+                "не задана — {} из конфига",
+                editor.default_ollama_model
+            ),
+            Provider::Ollama if editor.ollama_models.is_empty() => {
+                "локальных моделей не видно — Ctrl+L обновить список".to_string()
+            }
+            Provider::Ollama => format!(
+                "не задана — ◀/▶ выбрать из {} локальных",
+                editor.ollama_models.len()
+            ),
+        },
+        FormatField::BaseUrl => format!("не задан — {}", crate::config::DEFAULT_BASE_URL),
+        FormatField::ApiKey => "не задан — запросы к API не пройдут".to_string(),
+        FormatField::OllamaUrl => {
+            format!("не задан — {}", crate::config::DEFAULT_OLLAMA_URL)
+        }
+        _ => "не задано — используется значение модели".to_string(),
+    }
+}
+
+/// Ключ на экране не показываем целиком: видны только последние 4 символа.
+fn mask_secret(value: &str) -> String {
+    let count = value.chars().count();
+    if count == 0 {
+        return String::new();
+    }
+    if count <= 4 {
+        return "•".repeat(count);
+    }
+    let tail: String = value.chars().skip(count - 4).collect();
+    format!("{}{tail}", "•".repeat(count - 4))
+}
+
 /// Правая панель попапа: поля активного раздела.
 fn render_settings_fields(f: &mut Frame, editor: &SettingsEditor, area: Rect) {
     let active = editor.pane == SettingsPane::Fields;
@@ -1683,6 +2026,14 @@ fn render_settings_fields(f: &mut Frame, editor: &SettingsEditor, area: Rect) {
         };
 
         let raw = match field {
+            FormatField::Provider => format!(
+                "{} (◀/▶ или Space — переключить)",
+                editor.provider.label()
+            ),
+            FormatField::Model => editor.model.clone(),
+            FormatField::BaseUrl => editor.base_url.clone(),
+            FormatField::ApiKey => mask_secret(&editor.api_key),
+            FormatField::OllamaUrl => editor.ollama_url.clone(),
             FormatField::Mode => {
                 if editor.custom_mode {
                     "Кастомный (◀/▶ или Space — переключить)".to_string()
@@ -1710,11 +2061,14 @@ fn render_settings_fields(f: &mut Frame, editor: &SettingsEditor, area: Rect) {
             FormatField::PresencePenalty => editor.presence_penalty.clone(),
         };
         let cursor = if selected && !field.is_toggle() { "▏" } else { "" };
-        let enabled =
-            field.is_sampling() || field.is_toggle() || field.is_reasoning_detail() || editor.custom_mode;
+        let enabled = field.is_connection()
+            || field.is_sampling()
+            || field.is_toggle()
+            || field.is_reasoning_detail()
+            || editor.custom_mode;
         let placeholder = raw.is_empty() && !field.is_toggle();
         let value = if placeholder {
-            "не задано — используется значение модели".to_string()
+            empty_field_hint(field, editor)
         } else {
             raw
         };

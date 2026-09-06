@@ -2,6 +2,55 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
+/// Базовый URL API по умолчанию, если он не задан в конфиге.
+pub const DEFAULT_BASE_URL: &str = "https://api.deepseek.com";
+/// Модель по умолчанию, если она не задана ни в чате, ни в конфиге.
+pub const DEFAULT_MODEL: &str = "deepseek-v4-flash";
+/// Адрес локального сервера Ollama по умолчанию.
+pub const DEFAULT_OLLAMA_URL: &str = "http://localhost:11434";
+
+/// Модели, между которыми можно переключаться стрелками в настройках чата.
+/// Список — только подсказка: в поле модели можно ввести любое имя,
+/// а свой набор задаётся в конфиге полем `models`.
+pub const KNOWN_MODELS: [&str; 6] = [
+    "deepseek-v4-flash",
+    "deepseek-chat",
+    "deepseek-reasoner",
+    "gpt-4o",
+    "gpt-4o-mini",
+    "o3-mini",
+];
+
+/// Кто отвечает в чате: облачный API или локальная модель через Ollama.
+#[derive(Serialize, Deserialize, Default, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum Provider {
+    /// Облачный OpenAI-совместимый API: base_url + API key.
+    #[default]
+    Cloud,
+    /// Локальный Ollama: нативный /api/chat, ключ не нужен.
+    Ollama,
+}
+
+impl Provider {
+    pub const ALL: [Provider; 2] = [Provider::Cloud, Provider::Ollama];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Provider::Cloud => "Облачный API",
+            Provider::Ollama => "Ollama (локально)",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Provider> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "cloud" | "api" | "облако" => Some(Provider::Cloud),
+            "ollama" | "local" | "локально" => Some(Provider::Ollama),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Serialize, Deserialize, Default, Debug, Clone)]
 pub struct ResponseFormat {
     /// Описание формата ответа (например: "отвечай маркированным списком")
@@ -167,6 +216,13 @@ impl ReasoningMode {
 /// Параметры агента, привязанные к конкретному чату.
 #[derive(Serialize, Deserialize, Default, Debug, Clone)]
 pub struct ChatSettings {
+    /// Откуда берётся ответ: облачный API или локальная модель Ollama.
+    #[serde(default)]
+    pub provider: Provider,
+    /// Модель, которой отвечает этот чат. `None` — модель из глобального
+    /// конфига, а если и там пусто — `DEFAULT_MODEL`.
+    #[serde(default)]
+    pub model: Option<String>,
     /// Режим ответа: false — дефолтный, true — кастомный (см. response_format)
     #[serde(default)]
     pub custom_response_mode: bool,
@@ -207,6 +263,17 @@ pub struct Config {
     pub api_key: Option<String>,
     pub base_url: Option<String>,
     pub model: Option<String>,
+    /// Провайдер по умолчанию для новых чатов.
+    #[serde(default)]
+    pub provider: Provider,
+    /// Адрес локального Ollama. Пусто — `DEFAULT_OLLAMA_URL`.
+    pub ollama_url: Option<String>,
+    /// Локальная модель по умолчанию для чатов с провайдером Ollama.
+    pub ollama_model: Option<String>,
+    /// Свой список моделей для быстрого переключения в настройках чата.
+    /// Пустой список — используется `KNOWN_MODELS`.
+    #[serde(default)]
+    pub models: Vec<String>,
     /// Режим ответа: false — дефолтный, true — кастомный (см. response_format)
     #[serde(default)]
     pub custom_response_mode: bool,
@@ -260,12 +327,56 @@ impl Config {
     /// шаблоном, дальше каждый чат правит свои параметры независимо.
     pub fn default_chat_settings(&self) -> ChatSettings {
         ChatSettings {
+            provider: self.provider,
+            model: self.default_model_for(self.provider),
             custom_response_mode: self.custom_response_mode,
             response_format: self.response_format.clone(),
             sampling: self.sampling.clone(),
             reasoning: self.reasoning,
             thinking: self.thinking,
             experts: self.experts.clone(),
+        }
+    }
+
+    /// Модель по умолчанию для новых чатов и для чатов без своей модели.
+    pub fn effective_model(&self) -> String {
+        self.model
+            .clone()
+            .filter(|m| !m.trim().is_empty())
+            .unwrap_or_else(|| DEFAULT_MODEL.to_string())
+    }
+
+    /// Модель по умолчанию для выбранного провайдера: у Ollama свой список
+    /// моделей, поэтому и модель по умолчанию у неё своя.
+    pub fn default_model_for(&self, provider: Provider) -> Option<String> {
+        let value = match provider {
+            Provider::Cloud => self.model.clone(),
+            Provider::Ollama => self.ollama_model.clone(),
+        };
+        value.filter(|m| !m.trim().is_empty())
+    }
+
+    pub fn effective_ollama_url(&self) -> String {
+        self.ollama_url
+            .clone()
+            .filter(|u| !u.trim().is_empty())
+            .unwrap_or_else(|| DEFAULT_OLLAMA_URL.to_string())
+    }
+
+    pub fn effective_base_url(&self) -> String {
+        self.base_url
+            .clone()
+            .filter(|u| !u.trim().is_empty())
+            .unwrap_or_else(|| DEFAULT_BASE_URL.to_string())
+    }
+
+    /// Список моделей для переключения стрелками: свой из конфига либо
+    /// встроенный `KNOWN_MODELS`.
+    pub fn model_choices(&self) -> Vec<String> {
+        if self.models.is_empty() {
+            KNOWN_MODELS.iter().map(|m| m.to_string()).collect()
+        } else {
+            self.models.clone()
         }
     }
 
