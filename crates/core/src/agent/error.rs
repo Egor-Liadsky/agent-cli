@@ -10,34 +10,110 @@ use std::fmt;
 /// Нейтральный текст об отсутствующем ключе: без команд консольного клиента.
 pub const MISSING_API_KEY_MESSAGE: &str = "API key не задан";
 
+/// Нейтральный текст об отказе аутентификации: без команд консольного клиента.
+pub const UNAUTHORIZED_MESSAGE: &str = "сервис не принял клиентский токен";
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AgentError {
     /// Провайдер не ответил в отведённое время.
-    Timeout,
+    Timeout { request_id: Option<String> },
     /// Провайдер ответил кодом ошибки.
-    Provider { status: u16, message: String },
+    Provider {
+        status: u16,
+        message: String,
+        request_id: Option<String>,
+    },
     /// Запрос не дошёл до провайдера: сеть, DNS, TLS.
     Transport(String),
     /// Ключ провайдера не задан. `hint` задаёт вызывающая сторона.
     MissingApiKey { hint: Option<String> },
     /// Ответ провайдера не разобран.
     Decode(String),
+    /// Клиентский токен отсутствует или не известен сервису.
+    Unauthorized {
+        hint: Option<String>,
+        request_id: Option<String>,
+    },
+    /// Запрос отвергнут как неправильно составленный.
+    InvalidRequest {
+        message: String,
+        request_id: Option<String>,
+    },
+    /// Запрос отклонён стадией конвейера: код и причина отказа.
+    PolicyRejected {
+        code: String,
+        reason: String,
+        request_id: Option<String>,
+    },
+    /// Превышен предел нагрузки.
+    RateLimited {
+        message: String,
+        request_id: Option<String>,
+    },
 }
 
 impl AgentError {
     pub fn missing_api_key(hint: Option<String>) -> Self {
         AgentError::MissingApiKey { hint }
     }
+
+    pub fn timeout() -> Self {
+        AgentError::Timeout { request_id: None }
+    }
+
+    pub fn provider(status: u16, message: impl Into<String>) -> Self {
+        AgentError::Provider {
+            status,
+            message: message.into(),
+            request_id: None,
+        }
+    }
+
+    /// Идентификатор запроса виден в тексте ошибки: без него разбирательство
+    /// по журналу сервиса невозможно.
+    pub fn request_id(&self) -> Option<&str> {
+        match self {
+            AgentError::Timeout { request_id }
+            | AgentError::Provider { request_id, .. }
+            | AgentError::Unauthorized { request_id, .. }
+            | AgentError::InvalidRequest { request_id, .. }
+            | AgentError::PolicyRejected { request_id, .. }
+            | AgentError::RateLimited { request_id, .. } => request_id.as_deref(),
+            AgentError::Transport(_) | AgentError::MissingApiKey { .. } | AgentError::Decode(_) => {
+                None
+            }
+        }
+    }
+}
+
+/// Хвост сообщения с идентификатором запроса, если он известен.
+fn request_id_suffix(request_id: &Option<String>) -> String {
+    match request_id {
+        Some(id) if !id.trim().is_empty() => format!(" (request_id: {id})"),
+        _ => String::new(),
+    }
 }
 
 impl fmt::Display for AgentError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            AgentError::Timeout => {
-                write!(f, "провайдер не ответил в отведённое время")
+            AgentError::Timeout { request_id } => {
+                write!(
+                    f,
+                    "провайдер не ответил в отведённое время{}",
+                    request_id_suffix(request_id)
+                )
             }
-            AgentError::Provider { status, message } => {
-                write!(f, "API вернул ошибку ({status}): {message}")
+            AgentError::Provider {
+                status,
+                message,
+                request_id,
+            } => {
+                write!(
+                    f,
+                    "API вернул ошибку ({status}): {message}{}",
+                    request_id_suffix(request_id)
+                )
             }
             AgentError::Transport(message) => write!(f, "{message}"),
             AgentError::MissingApiKey { hint } => match hint {
@@ -45,6 +121,38 @@ impl fmt::Display for AgentError {
                 None => write!(f, "{MISSING_API_KEY_MESSAGE}"),
             },
             AgentError::Decode(message) => write!(f, "{message}"),
+            AgentError::Unauthorized { hint, request_id } => {
+                let suffix = request_id_suffix(request_id);
+                match hint {
+                    Some(hint) => write!(f, "{UNAUTHORIZED_MESSAGE}. {hint}{suffix}"),
+                    None => write!(f, "{UNAUTHORIZED_MESSAGE}{suffix}"),
+                }
+            }
+            AgentError::InvalidRequest {
+                message,
+                request_id,
+            } => write!(
+                f,
+                "сервис отклонил запрос: {message}{}",
+                request_id_suffix(request_id)
+            ),
+            AgentError::PolicyRejected {
+                code,
+                reason,
+                request_id,
+            } => write!(
+                f,
+                "запрос отклонён политикой сервиса ({code}): {reason}{}",
+                request_id_suffix(request_id)
+            ),
+            AgentError::RateLimited {
+                message,
+                request_id,
+            } => write!(
+                f,
+                "превышен предел нагрузки: {message}{}",
+                request_id_suffix(request_id)
+            ),
         }
     }
 }
@@ -52,9 +160,9 @@ impl fmt::Display for AgentError {
 impl std::error::Error for AgentError {}
 
 /// Ошибка `reqwest` в терминах ядра: таймаут отделён от прочего транспорта.
-pub(super) fn transport_error(context: &str, err: reqwest::Error) -> AgentError {
+pub fn transport_error(context: &str, err: reqwest::Error) -> AgentError {
     if err.is_timeout() {
-        AgentError::Timeout
+        AgentError::timeout()
     } else {
         AgentError::Transport(format!("{context}: {err}"))
     }

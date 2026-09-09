@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/core", "crates/cli"]
+members = ["crates/core", "crates/upstream", "crates/client", "crates/cli"]
 
 [workspace.package]
 version = "0.1.0"
@@ -8,6 +8,8 @@ edition = "2024"
 
 [workspace.dependencies]
 agentcore = { path = "crates/core" }
+agentupstream = { path = "crates/upstream" }
+agentclient = { path = "crates/client" }
 anyhow = "1"
 async-trait = "0.1"
 dirs = "5"

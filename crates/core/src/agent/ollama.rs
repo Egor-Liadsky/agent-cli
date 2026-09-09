@@ -103,11 +103,11 @@ struct TagEntry {
 /// Клиент для локальных запросов. Прокси из окружения (`HTTP_PROXY`)
 /// отключён намеренно: Ollama работает на самой машине, а прокси рвёт
 /// долгие ответы больших моделей по своему таймауту (502 с пустым телом).
-pub(super) fn client_builder() -> reqwest::ClientBuilder {
+pub fn client_builder() -> reqwest::ClientBuilder {
     reqwest::Client::builder().no_proxy()
 }
 
-pub(super) fn client() -> reqwest::Client {
+pub fn client() -> reqwest::Client {
     client_builder()
         .build()
         .unwrap_or_else(|_| reqwest::Client::new())
@@ -132,10 +132,7 @@ fn parse_error(status: reqwest::StatusCode, body: &str) -> AgentError {
             .map(|e| e.error)
             .unwrap_or_else(|_| body.to_string())
     };
-    AgentError::Provider {
-        status: status.as_u16(),
-        message,
-    }
+    AgentError::provider(status.as_u16(), message)
 }
 
 /// Не удалось соединиться — почти всегда это «сервер не запущен».
@@ -286,6 +283,7 @@ pub async fn chat(
         duration_ms: Some(duration_ms as u64),
         sent_at: Some(sent_at),
         received_at: Some(unix_timestamp() as i64),
+        model: Some(model.to_string()),
     };
     let reasoning = parsed
         .message
@@ -297,5 +295,7 @@ pub async fn chat(
         content: parsed.message.content,
         reasoning,
         meta,
+        model: Some(model.to_string()),
+        policy: None,
     })
 }

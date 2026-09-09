@@ -9,6 +9,8 @@ path = "src/main.rs"
 
 [dependencies]
 agentcore.workspace = true
+agentclient.workspace = true
+async-trait.workspace = true
 anyhow.workspace = true
 dirs.workspace = true
 serde.workspace = true

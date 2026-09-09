@@ -2,8 +2,8 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
-/// Базовый URL API по умолчанию, если он не задан в конфиге.
-pub const DEFAULT_BASE_URL: &str = "https://api.deepseek.com";
+/// Адрес сервиса `agentd` по умолчанию, если он не задан в конфиге.
+pub const DEFAULT_SERVER_URL: &str = "http://127.0.0.1:8080";
 /// Модель по умолчанию, если она не задана ни в чате, ни в конфиге.
 pub const DEFAULT_MODEL: &str = "deepseek-v4-flash";
 /// Адрес локального сервера Ollama по умолчанию.
@@ -25,7 +25,7 @@ pub const KNOWN_MODELS: [&str; 6] = [
 #[derive(Serialize, Deserialize, Default, Debug, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
 pub enum Provider {
-    /// Облачный OpenAI-совместимый API: base_url + API key.
+    /// Облачная модель через сервис `agentd`: ключ провайдера у сервиса.
     #[default]
     Cloud,
     /// Локальный Ollama: нативный /api/chat, ключ не нужен.
@@ -260,8 +260,12 @@ impl ChatSettings {
 
 #[derive(Serialize, Deserialize, Default, Debug)]
 pub struct Config {
-    pub api_key: Option<String>,
-    pub base_url: Option<String>,
+    /// Адрес сервиса `agentd`. Облачная модель доступна только через него:
+    /// ключ провайдера принадлежит сервису и клиенту не известен.
+    pub server_url: Option<String>,
+    /// Клиентский токен для заголовка `Authorization`. Пустой токен допустим:
+    /// сервис с пустым списком токенов аутентификацию не проверяет.
+    pub client_token: Option<String>,
     pub model: Option<String>,
     /// Провайдер по умолчанию для новых чатов.
     #[serde(default)]
@@ -300,15 +304,32 @@ impl Config {
     }
 
     pub fn load() -> Result<Config> {
+        Ok(Self::load_with_legacy_fields()?.0)
+    }
+
+    /// Конфиг вместе со списком найденных в файле полей прежней схемы.
+    /// Файл при этом не переписывается: чужие правки в нём терять нельзя.
+    pub fn load_with_legacy_fields() -> Result<(Config, Vec<&'static str>)> {
         let path = Self::path()?;
         if !path.exists() {
-            return Ok(Config::default());
+            return Ok((Config::default(), Vec::new()));
         }
         let content = std::fs::read_to_string(&path)
             .with_context(|| format!("не удалось прочитать конфиг {}", path.display()))?;
-        let config = toml::from_str(&content)
-            .with_context(|| format!("не удалось разобрать конфиг {}", path.display()))?;
-        Ok(config)
+        Ok(Self::parse_with_legacy_fields(&content)
+            .with_context(|| format!("не удалось разобрать конфиг {}", path.display()))?)
+    }
+
+    /// Разбор конфига: неизвестные поля игнорируются, поэтому файл прежней
+    /// схемы читается без ошибки.
+    pub fn parse_with_legacy_fields(content: &str) -> Result<(Config, Vec<&'static str>)> {
+        let config: Config = toml::from_str(content)?;
+        let table: toml::Value = toml::from_str(content)?;
+        let legacy = LEGACY_FIELDS
+            .into_iter()
+            .filter(|field| table.get(field).is_some())
+            .collect();
+        Ok((config, legacy))
     }
 
     pub fn save(&self) -> Result<()> {
@@ -363,11 +384,15 @@ impl Config {
             .unwrap_or_else(|| DEFAULT_OLLAMA_URL.to_string())
     }
 
-    pub fn effective_base_url(&self) -> String {
-        self.base_url
+    pub fn effective_server_url(&self) -> String {
+        self.server_url
             .clone()
             .filter(|u| !u.trim().is_empty())
-            .unwrap_or_else(|| DEFAULT_BASE_URL.to_string())
+            .unwrap_or_else(|| DEFAULT_SERVER_URL.to_string())
+    }
+
+    pub fn client_token(&self) -> String {
+        self.client_token.clone().unwrap_or_default()
     }
 
     /// Список моделей для переключения стрелками: свой из конфига либо
@@ -380,11 +405,71 @@ impl Config {
         }
     }
 
-    pub fn masked_api_key(&self) -> String {
-        match &self.api_key {
+    pub fn masked_client_token(&self) -> String {
+        match &self.client_token {
             None => "<не задан>".to_string(),
-            Some(key) if key.len() <= 8 => "*".repeat(key.len()),
-            Some(key) => format!("{}***{}", &key[..4], &key[key.len() - 4..]),
+            Some(token) if token.trim().is_empty() => "<не задан>".to_string(),
+            Some(token) if token.chars().count() <= 8 => "*".repeat(token.chars().count()),
+            Some(token) => {
+                let chars: Vec<char> = token.chars().collect();
+                let head: String = chars[..4].iter().collect();
+                let tail: String = chars[chars.len() - 4..].iter().collect();
+                format!("{head}***{tail}")
+            }
         }
+    }
+}
+
+/// Поля прежней схемы, когда ключ провайдера хранил клиент. Конфиг с ними
+/// читается без ошибки, но клиент один раз предупреждает: ключ больше не
+/// используется, а его хранение у клиента ничего не даёт.
+pub const LEGACY_FIELDS: [&str; 2] = ["api_key", "base_url"];
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn server_url_defaults_to_local_service() {
+        let config = Config::default();
+        assert_eq!(config.effective_server_url(), DEFAULT_SERVER_URL);
+        assert!(config.client_token().is_empty());
+    }
+
+    #[test]
+    fn token_is_masked() {
+        let config = Config {
+            client_token: Some("supersecrettoken".to_string()),
+            ..Config::default()
+        };
+        let masked = config.masked_client_token();
+        assert!(!masked.contains("secret"), "маска: {masked}");
+        assert!(masked.starts_with("supe") && masked.ends_with("oken"));
+        assert_eq!(Config::default().masked_client_token(), "<не задан>");
+    }
+
+    #[test]
+    fn legacy_config_is_read_and_reported() {
+        let content = r#"
+api_key = "sk-xxx"
+base_url = "https://api.deepseek.com"
+model = "deepseek-chat"
+"#;
+        let (config, legacy) = Config::parse_with_legacy_fields(content).expect("конфиг");
+        assert_eq!(config.effective_model(), "deepseek-chat");
+        // Ключ провайдера читается, но игнорируется: места для него нет.
+        assert_eq!(config.effective_server_url(), DEFAULT_SERVER_URL);
+        assert_eq!(legacy, vec!["api_key", "base_url"]);
+    }
+
+    #[test]
+    fn new_config_reports_no_legacy_fields() {
+        let content = r#"
+server_url = "http://127.0.0.1:9000"
+client_token = "t"
+"#;
+        let (config, legacy) = Config::parse_with_legacy_fields(content).expect("конфиг");
+        assert_eq!(config.effective_server_url(), "http://127.0.0.1:9000");
+        assert!(legacy.is_empty());
     }
 }

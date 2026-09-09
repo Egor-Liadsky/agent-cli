@@ -1,10 +1,12 @@
 pub mod error;
-mod http;
-mod ollama;
+mod local;
+pub mod ollama;
 
-pub use error::{AgentError, MISSING_API_KEY_MESSAGE};
-pub use http::HttpAgent;
+pub use error::{transport_error, AgentError, MISSING_API_KEY_MESSAGE, UNAUTHORIZED_MESSAGE};
+pub use local::OllamaAgent;
 pub use ollama::list_models as list_ollama_models;
+
+use crate::config::ResponseFormat;
 
 use crate::config::ChatSettings;
 use anyhow::Result;
@@ -69,6 +71,10 @@ pub struct MessageMeta {
     /// Unix-время получения ответа.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub received_at: Option<i64>,
+    /// Модель, которой ответили на самом деле: сервис мог выбрать не ту,
+    /// что запрошена, и показывать нужно фактическую.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
 }
 
 impl MessageMeta {
@@ -89,6 +95,11 @@ pub struct AgentReply {
     pub content: String,
     pub reasoning: Option<String>,
     pub meta: MessageMeta,
+    /// Модель, которой ответили на самом деле. `None` — источник ответа её не
+    /// сообщил, и показывать следует запрошенную.
+    pub model: Option<String>,
+    /// Результаты стадий конвейера, если ответ пришёл через сервис.
+    pub policy: Option<crate::pipeline::PolicyLog>,
 }
 
 pub fn now_secs() -> i64 {
@@ -111,4 +122,36 @@ pub enum Role {
 #[async_trait]
 pub trait Agent: Send + Sync {
     async fn ask(&self, history: &[Message], settings: &ChatSettings) -> Result<AgentReply>;
+}
+
+/// Системный промпт запроса: стратегия рассуждения плюс описание формата и
+/// условие завершения ответа (последние — только в кастомном режиме).
+///
+/// Функция общая для всех провайдеров: тело запроса у них разное, а правила
+/// сборки системного сообщения — одни и те же.
+pub fn system_prompt(settings: &ChatSettings) -> Option<String> {
+    let mut parts = Vec::new();
+    if let Some(reasoning) = settings.reasoning_prompt() {
+        parts.push(reasoning);
+    }
+    parts.extend(format_prompt_parts(settings.active_response_format()));
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join("\n"))
+    }
+}
+
+fn format_prompt_parts(format: Option<&ResponseFormat>) -> Vec<String> {
+    let Some(format) = format else {
+        return Vec::new();
+    };
+    let mut parts = Vec::new();
+    if let Some(description) = &format.description {
+        parts.push(format!("Формат ответа: {description}"));
+    }
+    if let Some(instruction) = &format.stop_instruction {
+        parts.push(format!("Условие завершения ответа: {instruction}"));
+    }
+    parts
 }

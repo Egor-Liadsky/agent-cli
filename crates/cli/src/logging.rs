@@ -11,9 +11,9 @@ use std::sync::Arc;
 /// Переменная окружения, задающая свою директорию журнала.
 pub const LOG_DIR_ENV: &str = "AGENTCLI_LOG_DIR";
 
-/// Подсказка консольного клиента в сообщении об отсутствующем ключе.
-pub const MISSING_KEY_HINT: &str = "Введите его в настройках чата \
-    (Ctrl+P → «Подключение») или выполните: agentcli config set-key <KEY>";
+/// Подсказка консольного клиента в сообщении об отказе аутентификации.
+pub const UNAUTHORIZED_HINT: &str = "Задайте токен в настройках чата \
+    (Ctrl+P → «Подключение») или выполните: agentcli config set-token <TOKEN>";
 
 pub fn log_dir() -> Option<PathBuf> {
     if let Ok(value) = std::env::var(LOG_DIR_ENV) {

@@ -1,4 +1,5 @@
-use agentcore::agent::{Agent, AgentReply, HttpAgent, Message, MessageMeta, Role};
+use crate::agent::CliAgent;
+use agentcore::agent::{Agent, AgentReply, Message, MessageMeta, Role};
 use crate::chats::{self, ChatSession};
 use agentcore::config::{
     ChatSettings, Config, Provider, ReasoningMode, ResponseFormat, SamplingParams, ThinkingMode,
@@ -58,8 +59,8 @@ struct DeleteConfirm {
 enum FormatField {
     Provider,
     Model,
-    BaseUrl,
-    ApiKey,
+    ServerUrl,
+    ClientToken,
     OllamaUrl,
     Mode,
     Reasoning,
@@ -107,8 +108,8 @@ impl SettingsSection {
             SettingsSection::Connection => &[
                 FormatField::Provider,
                 FormatField::Model,
-                FormatField::BaseUrl,
-                FormatField::ApiKey,
+                FormatField::ServerUrl,
+                FormatField::ClientToken,
                 FormatField::OllamaUrl,
             ],
             SettingsSection::Format => &[
@@ -207,8 +208,8 @@ impl FormatField {
         match self {
             FormatField::Provider => "Провайдер (◀/▶ или Space — переключить)",
             FormatField::Model => "Модель (◀/▶ — из списка, ввод — любое имя)",
-            FormatField::BaseUrl => "Base URL API",
-            FormatField::ApiKey => "API key (общий для всех чатов)",
+            FormatField::ServerUrl => "Адрес сервиса agentd (общий для всех чатов)",
+            FormatField::ClientToken => "Токен сервиса (общий для всех чатов)",
             FormatField::OllamaUrl => "Адрес Ollama (общий для всех чатов)",
             FormatField::Mode => "Режим",
             FormatField::Reasoning => "Стратегия рассуждения",
@@ -242,14 +243,14 @@ impl FormatField {
         )
     }
 
-    /// Поля подключения: модель, адрес API и ключ — доступны всегда.
+    /// Поля подключения: модель, адрес сервиса и токен — доступны всегда.
     fn is_connection(self) -> bool {
         matches!(
             self,
             FormatField::Provider
                 | FormatField::Model
-                | FormatField::BaseUrl
-                | FormatField::ApiKey
+                | FormatField::ServerUrl
+                | FormatField::ClientToken
                 | FormatField::OllamaUrl
         )
     }
@@ -276,9 +277,10 @@ struct SettingsEditor {
     provider: Provider,
     /// Модель этого чата: пусто — модель по умолчанию из конфига.
     model: String,
-    /// Адрес API и ключ — общие для всех чатов, живут в глобальном конфиге.
-    base_url: String,
-    api_key: String,
+    /// Адрес сервиса и токен — общие для всех чатов, живут в глобальном
+    /// конфиге. Ключа провайдера у клиента нет: он принадлежит сервису.
+    server_url: String,
+    client_token: String,
     /// Адрес локального Ollama — тоже общий для всех чатов.
     ollama_url: String,
     /// Облачные модели для переключения стрелками в поле «Модель».
@@ -325,8 +327,8 @@ impl SettingsEditor {
             chat_title: chat.title.clone(),
             provider: settings.provider,
             model: settings.model.clone().unwrap_or_default(),
-            base_url: config.base_url.clone().unwrap_or_default(),
-            api_key: config.api_key.clone().unwrap_or_default(),
+            server_url: config.server_url.clone().unwrap_or_default(),
+            client_token: config.client_token.clone().unwrap_or_default(),
             ollama_url: config.ollama_url.clone().unwrap_or_default(),
             model_choices: config.model_choices(),
             ollama_models: ollama_models.to_vec(),
@@ -374,7 +376,9 @@ impl SettingsEditor {
                 // состав экспертов имеет смысл только для своей стратегии
                 FormatField::Experts => self.reasoning == ReasoningMode::ExpertPanel,
                 // адрес и ключ облака не нужны локальным моделям, и наоборот
-                FormatField::BaseUrl | FormatField::ApiKey => self.provider == Provider::Cloud,
+                FormatField::ServerUrl | FormatField::ClientToken => {
+                    self.provider == Provider::Cloud
+                }
                 FormatField::OllamaUrl => self.provider == Provider::Ollama,
                 _ => true,
             })
@@ -511,8 +515,8 @@ impl SettingsEditor {
             | FormatField::Thinking
             | FormatField::Provider => None,
             FormatField::Model => Some(&mut self.model),
-            FormatField::BaseUrl => Some(&mut self.base_url),
-            FormatField::ApiKey => Some(&mut self.api_key),
+            FormatField::ServerUrl => Some(&mut self.server_url),
+            FormatField::ClientToken => Some(&mut self.client_token),
             FormatField::OllamaUrl => Some(&mut self.ollama_url),
             FormatField::Experts => Some(&mut self.experts),
             FormatField::Description => Some(&mut self.description),
@@ -626,7 +630,7 @@ fn non_empty(s: &str) -> Option<String> {
     }
 }
 
-pub async fn run(agent: HttpAgent, config: Config) -> anyhow::Result<()> {
+pub async fn run(agent: CliAgent, config: Config) -> anyhow::Result<()> {
     let agent = Arc::new(agent);
 
     enable_raw_mode()?;
@@ -775,7 +779,7 @@ impl AppState {
 
 async fn run_app(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
-    mut agent: Arc<HttpAgent>,
+    mut agent: Arc<CliAgent>,
     config: Config,
 ) -> anyhow::Result<()> {
     let mut chats: Vec<ChatSession> = chats::list_chats().unwrap_or_default();
@@ -828,12 +832,16 @@ async fn run_app(
                         if matches!(handle_key(key, &mut state, &agent, &tx), LoopControl::Break) {
                             break;
                         }
-                        // ключ или адрес API поменяли — дальше шлём запросы
+                        // токен или адрес сервиса поменяли — дальше шлём запросы
                         // уже новым агентом (запущенные ждут на старом)
                         if state.agent_dirty {
                             state.agent_dirty = false;
-                            match HttpAgent::from_config(&state.config, crate::logging::exchange_log())
-                                .map(|agent| agent.with_missing_key_hint(crate::logging::MISSING_KEY_HINT))
+                            match CliAgent::from_config(&state.config, crate::logging::exchange_log())
+                                .map(|agent| {
+                                    agent.with_unauthorized_hint(
+                                        crate::logging::UNAUTHORIZED_HINT,
+                                    )
+                                })
                             {
                                 Ok(updated) => agent = Arc::new(updated),
                                 Err(err) => state.notify(format!(
@@ -932,7 +940,7 @@ fn handle_global_key(key: crossterm::event::KeyEvent, state: &mut AppState) -> O
 fn handle_key(
     key: crossterm::event::KeyEvent,
     state: &mut AppState,
-    agent: &Arc<HttpAgent>,
+    agent: &Arc<CliAgent>,
     tx: &mpsc::UnboundedSender<ChatEvent>,
 ) -> LoopControl {
     if let Some(control) = handle_global_key(key, state) {
@@ -1016,8 +1024,8 @@ fn handle_settings_key(
                     let model = non_empty(&editor.model);
                     let provider = editor.provider;
                     let chat_id = editor.chat_id.clone();
-                    let base_url = non_empty(&editor.base_url);
-                    let api_key = non_empty(&editor.api_key);
+                    let server_url = non_empty(&editor.server_url);
+                    let client_token = non_empty(&editor.client_token);
                     let ollama_url = non_empty(&editor.ollama_url);
                     state.settings = None;
                     state.focus = Focus::Input;
@@ -1034,7 +1042,7 @@ fn handle_settings_key(
                         };
                         let _ = chats::save_chat(chat);
                     }
-                    save_connection(state, base_url, api_key, ollama_url);
+                    save_connection(state, server_url, client_token, ollama_url);
                 }
                 Err(err) => editor.error = Some(err),
             }
@@ -1132,22 +1140,22 @@ fn handle_settings_key(
     LoopControl::Continue
 }
 
-/// Сохранить общие параметры подключения в конфиг. Ключ и адрес общие для всех
-/// чатов, поэтому после изменения агента нужно пересобрать.
+/// Сохранить общие параметры подключения в конфиг. Адрес сервиса и токен
+/// общие для всех чатов, поэтому после изменения агента нужно пересобрать.
 fn save_connection(
     state: &mut AppState,
-    base_url: Option<String>,
-    api_key: Option<String>,
+    server_url: Option<String>,
+    client_token: Option<String>,
     ollama_url: Option<String>,
 ) {
-    if state.config.base_url == base_url
-        && state.config.api_key == api_key
+    if state.config.server_url == server_url
+        && state.config.client_token == client_token
         && state.config.ollama_url == ollama_url
     {
         return;
     }
-    state.config.base_url = base_url;
-    state.config.api_key = api_key;
+    state.config.server_url = server_url;
+    state.config.client_token = client_token;
     state.config.ollama_url = ollama_url;
     match state.config.save() {
         Ok(()) => {
@@ -1317,7 +1325,7 @@ fn delete_chat(state: &mut AppState, chat_id: &str) {
 fn handle_input_key(
     key: crossterm::event::KeyEvent,
     state: &mut AppState,
-    agent: &Arc<HttpAgent>,
+    agent: &Arc<CliAgent>,
     tx: &mpsc::UnboundedSender<ChatEvent>,
 ) -> LoopControl {
     let chat_id = state.active_chat_id();
@@ -1688,6 +1696,10 @@ fn render_pane_title(
 /// токены и скорость генерации.
 fn meta_summary(meta: &MessageMeta) -> String {
     let mut parts = Vec::new();
+    // Модель из ответа: фактическая, а не запрошенная чатом.
+    if let Some(model) = &meta.model {
+        parts.push(model.clone());
+    }
     if let Some(received) = meta.received_at.or(meta.sent_at) {
         parts.push(format_clock(received));
     }
@@ -1988,8 +2000,12 @@ fn empty_field_hint(field: FormatField, editor: &SettingsEditor) -> String {
                 editor.ollama_models.len()
             ),
         },
-        FormatField::BaseUrl => format!("не задан — {}", agentcore::config::DEFAULT_BASE_URL),
-        FormatField::ApiKey => "не задан — запросы к API не пройдут".to_string(),
+        FormatField::ServerUrl => {
+            format!("не задан — {}", agentcore::config::DEFAULT_SERVER_URL)
+        }
+        FormatField::ClientToken => {
+            "не задан — сервис без аутентификации ответит и так".to_string()
+        }
         FormatField::OllamaUrl => {
             format!("не задан — {}", agentcore::config::DEFAULT_OLLAMA_URL)
         }
@@ -2033,8 +2049,8 @@ fn render_settings_fields(f: &mut Frame, editor: &SettingsEditor, area: Rect) {
                 editor.provider.label()
             ),
             FormatField::Model => editor.model.clone(),
-            FormatField::BaseUrl => editor.base_url.clone(),
-            FormatField::ApiKey => mask_secret(&editor.api_key),
+            FormatField::ServerUrl => editor.server_url.clone(),
+            FormatField::ClientToken => mask_secret(&editor.client_token),
             FormatField::OllamaUrl => editor.ollama_url.clone(),
             FormatField::Mode => {
                 if editor.custom_mode {

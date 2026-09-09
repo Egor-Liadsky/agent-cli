@@ -422,6 +422,8 @@ mod tests {
                 content: self.reply.clone(),
                 reasoning: None,
                 meta: MessageMeta::default(),
+                model: None,
+                policy: None,
             })
         }
     }

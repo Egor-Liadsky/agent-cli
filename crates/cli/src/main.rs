@@ -1,3 +1,4 @@
+mod agent;
 mod chats;
 mod clipboard;
 mod cli;
@@ -5,13 +6,15 @@ mod logging;
 mod markdown;
 mod tui;
 
-use agentcore::agent::{Agent, AgentReply, HttpAgent, Message, MessageMeta};
+use agent::CliAgent;
+use agentcore::agent::{Agent, AgentReply, Message, MessageMeta};
+use anyhow::Context;
 use clap::Parser;
 use cli::{Cli, Commands, ConfigAction, FormatAction, OllamaAction, SamplingAction};
 use agentcore::config::{Config, Provider, ReasoningMode, ThinkingMode};
 use console::style;
 use indicatif::{ProgressBar, ProgressStyle};
-use logging::{exchange_log, MISSING_KEY_HINT};
+use logging::{exchange_log, UNAUTHORIZED_HINT};
 use markdown::agent_skin;
 use std::time::Duration;
 
@@ -22,7 +25,11 @@ async fn main() -> anyhow::Result<()> {
     match cli.command {
         Commands::Ask { prompt } => run_ask(prompt).await?,
         Commands::Chat => run_chat().await?,
-        Commands::Config { action } => run_config(action)?,
+        Commands::Config { action } => match action {
+            // Единственная сетевая команда конфига: список моделей отдаёт сервис.
+            ConfigAction::Models => run_config_models().await?,
+            action => run_config(action)?,
+        },
         Commands::Ollama { action } => run_ollama(action).await?,
     }
 
@@ -30,8 +37,9 @@ async fn main() -> anyhow::Result<()> {
 }
 
 async fn run_ask(prompt: String) -> anyhow::Result<()> {
-    let config = Config::load()?;
-    let agent = HttpAgent::from_config(&config, exchange_log())?.with_missing_key_hint(MISSING_KEY_HINT);
+    let config = load_config()?;
+    let agent =
+        CliAgent::from_config(&config, exchange_log())?.with_unauthorized_hint(UNAUTHORIZED_HINT);
     let history = vec![Message::user(prompt)];
     let settings = config.default_chat_settings();
     let reply = ask_with_spinner(&agent, &history, &settings).await?;
@@ -46,41 +54,54 @@ async fn run_ask(prompt: String) -> anyhow::Result<()> {
 }
 
 async fn run_chat() -> anyhow::Result<()> {
-    let config = Config::load()?;
-    let agent = HttpAgent::from_config(&config, exchange_log())?.with_missing_key_hint(MISSING_KEY_HINT);
+    let config = load_config()?;
+    let agent =
+        CliAgent::from_config(&config, exchange_log())?.with_unauthorized_hint(UNAUTHORIZED_HINT);
     tui::run(agent, config).await
+}
+
+/// Конфиг вместе с предупреждением о полях прежней схемы. Файл не
+/// переписывается: убрать устаревшие поля — решение пользователя.
+fn load_config() -> anyhow::Result<Config> {
+    let (config, legacy) = Config::load_with_legacy_fields()?;
+    if !legacy.is_empty() {
+        eprintln!(
+            "{} {}",
+            style("Внимание:").yellow().bold(),
+            style(format!(
+                "конфиг содержит устаревшие поля ({}). Ключ провайдера больше не \
+                 используется клиентом: облачная модель отвечает через сервис agentd. \
+                 Уберите эти поля из файла конфигурации.",
+                legacy.join(", ")
+            ))
+            .yellow()
+        );
+    }
+    Ok(config)
 }
 
 fn run_config(action: ConfigAction) -> anyhow::Result<()> {
     match action {
-        ConfigAction::SetKey { key } => {
-            let mut config = Config::load()?;
-            config.api_key = Some(key);
+        ConfigAction::SetToken { token } => {
+            let mut config = load_config()?;
+            config.client_token = Some(token);
             config.save()?;
-            println!("{}", style("API key сохранён.").green().bold());
+            println!("{}", style("Клиентский токен сохранён.").green().bold());
         }
         ConfigAction::SetModel { model } => {
-            let mut config = Config::load()?;
+            let mut config = load_config()?;
             config.model = Some(model);
             config.save()?;
             println!("{}", style("Модель по умолчанию сохранена.").green().bold());
         }
         ConfigAction::SetUrl { url } => {
-            let mut config = Config::load()?;
-            config.base_url = Some(url);
+            let mut config = load_config()?;
+            config.server_url = Some(url);
             config.save()?;
-            println!("{}", style("Базовый URL сохранён.").green().bold());
-        }
-        ConfigAction::Models => {
-            let config = Config::load()?;
-            let current = config.effective_model();
-            for model in config.model_choices() {
-                let marker = if model == current { "●" } else { " " };
-                println!("{marker} {model}");
-            }
+            println!("{}", style("Адрес сервиса сохранён.").green().bold());
         }
         ConfigAction::SetProvider { provider } => {
-            let mut config = Config::load()?;
+            let mut config = load_config()?;
             config.provider = Provider::parse(&provider).ok_or_else(|| {
                 anyhow::anyhow!("неизвестный провайдер «{provider}». Доступны: cloud, ollama")
             })?;
@@ -92,6 +113,8 @@ fn run_config(action: ConfigAction) -> anyhow::Result<()> {
             );
         }
         ConfigAction::Show => show_config()?,
+        // Список моделей принадлежит сервису, поэтому команда сетевая.
+        ConfigAction::Models => unreachable!("обрабатывается в run_config_async"),
         ConfigAction::Format { action } => run_format_action(action)?,
         ConfigAction::Sampling { action } => run_sampling_action(action)?,
         ConfigAction::Reasoning {
@@ -145,8 +168,35 @@ async fn run_ollama(action: OllamaAction) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Список моделей, разрешённых сервисом. Встроенного списка у клиента больше
+/// нет: при недоступном сервисе это ошибка, а не пустой вывод.
+async fn run_config_models() -> anyhow::Result<()> {
+    let config = load_config()?;
+    let models = agentclient::list_models(&config.effective_server_url(), &config.client_token())
+        .await
+        .with_context(|| {
+            format!(
+                "не удалось получить список моделей у сервиса {}",
+                config.effective_server_url()
+            )
+        })?;
+    if models.is_empty() {
+        println!(
+            "{}",
+            style("Сервис не сообщил ни одной модели: проверьте AGENTD_ALLOWED_MODELS.").yellow()
+        );
+        return Ok(());
+    }
+    let current = config.effective_model();
+    for model in models {
+        let marker = if model == current { "●" } else { " " };
+        println!("{marker} {model}");
+    }
+    Ok(())
+}
+
 fn show_config() -> anyhow::Result<()> {
-    let config = Config::load()?;
+    let config = load_config()?;
     println!(
         "{} {}",
         style("провайдер:").cyan().bold(),
@@ -154,13 +204,13 @@ fn show_config() -> anyhow::Result<()> {
     );
     println!(
         "{} {}",
-        style("api_key: ").cyan().bold(),
-        config.masked_api_key()
+        style("server_url:  ").cyan().bold(),
+        config.effective_server_url()
     );
     println!(
         "{} {}",
-        style("base_url:").cyan().bold(),
-        config.effective_base_url()
+        style("client_token:").cyan().bold(),
+        config.masked_client_token()
     );
     println!(
         "{} {}",
@@ -445,6 +495,10 @@ fn print_sampling_params(sampling: &agentcore::config::SamplingParams) {
 /// Однострочная сводка: время отправки/получения, длительность, токены, скорость.
 fn format_stats_line(meta: &MessageMeta) -> String {
     let mut parts = Vec::new();
+    // Модель берётся из ответа: сервис мог ответить не запрошенной моделью.
+    if let Some(model) = &meta.model {
+        parts.push(model.clone());
+    }
     if let (Some(sent), Some(received)) = (meta.sent_at, meta.received_at) {
         parts.push(format!(
             "{} → {}",
@@ -489,7 +543,7 @@ fn format_clock(timestamp: i64) -> String {
 }
 
 async fn ask_with_spinner(
-    agent: &HttpAgent,
+    agent: &CliAgent,
     history: &[Message],
     settings: &agentcore::config::ChatSettings,
 ) -> anyhow::Result<AgentReply> {

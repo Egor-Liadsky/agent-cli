@@ -1,14 +1,26 @@
-use super::{Agent, AgentReply, Message, MessageMeta, Role};
-use crate::config::{ChatSettings, Config, Provider, ResponseFormat, DEFAULT_MODEL};
-use super::error::{transport_error, AgentError};
-use crate::logging::{request_id, unix_timestamp, ExchangeLog, RequestLogEntry, ResponseLogEntry};
+//! Облачный провайдер: OpenAI-совместимый `POST {base_url}/chat/completions`.
+//!
+//! Крейт отделён от ядра намеренно: ключ провайдера принадлежит сервису
+//! `agentd`, и консольный клиент не должен иметь этот код в своём графе
+//! зависимостей. Запрет держится сборкой, а не договорённостью.
+
+use agentcore::agent::{
+    system_prompt, transport_error, Agent, AgentError, AgentReply, Message, MessageMeta, Role,
+};
+use agentcore::config::{ChatSettings, DEFAULT_MODEL};
+use agentcore::logging::{
+    request_id, unix_timestamp, ExchangeLog, RequestLogEntry, ResponseLogEntry,
+};
 use anyhow::Result;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-pub struct HttpAgent {
+/// Базовый URL провайдера по умолчанию.
+pub const DEFAULT_BASE_URL: &str = "https://api.deepseek.com";
+
+pub struct UpstreamAgent {
     client: reqwest::Client,
     /// Пустая строка означает «ключ не задан»: агент создаётся и без ключа,
     /// чтобы его можно было ввести уже в настройках чата.
@@ -16,31 +28,35 @@ pub struct HttpAgent {
     base_url: String,
     /// Модель по умолчанию: используется, если у чата нет своей.
     model: String,
-    /// Отдельный клиент для Ollama: без прокси из окружения.
-    ollama_client: reqwest::Client,
-    /// Адрес локального Ollama для чатов с провайдером `Ollama`.
-    ollama_url: String,
-    /// Локальная модель по умолчанию для чатов с провайдером `Ollama`.
-    ollama_model: String,
     /// Журнал обмена с провайдером. Назначение задаёт вызывающая сторона.
     log: Arc<ExchangeLog>,
     /// Подсказка вызывающей стороны в сообщении об отсутствующем ключе.
     missing_key_hint: Option<String>,
 }
 
-impl HttpAgent {
-    pub fn from_config(config: &Config, log: Arc<ExchangeLog>) -> Result<Self> {
-        Ok(Self {
+impl UpstreamAgent {
+    /// Ключ, адрес провайдера и модель по умолчанию задаёт вызывающая
+    /// сторона: ключ принадлежит ей, а не пользовательскому конфигу.
+    /// Пустой `base_url` означает [`DEFAULT_BASE_URL`].
+    pub fn new(
+        api_key: impl Into<String>,
+        base_url: impl Into<String>,
+        model: impl Into<String>,
+        log: Arc<ExchangeLog>,
+    ) -> Self {
+        let base_url = base_url.into();
+        Self {
             client: reqwest::Client::new(),
-            api_key: config.api_key.clone().unwrap_or_default(),
-            base_url: config.effective_base_url(),
-            model: config.effective_model(),
-            ollama_client: super::ollama::client(),
-            ollama_url: config.effective_ollama_url(),
-            ollama_model: config.ollama_model.clone().unwrap_or_default(),
+            api_key: api_key.into(),
+            base_url: if base_url.trim().is_empty() {
+                DEFAULT_BASE_URL.to_string()
+            } else {
+                base_url
+            },
+            model: model.into(),
             log,
             missing_key_hint: None,
-        })
+        }
     }
 
     /// Подсказка, которую вызывающая сторона добавляет к нейтральному
@@ -54,54 +70,23 @@ impl HttpAgent {
     /// [`AgentError::Timeout`], а не безымянную транспортную ошибку.
     pub fn with_request_timeout(mut self, timeout: Duration) -> Result<Self> {
         self.client = reqwest::Client::builder().timeout(timeout).build()?;
-        self.ollama_client = super::ollama::client_builder().timeout(timeout).build()?;
         Ok(self)
     }
 
-    /// Модель запроса: своя у чата, иначе модель по умолчанию для его
-    /// провайдера. У Ollama своя модель по умолчанию и нет встроенной:
-    /// список локальных моделей зависит от того, что скачано.
+    /// Модель запроса: своя у чата, иначе модель по умолчанию, иначе
+    /// встроенное значение.
     fn model_for(&self, settings: &ChatSettings) -> String {
-        let chat_model = settings.model.clone().filter(|m| !m.trim().is_empty());
-        match settings.provider {
-            Provider::Cloud => chat_model.unwrap_or_else(|| {
+        settings
+            .model
+            .clone()
+            .filter(|m| !m.trim().is_empty())
+            .unwrap_or_else(|| {
                 if self.model.trim().is_empty() {
                     DEFAULT_MODEL.to_string()
                 } else {
                     self.model.clone()
                 }
-            }),
-            Provider::Ollama => chat_model.unwrap_or_else(|| self.ollama_model.clone()),
-        }
-    }
-
-    /// Системный промпт: стратегия рассуждения плюс описание формата и
-    /// условие завершения ответа (последние — только в кастомном режиме).
-    pub(super) fn system_prompt(settings: &ChatSettings) -> Option<String> {
-        let mut parts = Vec::new();
-        if let Some(reasoning) = settings.reasoning_prompt() {
-            parts.push(reasoning);
-        }
-        parts.extend(Self::format_prompt_parts(settings.active_response_format()));
-        if parts.is_empty() {
-            None
-        } else {
-            Some(parts.join("\n"))
-        }
-    }
-
-    fn format_prompt_parts(format: Option<&ResponseFormat>) -> Vec<String> {
-        let Some(format) = format else {
-            return Vec::new();
-        };
-        let mut parts = Vec::new();
-        if let Some(description) = &format.description {
-            parts.push(format!("Формат ответа: {description}"));
-        }
-        if let Some(instruction) = &format.stop_instruction {
-            parts.push(format!("Условие завершения ответа: {instruction}"));
-        }
-        parts
+            })
     }
 }
 
@@ -146,6 +131,9 @@ struct ChatResponse {
     choices: Vec<ChatChoice>,
     #[serde(default)]
     usage: Option<Usage>,
+    /// Модель, которой провайдер ответил на самом деле.
+    #[serde(default)]
+    model: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -198,16 +186,13 @@ fn parse_api_error(status: reqwest::StatusCode, body: &str) -> AgentError {
         .and_then(|e| e.error)
         .map(|e| e.message)
         .unwrap_or_else(|| body.to_string());
-    AgentError::Provider {
-        status: status.as_u16(),
-        message,
-    }
+    AgentError::provider(status.as_u16(), message)
 }
 
-impl HttpAgent {
+impl UpstreamAgent {
     fn build_messages(&self, history: &[Message], settings: &ChatSettings) -> Vec<ChatMessage> {
         let mut messages = Vec::with_capacity(history.len() + 1);
-        if let Some(system_content) = Self::system_prompt(settings) {
+        if let Some(system_content) = system_prompt(settings) {
             messages.push(ChatMessage {
                 role: "system",
                 content: system_content,
@@ -309,6 +294,7 @@ fn extract_answer(body: &str, mut meta: MessageMeta) -> Result<AgentReply> {
     let parsed: ChatResponse = serde_json::from_str(body)
         .map_err(|err| AgentError::Decode(format!("не удалось разобрать ответ API: {err}")))?;
 
+    meta.model = parsed.model.clone();
     if let Some(usage) = parsed.usage {
         meta.prompt_tokens = usage.prompt_tokens;
         meta.completion_tokens = usage.completion_tokens;
@@ -318,6 +304,7 @@ fn extract_answer(body: &str, mut meta: MessageMeta) -> Result<AgentReply> {
             .and_then(|d| d.reasoning_tokens);
     }
 
+    let model = parsed.model.clone();
     let message = parsed
         .choices
         .into_iter()
@@ -335,24 +322,14 @@ fn extract_answer(body: &str, mut meta: MessageMeta) -> Result<AgentReply> {
         content: message.content,
         reasoning,
         meta,
+        model,
+        policy: None,
     })
 }
 
 #[async_trait]
-impl Agent for HttpAgent {
+impl Agent for UpstreamAgent {
     async fn ask(&self, history: &[Message], settings: &ChatSettings) -> Result<AgentReply> {
-        if settings.provider == Provider::Ollama {
-            return super::ollama::chat(
-                &self.ollama_client,
-                &self.ollama_url,
-                &self.model_for(settings),
-                history,
-                settings,
-                Self::system_prompt(settings),
-                &self.log,
-            )
-            .await;
-        }
         let messages = self.build_messages(history, settings);
         let url = format!("{}/chat/completions", self.base_url.trim_end_matches('/'));
         let model = self.model_for(settings);
@@ -366,7 +343,6 @@ impl Agent for HttpAgent {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::Config;
     use std::time::Duration;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
@@ -403,16 +379,15 @@ mod tests {
         format!("http://{addr}")
     }
 
-    fn agent(base_url: String) -> HttpAgent {
-        let config = Config {
-            api_key: Some("test-key".to_string()),
-            base_url: Some(base_url),
-            ..Config::default()
-        };
-        HttpAgent::from_config(&config, Arc::new(ExchangeLog::disabled()))
-            .expect("агент")
-            .with_request_timeout(Duration::from_millis(300))
-            .expect("таймаут")
+    fn agent(base_url: String) -> UpstreamAgent {
+        UpstreamAgent::new(
+            "test-key",
+            base_url,
+            DEFAULT_MODEL,
+            Arc::new(ExchangeLog::disabled()),
+        )
+        .with_request_timeout(Duration::from_millis(300))
+        .expect("таймаут")
     }
 
     #[tokio::test]
@@ -427,7 +402,9 @@ mod tests {
             .expect_err("ожидалась ошибка провайдера");
 
         match err.downcast_ref::<AgentError>() {
-            Some(AgentError::Provider { status, message }) => {
+            Some(AgentError::Provider {
+                status, message, ..
+            }) => {
                 assert_eq!(*status, 500);
                 assert_eq!(message, "внутренняя ошибка");
             }
@@ -445,15 +422,17 @@ mod tests {
             .expect_err("ожидался таймаут");
 
         assert!(
-            matches!(err.downcast_ref::<AgentError>(), Some(AgentError::Timeout)),
+            matches!(
+                err.downcast_ref::<AgentError>(),
+                Some(AgentError::Timeout { .. })
+            ),
             "ожидался Timeout, получено: {err:#}"
         );
     }
 
     #[tokio::test]
     async fn missing_key_is_typed_and_uses_hint() {
-        let agent = HttpAgent::from_config(&Config::default(), Arc::new(ExchangeLog::disabled()))
-            .expect("агент")
+        let agent = UpstreamAgent::new("", "", DEFAULT_MODEL, Arc::new(ExchangeLog::disabled()))
             .with_missing_key_hint("подсказка вызывающей стороны");
         let history = [Message::user("привет")];
         let err = agent
