@@ -1,5 +1,5 @@
-use crate::agent::{Message, Role};
-use crate::config::ChatSettings;
+use agentcore::agent::{Message, Role};
+use agentcore::config::ChatSettings;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};

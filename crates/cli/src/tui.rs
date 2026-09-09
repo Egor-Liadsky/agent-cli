@@ -1,6 +1,6 @@
-use crate::agent::{Agent, AgentReply, HttpAgent, Message, MessageMeta, Role};
+use agentcore::agent::{Agent, AgentReply, HttpAgent, Message, MessageMeta, Role};
 use crate::chats::{self, ChatSession};
-use crate::config::{
+use agentcore::config::{
     ChatSettings, Config, Provider, ReasoningMode, ResponseFormat, SamplingParams, ThinkingMode,
 };
 use crate::markdown::agent_skin;
@@ -832,7 +832,9 @@ async fn run_app(
                         // уже новым агентом (запущенные ждут на старом)
                         if state.agent_dirty {
                             state.agent_dirty = false;
-                            match HttpAgent::from_config(&state.config) {
+                            match HttpAgent::from_config(&state.config, crate::logging::exchange_log())
+                                .map(|agent| agent.with_missing_key_hint(crate::logging::MISSING_KEY_HINT))
+                            {
                                 Ok(updated) => agent = Arc::new(updated),
                                 Err(err) => state.notify(format!(
                                     "Не удалось применить настройки подключения: {err}"
@@ -1392,7 +1394,7 @@ fn fetch_ollama_models(config: &Config, tx: &mpsc::UnboundedSender<ChatEvent>) {
     let url = config.effective_ollama_url();
     let tx = tx.clone();
     tokio::spawn(async move {
-        let result = crate::agent::list_ollama_models(&url)
+        let result = agentcore::agent::list_ollama_models(&url)
             .await
             .map_err(|err| err.to_string());
         let _ = tx.send(ChatEvent::OllamaModels(result));
@@ -1425,7 +1427,7 @@ fn handle_chat_event(chat_event: ChatEvent, state: &mut AppState) {
     // у ошибки телеметрии нет — оставляем хотя бы время получения
     if message.meta.is_none() {
         message.meta = Some(MessageMeta {
-            received_at: Some(crate::agent::now_secs()),
+            received_at: Some(agentcore::agent::now_secs()),
             ..MessageMeta::default()
         });
     }
@@ -1986,10 +1988,10 @@ fn empty_field_hint(field: FormatField, editor: &SettingsEditor) -> String {
                 editor.ollama_models.len()
             ),
         },
-        FormatField::BaseUrl => format!("не задан — {}", crate::config::DEFAULT_BASE_URL),
+        FormatField::BaseUrl => format!("не задан — {}", agentcore::config::DEFAULT_BASE_URL),
         FormatField::ApiKey => "не задан — запросы к API не пройдут".to_string(),
         FormatField::OllamaUrl => {
-            format!("не задан — {}", crate::config::DEFAULT_OLLAMA_URL)
+            format!("не задан — {}", agentcore::config::DEFAULT_OLLAMA_URL)
         }
         _ => "не задано — используется значение модели".to_string(),
     }

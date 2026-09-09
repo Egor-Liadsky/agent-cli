@@ -1,6 +1,8 @@
+pub mod error;
 mod http;
 mod ollama;
 
+pub use error::{AgentError, MISSING_API_KEY_MESSAGE};
 pub use http::HttpAgent;
 pub use ollama::list_models as list_ollama_models;
 
@@ -104,7 +106,9 @@ pub enum Role {
     Assistant,
 }
 
+/// `Send + Sync` нужны, чтобы агента можно было держать в `Arc<dyn Agent>`
+/// и делить между одновременными запросами сетевого сервиса.
 #[async_trait]
-pub trait Agent {
+pub trait Agent: Send + Sync {
     async fn ask(&self, history: &[Message], settings: &ChatSettings) -> Result<AgentReply>;
 }

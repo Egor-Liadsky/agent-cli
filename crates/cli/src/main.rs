@@ -1,17 +1,17 @@
-mod agent;
 mod chats;
 mod clipboard;
 mod cli;
-mod config;
+mod logging;
 mod markdown;
 mod tui;
 
-use agent::{Agent, AgentReply, HttpAgent, Message, MessageMeta};
+use agentcore::agent::{Agent, AgentReply, HttpAgent, Message, MessageMeta};
 use clap::Parser;
 use cli::{Cli, Commands, ConfigAction, FormatAction, OllamaAction, SamplingAction};
-use config::{Config, Provider, ReasoningMode, ThinkingMode};
+use agentcore::config::{Config, Provider, ReasoningMode, ThinkingMode};
 use console::style;
 use indicatif::{ProgressBar, ProgressStyle};
+use logging::{exchange_log, MISSING_KEY_HINT};
 use markdown::agent_skin;
 use std::time::Duration;
 
@@ -31,7 +31,7 @@ async fn main() -> anyhow::Result<()> {
 
 async fn run_ask(prompt: String) -> anyhow::Result<()> {
     let config = Config::load()?;
-    let agent = HttpAgent::from_config(&config)?;
+    let agent = HttpAgent::from_config(&config, exchange_log())?.with_missing_key_hint(MISSING_KEY_HINT);
     let history = vec![Message::user(prompt)];
     let settings = config.default_chat_settings();
     let reply = ask_with_spinner(&agent, &history, &settings).await?;
@@ -47,7 +47,7 @@ async fn run_ask(prompt: String) -> anyhow::Result<()> {
 
 async fn run_chat() -> anyhow::Result<()> {
     let config = Config::load()?;
-    let agent = HttpAgent::from_config(&config)?;
+    let agent = HttpAgent::from_config(&config, exchange_log())?.with_missing_key_hint(MISSING_KEY_HINT);
     tui::run(agent, config).await
 }
 
@@ -109,7 +109,7 @@ async fn run_ollama(action: OllamaAction) -> anyhow::Result<()> {
         OllamaAction::Models => {
             let config = Config::load()?;
             let url = config.effective_ollama_url();
-            let models = agent::list_ollama_models(&url).await?;
+            let models = agentcore::agent::list_ollama_models(&url).await?;
             if models.is_empty() {
                 println!(
                     "{}",
@@ -369,7 +369,7 @@ fn print_markdown(text: &str) {
     agent_skin().print_text(text);
 }
 
-fn print_response_format(format: &config::ResponseFormat) {
+fn print_response_format(format: &agentcore::config::ResponseFormat) {
     println!(
         "{} {}",
         style("описание:      ").cyan().bold(),
@@ -399,7 +399,7 @@ fn print_response_format(format: &config::ResponseFormat) {
     );
 }
 
-fn print_sampling_params(sampling: &config::SamplingParams) {
+fn print_sampling_params(sampling: &agentcore::config::SamplingParams) {
     println!(
         "{} {}",
         style("temperature:       ").cyan().bold(),
@@ -491,7 +491,7 @@ fn format_clock(timestamp: i64) -> String {
 async fn ask_with_spinner(
     agent: &HttpAgent,
     history: &[Message],
-    settings: &config::ChatSettings,
+    settings: &agentcore::config::ChatSettings,
 ) -> anyhow::Result<AgentReply> {
     let spinner = ProgressBar::new_spinner();
     spinner.set_style(

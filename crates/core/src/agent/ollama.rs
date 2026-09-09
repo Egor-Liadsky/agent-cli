@@ -5,11 +5,11 @@
 //! (`message.thinking`), счётчики токенов и `top_k`, то есть всё, что
 //! приложение уже показывает для облачных моделей.
 
-use super::http::{log_request, log_response, request_id, unix_timestamp, RequestLogEntry,
-    ResponseLogEntry};
 use super::{AgentReply, Message, MessageMeta, Role};
 use crate::config::{ChatSettings, ThinkingMode};
-use anyhow::{bail, Context, Result};
+use super::error::{transport_error, AgentError};
+use crate::logging::{request_id, unix_timestamp, ExchangeLog, RequestLogEntry, ResponseLogEntry};
+use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::time::Instant;
 
@@ -103,9 +103,12 @@ struct TagEntry {
 /// Клиент для локальных запросов. Прокси из окружения (`HTTP_PROXY`)
 /// отключён намеренно: Ollama работает на самой машине, а прокси рвёт
 /// долгие ответы больших моделей по своему таймауту (502 с пустым телом).
+pub(super) fn client_builder() -> reqwest::ClientBuilder {
+    reqwest::Client::builder().no_proxy()
+}
+
 pub(super) fn client() -> reqwest::Client {
-    reqwest::Client::builder()
-        .no_proxy()
+    client_builder()
         .build()
         .unwrap_or_else(|_| reqwest::Client::new())
 }
@@ -119,25 +122,27 @@ fn tags_url(base_url: &str) -> String {
 }
 
 /// Ошибка Ollama: тело `{"error": "..."}`, иначе — как есть.
-fn parse_error(status: reqwest::StatusCode, body: &str) -> anyhow::Error {
-    if body.trim().is_empty() {
-        return anyhow::anyhow!(
-            "Ollama вернул ошибку ({status}) с пустым телом. Обычно так отвечает \
-             HTTP-прокси или обратный прокси перед Ollama, а не он сам: проверьте \
-             адрес в настройках чата"
-        );
+fn parse_error(status: reqwest::StatusCode, body: &str) -> AgentError {
+    let message = if body.trim().is_empty() {
+        "пустое тело ответа. Обычно так отвечает HTTP-прокси или обратный прокси \
+         перед Ollama, а не он сам: проверьте адрес"
+            .to_string()
+    } else {
+        serde_json::from_str::<ErrorBody>(body)
+            .map(|e| e.error)
+            .unwrap_or_else(|_| body.to_string())
+    };
+    AgentError::Provider {
+        status: status.as_u16(),
+        message,
     }
-    let detail = serde_json::from_str::<ErrorBody>(body)
-        .map(|e| e.error)
-        .unwrap_or_else(|_| body.to_string());
-    anyhow::anyhow!("Ollama вернул ошибку ({status}): {detail}")
 }
 
 /// Не удалось соединиться — почти всегда это «сервер не запущен».
-fn connection_error(base_url: &str, err: reqwest::Error) -> anyhow::Error {
-    anyhow::anyhow!(
-        "не удалось связаться с Ollama по адресу {base_url}: {err}. \
-         Проверьте, что сервер запущен (`ollama serve`)"
+fn connection_error(base_url: &str, err: reqwest::Error) -> AgentError {
+    transport_error(
+        &format!("не удалось связаться с Ollama по адресу {base_url}"),
+        err,
     )
 }
 
@@ -153,12 +158,13 @@ pub async fn list_models(base_url: &str) -> Result<Vec<String>> {
     let body = response
         .text()
         .await
-        .context("не удалось прочитать список моделей Ollama")?;
+        .map_err(|err| transport_error("не удалось прочитать список моделей Ollama", err))?;
     if !status.is_success() {
-        bail!(parse_error(status, &body));
+        return Err(parse_error(status, &body).into());
     }
-    let parsed: TagsResponse =
-        serde_json::from_str(&body).context("не удалось разобрать список моделей Ollama")?;
+    let parsed: TagsResponse = serde_json::from_str(&body).map_err(|err| {
+        AgentError::Decode(format!("не удалось разобрать список моделей Ollama: {err}"))
+    })?;
     Ok(parsed.models.into_iter().map(|m| m.name).collect())
 }
 
@@ -210,9 +216,10 @@ pub async fn chat(
     history: &[Message],
     settings: &ChatSettings,
     system: Option<String>,
+    log: &ExchangeLog,
 ) -> Result<AgentReply> {
     if model.trim().is_empty() {
-        bail!(
+        anyhow::bail!(
             "модель Ollama не выбрана. Выберите её в настройках чата (Ctrl+P → «Подключение») \
              или выполните: agentcli ollama use <МОДЕЛЬ>"
         );
@@ -227,7 +234,7 @@ pub async fn chat(
 
     let url = chat_url(base_url);
     let id = request_id();
-    log_request(&RequestLogEntry {
+    log.log_request(&RequestLogEntry {
         id: &id,
         timestamp: unix_timestamp(),
         url: &url,
@@ -248,10 +255,10 @@ pub async fn chat(
     let body = response
         .text()
         .await
-        .context("не удалось прочитать тело ответа Ollama")?;
+        .map_err(|err| transport_error("не удалось прочитать тело ответа Ollama", err))?;
     let duration_ms = started_at.elapsed().as_millis();
 
-    log_response(&ResponseLogEntry {
+    log.log_response(&ResponseLogEntry {
         id: &id,
         timestamp: unix_timestamp(),
         status: status.as_u16(),
@@ -261,11 +268,11 @@ pub async fn chat(
     });
 
     if !status.is_success() {
-        bail!(parse_error(status, &body));
+        return Err(parse_error(status, &body).into());
     }
 
-    let parsed: ChatResponse =
-        serde_json::from_str(&body).context("не удалось разобрать ответ Ollama")?;
+    let parsed: ChatResponse = serde_json::from_str(&body)
+        .map_err(|err| AgentError::Decode(format!("не удалось разобрать ответ Ollama: {err}")))?;
     let total_tokens = match (parsed.prompt_eval_count, parsed.eval_count) {
         (Some(prompt), Some(completion)) => Some(prompt + completion),
         _ => None,

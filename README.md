@@ -8,23 +8,28 @@
 
 ## Архитектура
 
-Проект собран как один бинарный крейт (`agentcli`), разбитый на модули:
+Проект собран как cargo workspace из двух крейтов: библиотеки `agentcore`
+(`crates/core`) и консольного бинарника `agentcli` (`crates/cli`). Ядро
+вынесено в библиотеку, чтобы им мог пользоваться не только терминал.
 
-- **`src/main.rs`** — точка входа: разбирает CLI-команды и вызывает
-  соответствующий обработчик (`ask`, `chat`, `config`).
-- **`src/cli.rs`** — описание команд и аргументов на `clap` (`derive`-API).
-- **`src/config.rs`** — конфигурация (`provider`, `api_key`, `base_url`,
+**`crates/core` — библиотека `agentcore`:**
+
+- **`config.rs`** — конфигурация (`provider`, `api_key`, `base_url`,
   `model`, `ollama_url`, `ollama_model`),
   хранится в TOML-файле в стандартной директории конфигов ОС
   (`~/.config/agentcli/config.toml` на Linux/macOS). Параметры агента
   (`ChatSettings`: модель, режим ответа, `response_format`, `sampling`, `reasoning`) в конфиге
   задают лишь значения по умолчанию для новых чатов — рабочие значения живут
   в самом чате.
-- **`src/agent/`** — слой обращения к AI-агенту:
+- **`agent/`** — слой обращения к AI-агенту:
   - `mod.rs` — трейт `Agent`
-    (`async fn ask(&self, history: &[Message], settings: &ChatSettings) -> Result<String>`)
-    и общие типы `Message`/`Role`, что позволяет позже добавить другие
-    реализации агента без изменения остального кода;
+    (`async fn ask(&self, history: &[Message], settings: &ChatSettings) -> Result<AgentReply>`)
+    и общие типы `Message`/`Role`/`MessageMeta`, что позволяет позже добавить
+    другие реализации агента без изменения остального кода;
+  - `error.rs` — типизированная `AgentError` (`Timeout`, `Provider`,
+    `Transport`, `MissingApiKey`, `Decode`). Она кладётся внутрь
+    `anyhow::Error`, поэтому вызывающая сторона отличает таймаут от ошибки
+    провайдера через `downcast_ref`, а не по тексту сообщения;
   - `http.rs` — `HttpAgent`: реализация `Agent` поверх `reqwest`. Для чатов
     с провайдером `cloud` шлёт `POST {base_url}/chat/completions` с телом
     OpenAI-совместимого Chat Completions API, для провайдера `ollama` —
@@ -34,19 +39,43 @@
     OpenAI-совместимый слой, потому что он отдаёт цепочку рассуждения
     (`message.thinking`), счётчики токенов и `top_k` — всё, что приложение уже
     показывает для облачных моделей.
-- **`src/chats.rs`** — хранение истории чатов: каждая сессия (`ChatSession`)
+- **`logging.rs`** — журнал обмена с провайдером (`ExchangeLog`) в формате
+  JSON Lines. Директорию задаёт вызывающая сторона, запись можно полностью
+  выключить, а строки уходят в фоновый поток, поэтому диск не задерживает
+  ответ модели.
+
+**`crates/cli` — бинарник `agentcli`:**
+
+- **`main.rs`** — точка входа: разбирает CLI-команды и вызывает
+  соответствующий обработчик (`ask`, `chat`, `config`, `ollama`).
+- **`cli.rs`** — описание команд и аргументов на `clap` (`derive`-API).
+- **`logging.rs`** — где консольный клиент держит журнал обмена и какую
+  подсказку про ключ он подставляет в сообщение об ошибке.
+- **`chats.rs`** — хранение истории чатов: каждая сессия (`ChatSession`)
   сериализуется в отдельный JSON-файл в `~/.config/agentcli/chats/`,
   список сессий подгружается и сортируется по времени последнего изменения.
   Вместе с историей в файле чата лежат его собственные параметры агента
   (`settings`), поэтому у каждого чата свои формат ответа и сэмплирование.
-- **`src/tui.rs`** — интерактивный интерфейс чата на `ratatui` + `crossterm`:
+- **`tui.rs`** — интерактивный интерфейс чата на `ratatui` + `crossterm`:
   боковая панель со списком чатов, окно истории сообщений с прокруткой,
   поле ввода, асинхронная отправка запросов к агенту (через `tokio::spawn`
   и `mpsc`-канал) со спиннером ожидания.
-- **`src/markdown.rs`** — единая настройка стилей Markdown-рендера
+- **`markdown.rs`** — единая настройка стилей Markdown-рендера
   (`termimad`), используется как при печати одиночного ответа, так и
   внутри истории TUI (через `ansi-to-tui`, конвертирующий ANSI-разметку
   `termimad` в виджеты `ratatui`).
+
+### Журнал обмена с провайдером
+
+Запросы и ответы пишутся в `requests.jsonl` и `responses.jsonl`. Консольный
+клиент кладёт их в пользовательскую директорию данных ОС —
+`~/Library/Application Support/agentcli/logs` на macOS,
+`~/.local/share/agentcli/logs` на Linux. Переменная окружения
+`AGENTCLI_LOG_DIR` задаёт свою директорию:
+
+```bash
+AGENTCLI_LOG_DIR=/tmp/agentcli-logs cargo run -p agentcli -- ask "привет"
+```
 
 ### Поток данных
 
@@ -56,8 +85,8 @@
    историю в формат Chat Completions и отправляет POST-запрос к
    `{base_url}/chat/completions`, для Ollama — к `{ollama_url}/api/chat`
    без ключа.
-4. Ответ разбирается (`serde_json`), при ошибке API — оборачивается в
-   понятное сообщение.
+4. Ответ разбирается (`serde_json`), при ошибке API — превращается
+   в `AgentError` с сохранением статуса и разобранного сообщения провайдера.
 5. Текст ответа рендерится как Markdown (`termimad`) и выводится в
    терминал либо добавляется в историю чата, которая сохраняется на диск
    (`chats::save_chat`).
@@ -77,6 +106,10 @@
 | Рендер Markdown в терминале      | `termimad`, `ansi-to-tui`        |
 | Индикация прогресса/стиль текста | `indicatif`, `console`          |
 
+Терминальные зависимости (`clap`, `ratatui`, `crossterm`, `termimad`,
+`ansi-to-tui`, `indicatif`, `console`, `arboard`) живут только в `agentcli`:
+`agentcore` от терминала не зависит.
+
 ## Запуск
 
 Требуется установленный Rust (издание 2024, см. `Cargo.toml`).
@@ -90,7 +123,7 @@ cargo build --release
 Задать API-ключ:
 
 ```bash
-cargo run -- config set-key <ВАШ_КЛЮЧ>
+cargo run -p agentcli -- config set-key <ВАШ_КЛЮЧ>
 ```
 
 Ключ можно ввести и не выходя из чата: `Ctrl+P`, раздел «Подключение»
@@ -100,9 +133,9 @@ cargo run -- config set-key <ВАШ_КЛЮЧ>
 Модель по умолчанию и адрес API:
 
 ```bash
-cargo run -- config set-model deepseek-chat
-cargo run -- config set-url https://api.deepseek.com
-cargo run -- config models   # список моделей для быстрого выбора
+cargo run -p agentcli -- config set-model deepseek-chat
+cargo run -p agentcli -- config set-url https://api.deepseek.com
+cargo run -p agentcli -- config models   # список моделей для быстрого выбора
 ```
 
 По умолчанию используется `base_url = https://api.deepseek.com` и
@@ -115,19 +148,19 @@ cargo run -- config models   # список моделей для быстрог
 Посмотреть текущую конфигурацию (ключ маскируется):
 
 ```bash
-cargo run -- config show
+cargo run -p agentcli -- config show
 ```
 
 Задать один вопрос и получить ответ:
 
 ```bash
-cargo run -- ask "Как настроить логирование в Rust?"
+cargo run -p agentcli -- ask "Как настроить логирование в Rust?"
 ```
 
 Запустить интерактивный чат (TUI):
 
 ```bash
-cargo run -- chat
+cargo run -p agentcli -- chat
 ```
 
 Управление в TUI:
@@ -270,11 +303,11 @@ Ollama), она показывается в
 задаётся глобально:
 
 ```bash
-cargo run -- config reasoning step-by-step
+cargo run -p agentcli -- config reasoning step-by-step
 ```
 
 ```bash
-cargo run -- config reasoning expert-panel --experts "аналитик, инженер, критик"
+cargo run -p agentcli -- config reasoning expert-panel --experts "аналитик, инженер, критик"
 ```
 
 Допустимые значения: `default`, `step-by-step`, `prompt-craft`,

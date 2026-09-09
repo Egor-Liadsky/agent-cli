@@ -1,0 +1,27 @@
+[package]
+name = "agentcli"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "agentcli"
+path = "src/main.rs"
+
+[dependencies]
+agentcore.workspace = true
+anyhow.workspace = true
+dirs.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+
+clap = { version = "4", features = ["derive"] }
+termimad = "0.35.2"
+indicatif = "0.18.6"
+console = "0.16.4"
+ratatui = { version = "0.30.2", features = ["unstable-rendered-line-info"] }
+crossterm = { version = "0.29.0", features = ["event-stream"] }
+futures = "0.3.34"
+ansi-to-tui = "8.0.1"
+arboard = { version = "3", default-features = false }
+chrono = { version = "0.4.45", default-features = false, features = ["clock"] }

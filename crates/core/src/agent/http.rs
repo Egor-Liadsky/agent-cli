@@ -1,10 +1,12 @@
 use super::{Agent, AgentReply, Message, MessageMeta, Role};
 use crate::config::{ChatSettings, Config, Provider, ResponseFormat, DEFAULT_MODEL};
-use anyhow::{bail, Context, Result};
+use super::error::{transport_error, AgentError};
+use crate::logging::{request_id, unix_timestamp, ExchangeLog, RequestLogEntry, ResponseLogEntry};
+use anyhow::Result;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
-use std::io::Write;
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 pub struct HttpAgent {
     client: reqwest::Client,
@@ -20,10 +22,14 @@ pub struct HttpAgent {
     ollama_url: String,
     /// Локальная модель по умолчанию для чатов с провайдером `Ollama`.
     ollama_model: String,
+    /// Журнал обмена с провайдером. Назначение задаёт вызывающая сторона.
+    log: Arc<ExchangeLog>,
+    /// Подсказка вызывающей стороны в сообщении об отсутствующем ключе.
+    missing_key_hint: Option<String>,
 }
 
 impl HttpAgent {
-    pub fn from_config(config: &Config) -> Result<Self> {
+    pub fn from_config(config: &Config, log: Arc<ExchangeLog>) -> Result<Self> {
         Ok(Self {
             client: reqwest::Client::new(),
             api_key: config.api_key.clone().unwrap_or_default(),
@@ -32,7 +38,24 @@ impl HttpAgent {
             ollama_client: super::ollama::client(),
             ollama_url: config.effective_ollama_url(),
             ollama_model: config.ollama_model.clone().unwrap_or_default(),
+            log,
+            missing_key_hint: None,
         })
+    }
+
+    /// Подсказка, которую вызывающая сторона добавляет к нейтральному
+    /// сообщению об отсутствующем ключе провайдера.
+    pub fn with_missing_key_hint(mut self, hint: impl Into<String>) -> Self {
+        self.missing_key_hint = Some(hint.into());
+        self
+    }
+
+    /// Таймаут запроса к провайдеру. Его истечение даёт
+    /// [`AgentError::Timeout`], а не безымянную транспортную ошибку.
+    pub fn with_request_timeout(mut self, timeout: Duration) -> Result<Self> {
+        self.client = reqwest::Client::builder().timeout(timeout).build()?;
+        self.ollama_client = super::ollama::client_builder().timeout(timeout).build()?;
+        Ok(self)
     }
 
     /// Модель запроса: своя у чата, иначе модель по умолчанию для его
@@ -169,79 +192,16 @@ struct ApiErrorDetail {
     message: String,
 }
 
-#[derive(Serialize)]
-pub(super) struct RequestLogEntry<'a> {
-    pub id: &'a str,
-    pub timestamp: u64,
-    pub url: &'a str,
-    pub model: &'a str,
-    pub request: serde_json::Value,
-}
-
-#[derive(Serialize)]
-pub(super) struct ResponseLogEntry<'a> {
-    pub id: &'a str,
-    pub timestamp: u64,
-    pub status: u16,
-    pub duration_ms: u128,
-    pub response: serde_json::Value,
-}
-
-fn logs_dir() -> Result<std::path::PathBuf> {
-    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("logs");
-    std::fs::create_dir_all(&dir)
-        .with_context(|| format!("не удалось создать директорию логов {}", dir.display()))?;
-    Ok(dir)
-}
-
-fn append_log_line(file_name: &str, line: &str) {
-    let Ok(dir) = logs_dir() else { return };
-    if let Ok(mut file) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(dir.join(file_name))
-    {
-        let _ = writeln!(file, "{line}");
-    }
-}
-
-pub(super) fn log_request(entry: &RequestLogEntry) {
-    if let Ok(line) = serde_json::to_string(entry) {
-        append_log_line("requests.jsonl", &line);
-    }
-}
-
-pub(super) fn log_response(entry: &ResponseLogEntry) {
-    if let Ok(line) = serde_json::to_string(entry) {
-        append_log_line("responses.jsonl", &line);
-    }
-}
-
-pub(super) fn unix_timestamp() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
-}
-
-pub(super) fn request_id() -> String {
-    format!(
-        "{}-{:x}",
-        unix_timestamp(),
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.subsec_nanos())
-            .unwrap_or(0)
-    )
-}
-
-fn parse_api_error(status: reqwest::StatusCode, body: &str) -> anyhow::Error {
-    let detail = serde_json::from_str::<ApiErrorBody>(body)
+fn parse_api_error(status: reqwest::StatusCode, body: &str) -> AgentError {
+    let message = serde_json::from_str::<ApiErrorBody>(body)
         .ok()
         .and_then(|e| e.error)
         .map(|e| e.message)
         .unwrap_or_else(|| body.to_string());
-    anyhow::anyhow!("API вернул ошибку ({status}): {detail}")
+    AgentError::Provider {
+        status: status.as_u16(),
+        message,
+    }
 }
 
 impl HttpAgent {
@@ -291,14 +251,11 @@ impl HttpAgent {
         request_body: &ChatRequest<'_>,
     ) -> Result<(String, MessageMeta)> {
         if self.api_key.trim().is_empty() {
-            bail!(
-                "API key не задан. Введите его в настройках чата (Ctrl+P → «Подключение») \
-                 или выполните: agentcli config set-key <KEY>"
-            );
+            return Err(AgentError::missing_api_key(self.missing_key_hint.clone()).into());
         }
         let id = request_id();
         let request_json = serde_json::to_value(request_body).unwrap_or(serde_json::Value::Null);
-        log_request(&RequestLogEntry {
+        self.log.log_request(&RequestLogEntry {
             id: &id,
             timestamp: unix_timestamp(),
             url,
@@ -315,18 +272,18 @@ impl HttpAgent {
             .json(request_body)
             .send()
             .await
-            .context("не удалось отправить запрос к API")?;
+            .map_err(|err| transport_error("не удалось отправить запрос к API", err))?;
 
         let status = response.status();
         let body = response
             .text()
             .await
-            .context("не удалось прочитать тело ответа")?;
+            .map_err(|err| transport_error("не удалось прочитать тело ответа", err))?;
         let duration_ms = started_at.elapsed().as_millis();
 
         let response_json = serde_json::from_str::<serde_json::Value>(&body)
             .unwrap_or(serde_json::Value::String(body.clone()));
-        log_response(&ResponseLogEntry {
+        self.log.log_response(&ResponseLogEntry {
             id: &id,
             timestamp: unix_timestamp(),
             status: status.as_u16(),
@@ -335,7 +292,7 @@ impl HttpAgent {
         });
 
         if !status.is_success() {
-            bail!(parse_api_error(status, &body));
+            return Err(parse_api_error(status, &body).into());
         }
 
         let meta = MessageMeta {
@@ -349,8 +306,8 @@ impl HttpAgent {
 }
 
 fn extract_answer(body: &str, mut meta: MessageMeta) -> Result<AgentReply> {
-    let parsed: ChatResponse =
-        serde_json::from_str(body).context("не удалось разобрать ответ API")?;
+    let parsed: ChatResponse = serde_json::from_str(body)
+        .map_err(|err| AgentError::Decode(format!("не удалось разобрать ответ API: {err}")))?;
 
     if let Some(usage) = parsed.usage {
         meta.prompt_tokens = usage.prompt_tokens;
@@ -366,7 +323,7 @@ fn extract_answer(body: &str, mut meta: MessageMeta) -> Result<AgentReply> {
         .into_iter()
         .next()
         .map(|c| c.message)
-        .context("ответ API не содержит вариантов")?;
+        .ok_or_else(|| AgentError::Decode("ответ API не содержит вариантов".to_string()))?;
 
     let reasoning = message
         .reasoning_content
@@ -392,6 +349,7 @@ impl Agent for HttpAgent {
                 history,
                 settings,
                 Self::system_prompt(settings),
+                &self.log,
             )
             .await;
         }
@@ -402,5 +360,111 @@ impl Agent for HttpAgent {
 
         let (body, meta) = self.send_request(&url, &request_body).await?;
         extract_answer(&body, meta)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::Config;
+    use std::time::Duration;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    /// Одноразовый сервер: принимает соединение и отвечает статусом и телом.
+    /// `None` — не отвечает вовсе, чтобы сработал таймаут клиента.
+    async fn stub_provider(response: Option<(u16, &'static str)>) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("порт");
+        let addr = listener.local_addr().expect("адрес");
+        tokio::spawn(async move {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                return;
+            };
+            let mut buffer = [0u8; 1024];
+            let _ = socket.read(&mut buffer).await;
+            match response {
+                Some((status, body)) => {
+                    let head = format!(
+                        "HTTP/1.1 {status} STATUS\r\n\
+                         Content-Type: application/json\r\n\
+                         Content-Length: {}\r\n\
+                         Connection: close\r\n\r\n",
+                        body.len()
+                    );
+                    let _ = socket.write_all(head.as_bytes()).await;
+                    let _ = socket.write_all(body.as_bytes()).await;
+                    let _ = socket.flush().await;
+                }
+                // Держим соединение открытым: клиент должен упереться
+                // в собственный таймаут.
+                None => tokio::time::sleep(Duration::from_secs(30)).await,
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    fn agent(base_url: String) -> HttpAgent {
+        let config = Config {
+            api_key: Some("test-key".to_string()),
+            base_url: Some(base_url),
+            ..Config::default()
+        };
+        HttpAgent::from_config(&config, Arc::new(ExchangeLog::disabled()))
+            .expect("агент")
+            .with_request_timeout(Duration::from_millis(300))
+            .expect("таймаут")
+    }
+
+    #[tokio::test]
+    async fn provider_error_is_typed() {
+        let base_url =
+            stub_provider(Some((500, r#"{"error":{"message":"внутренняя ошибка"}}"#))).await;
+
+        let history = [Message::user("привет")];
+        let err = agent(base_url)
+            .ask(&history, &ChatSettings::default())
+            .await
+            .expect_err("ожидалась ошибка провайдера");
+
+        match err.downcast_ref::<AgentError>() {
+            Some(AgentError::Provider { status, message }) => {
+                assert_eq!(*status, 500);
+                assert_eq!(message, "внутренняя ошибка");
+            }
+            other => panic!("ожидался Provider, получено: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn timeout_is_typed() {
+        let base_url = stub_provider(None).await;
+        let history = [Message::user("привет")];
+        let err = agent(base_url)
+            .ask(&history, &ChatSettings::default())
+            .await
+            .expect_err("ожидался таймаут");
+
+        assert!(
+            matches!(err.downcast_ref::<AgentError>(), Some(AgentError::Timeout)),
+            "ожидался Timeout, получено: {err:#}"
+        );
+    }
+
+    #[tokio::test]
+    async fn missing_key_is_typed_and_uses_hint() {
+        let agent = HttpAgent::from_config(&Config::default(), Arc::new(ExchangeLog::disabled()))
+            .expect("агент")
+            .with_missing_key_hint("подсказка вызывающей стороны");
+        let history = [Message::user("привет")];
+        let err = agent
+            .ask(&history, &ChatSettings::default())
+            .await
+            .expect_err("ожидалась ошибка ключа");
+
+        assert!(matches!(
+            err.downcast_ref::<AgentError>(),
+            Some(AgentError::MissingApiKey { .. })
+        ));
+        assert!(format!("{err}").contains("подсказка вызывающей стороны"));
     }
 }
