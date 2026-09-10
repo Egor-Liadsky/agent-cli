@@ -38,6 +38,8 @@ enum ChatEvent {
     Response(String, anyhow::Result<AgentReply>),
     /// Список локальных моделей Ollama: пришёл фоновой задачей.
     OllamaModels(Result<Vec<String>, String>),
+    /// Список облачных моделей сервиса: пришёл фоновой задачей.
+    CloudModels(Result<Vec<String>, String>),
 }
 
 #[derive(PartialEq)]
@@ -317,7 +319,12 @@ struct SettingsEditor {
 }
 
 impl SettingsEditor {
-    fn from_chat(chat: &ChatSession, config: &Config, ollama_models: &[String]) -> Self {
+    fn from_chat(
+        chat: &ChatSession,
+        config: &Config,
+        model_choices: &[String],
+        ollama_models: &[String],
+    ) -> Self {
         let settings = &chat.settings;
         let custom_mode = settings.custom_response_mode;
         let format = settings.response_format.clone();
@@ -330,7 +337,9 @@ impl SettingsEditor {
             server_url: config.server_url.clone().unwrap_or_default(),
             client_token: config.client_token.clone().unwrap_or_default(),
             ollama_url: config.ollama_url.clone().unwrap_or_default(),
-            model_choices: config.model_choices(),
+            // приходит из AppState.model_choices: список сервиса, если фоновый
+            // запрос уже ответил, иначе — встроенный/конфигурный список
+            model_choices: model_choices.to_vec(),
             ollama_models: ollama_models.to_vec(),
             stashed_model: String::new(),
             default_model: config.effective_model(),
@@ -710,6 +719,11 @@ struct AppState {
     /// Локально скачанные модели Ollama: подгружаются фоном при старте
     /// и обновляются по Ctrl+L в настройках.
     ollama_models: Vec<String>,
+    /// Облачные модели, разрешённые сервисом (`GET /v1/models`): подгружаются
+    /// фоном при старте и обновляются по Ctrl+L. Начинаются со встроенного/
+    /// конфигурного списка, чтобы выбор модели не был пустым, пока сервис не
+    /// ответил или если он недоступен.
+    model_choices: Vec<String>,
 }
 
 impl AppState {
@@ -790,6 +804,9 @@ async fn run_app(
         chat_ui.insert(chat.id.clone(), ChatUi::default());
     }
     let first_id = chats[0].id.clone();
+    // встроенный/конфигурный список — стартовое значение, пока сервис не
+    // ответил на фоновый запрос (или если он недоступен)
+    let model_choices = config.model_choices();
 
     let mut state = AppState {
         config,
@@ -807,12 +824,16 @@ async fn run_app(
         notice: None,
         show_reasoning: true,
         ollama_models: Vec::new(),
+        model_choices,
     };
 
     let (tx, mut rx) = mpsc::unbounded_channel::<ChatEvent>();
     // список локальных моделей тянем фоном: Ollama может быть не запущен,
     // и ждать его на старте незачем
     fetch_ollama_models(&state.config, &tx);
+    // список облачных моделей тоже тянем фоном: сервис может быть недоступен,
+    // а падать в этом случае незачем — остаёмся на встроенном списке
+    fetch_cloud_models(&state.config, &tx);
     let mut events = EventStream::new();
     let mut tick = tokio::time::interval(Duration::from_millis(80));
 
@@ -969,6 +990,7 @@ fn handle_key(
             state.settings = Some(SettingsEditor::from_chat(
                 &state.chats[chat_index],
                 &state.config,
+                &state.model_choices,
                 &state.ollama_models,
             ));
             state.focus = Focus::Settings;
@@ -1075,9 +1097,20 @@ fn handle_settings_key(
             editor.cycle_reasoning(1);
         }
         KeyCode::Char('l') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            // одна клавиша на обоих провайдеров: обновляем список активного,
+            // чтобы не плодить отдельные горячие клавиши под каждый
+            let provider = editor.provider;
             editor.error = None;
-            state.notify("Обновляю список моделей Ollama…");
-            fetch_ollama_models(&state.config, tx);
+            match provider {
+                Provider::Ollama => {
+                    state.notify("Обновляю список моделей Ollama…");
+                    fetch_ollama_models(&state.config, tx);
+                }
+                Provider::Cloud => {
+                    state.notify("Обновляю список моделей сервиса…");
+                    fetch_cloud_models(&state.config, tx);
+                }
+            }
         }
         KeyCode::Left
             if editor.pane == SettingsPane::Fields
@@ -1409,10 +1442,30 @@ fn fetch_ollama_models(config: &Config, tx: &mpsc::UnboundedSender<ChatEvent>) {
     });
 }
 
+/// Фоновый запрос списка облачных моделей у сервиса (`GET /v1/models`).
+/// Список принадлежит сервису: клиенту нельзя было слать ключ провайдера
+/// сам, поэтому единственный способ узнать разрешённые модели — спросить
+/// сервис через `agentclient`, тот же клиент, что использует чат.
+fn fetch_cloud_models(config: &Config, tx: &mpsc::UnboundedSender<ChatEvent>) {
+    let server_url = config.effective_server_url();
+    let token = config.client_token();
+    let tx = tx.clone();
+    tokio::spawn(async move {
+        let result = agentclient::list_models(&server_url, &token)
+            .await
+            .map_err(|err| err.to_string());
+        let _ = tx.send(ChatEvent::CloudModels(result));
+    });
+}
+
 fn handle_chat_event(chat_event: ChatEvent, state: &mut AppState) {
     let chat_event = match chat_event {
         ChatEvent::OllamaModels(result) => {
             handle_ollama_models(result, state);
+            return;
+        }
+        ChatEvent::CloudModels(result) => {
+            handle_cloud_models(result, state);
             return;
         }
         other => other,
@@ -1472,6 +1525,39 @@ fn handle_ollama_models(result: Result<Vec<String>, String>, state: &mut AppStat
             }
             if state.focus == Focus::Settings {
                 state.notify(format!("Ollama недоступен: {err}"));
+            }
+        }
+    }
+}
+
+/// Обновить список облачных моделей в состоянии и в открытом редакторе
+/// настроек. В отличие от Ollama, при ошибке список НЕ очищаем: у облака
+/// есть встроенный/конфигурный список-запасной вариант (у Ollama такого нет,
+/// там пустой список — единственно честное состояние), и терять выбор модели
+/// только из-за недоступности сервиса не нужно.
+fn handle_cloud_models(result: Result<Vec<String>, String>, state: &mut AppState) {
+    match result {
+        Ok(models) if !models.is_empty() => {
+            let count = models.len();
+            state.model_choices = models.clone();
+            if let Some(editor) = state.settings.as_mut() {
+                editor.model_choices = models;
+            }
+            if state.focus == Focus::Settings {
+                state.notify(format!("Сервис: найдено моделей — {count}"));
+            }
+        }
+        Ok(_) => {
+            if state.focus == Focus::Settings {
+                state.notify("Сервис не сообщил ни одной модели, использую список из конфига");
+            }
+        }
+        Err(err) => {
+            if state.focus == Focus::Settings {
+                state.notify(format!("Список моделей сервиса недоступен: {err}"));
+            }
+            if let Some(editor) = state.settings.as_mut() {
+                editor.error = Some(err);
             }
         }
     }
