@@ -80,6 +80,7 @@ fn load_config() -> anyhow::Result<Config> {
     Ok(config)
 }
 
+
 fn run_config(action: ConfigAction) -> anyhow::Result<()> {
     match action {
         ConfigAction::SetToken { token } => {

@@ -38,6 +38,25 @@ impl CliAgent {
     }
 }
 
+impl CliAgent {
+    /// Ответ в чате, который хранится в сервисе. Облачный чат идёт запросом
+    /// с `chat_id`: сервис сам берёт историю и записывает обмен. Локальная
+    /// модель отвечает по истории, переданной клиентом, а обмен клиент
+    /// дозаписывает в сервис отдельно (specs/client-chat-storage).
+    pub async fn ask_in_chat(
+        &self,
+        chat_id: &str,
+        prompt: &str,
+        history: &[Message],
+        settings: &ChatSettings,
+    ) -> Result<AgentReply> {
+        match settings.provider {
+            Provider::Cloud => self.server.ask_in_chat(chat_id, prompt, settings).await,
+            Provider::Ollama => self.local.ask(history, settings).await,
+        }
+    }
+}
+
 #[async_trait]
 impl Agent for CliAgent {
     async fn ask(&self, history: &[Message], settings: &ChatSettings) -> Result<AgentReply> {

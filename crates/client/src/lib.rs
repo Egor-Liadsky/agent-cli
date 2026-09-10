@@ -20,7 +20,7 @@ use std::time::{Duration, Instant};
 
 /// Заголовок с идентификатором запроса: сервис дублирует его и в теле ошибки,
 /// но при пустом теле остаётся только заголовок.
-const REQUEST_ID_HEADER: &str = "x-request-id";
+pub(crate) const REQUEST_ID_HEADER: &str = "x-request-id";
 
 pub struct ServerAgent {
     client: reqwest::Client,
@@ -102,9 +102,18 @@ impl ServerAgent {
 
 /// Тело запроса к `POST /v1/chat`. Поля `api_key` здесь нет намеренно: ключ
 /// провайдера принадлежит сервису, и тело с этим полем он отклоняет как `400`.
+///
+/// С `chat_id` сервис берёт историю из чата и сам записывает обмен, поэтому
+/// в теле уходит только новая реплика: `messages` вместе с `chat_id` контракт
+/// не принимает.
 #[derive(Serialize)]
 struct ChatRequest {
-    messages: Vec<ChatMessage>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    chat_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    prompt: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    messages: Option<Vec<ChatMessage>>,
     settings: ChatSettingsPayload,
 }
 
@@ -139,15 +148,15 @@ struct ChatSettingsPayload {
 }
 
 #[derive(Serialize)]
-struct ResponseFormatPayload {
+pub(crate) struct ResponseFormatPayload {
     #[serde(skip_serializing_if = "Option::is_none")]
-    description: Option<String>,
+    pub(crate) description: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    max_length: Option<u32>,
+    pub(crate) max_length: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    stop: Option<Vec<String>>,
+    pub(crate) stop: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    stop_instruction: Option<String>,
+    pub(crate) stop_instruction: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -207,7 +216,7 @@ struct ErrorBody {
 
 /// Ошибка сервиса в терминах ядра. Разбор идёт по коду состояния: коды
 /// задокументированы контрактом `/v1`, а `code` из тела попадает в текст.
-fn parse_service_error(
+pub(crate) fn parse_service_error(
     status: reqwest::StatusCode,
     body: &str,
     header_request_id: Option<String>,
@@ -257,7 +266,7 @@ fn parse_service_error(
     }
 }
 
-fn header_request_id(response: &reqwest::Response) -> Option<String> {
+pub(crate) fn header_request_id(response: &reqwest::Response) -> Option<String> {
     response
         .headers()
         .get(REQUEST_ID_HEADER)
@@ -279,9 +288,20 @@ impl ServerAgent {
             },
             content: m.content.clone(),
         }));
+        self.build_body(None, None, Some(messages), settings)
+    }
 
+    fn build_body(
+        &self,
+        chat_id: Option<String>,
+        prompt: Option<String>,
+        messages: Option<Vec<ChatMessage>>,
+        settings: &ChatSettings,
+    ) -> ChatRequest {
         let sampling = &settings.sampling;
         ChatRequest {
+            chat_id,
+            prompt,
             messages,
             settings: ChatSettingsPayload {
                 provider: "cloud",
@@ -307,10 +327,38 @@ impl ServerAgent {
     }
 }
 
+impl ServerAgent {
+    /// Диалог в чате сервиса: историю сервис берёт из хранилища сам, а обмен
+    /// записывает одной транзакцией после ответа модели. Клиент отправляет
+    /// только новую реплику (specs/client-chat-storage, «Реплики чата
+    /// попадают в сервис»).
+    pub async fn ask_in_chat(
+        &self,
+        chat_id: &str,
+        prompt: &str,
+        settings: &ChatSettings,
+    ) -> Result<AgentReply> {
+        let body = self.build_body(
+            Some(chat_id.to_string()),
+            Some(prompt.to_string()),
+            None,
+            settings,
+        );
+        self.exchange(body).await
+    }
+}
+
 #[async_trait]
 impl Agent for ServerAgent {
     async fn ask(&self, history: &[Message], settings: &ChatSettings) -> Result<AgentReply> {
         let request_body = self.build_request(history, settings);
+        self.exchange(request_body).await
+    }
+}
+
+impl ServerAgent {
+    /// Один обмен с сервисом: журнал, разбор ошибок и сборка ответа агента.
+    async fn exchange(&self, request_body: ChatRequest) -> Result<AgentReply> {
         let url = self.chat_url();
         let id = request_id();
         self.log.log_request(&RequestLogEntry {
@@ -425,6 +473,9 @@ pub async fn list_models(server_url: &str, token: &str) -> Result<Vec<String>> {
     })?;
     Ok(parsed.models)
 }
+
+mod chats;
+pub use chats::{ChatHistory, ChatSummary, ChatsClient, StoredMessage};
 
 #[cfg(test)]
 mod tests;

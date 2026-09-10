@@ -146,7 +146,7 @@
 
 ## 7. Поставка
 
-- [ ] 7.1 Написать многостадийный `Dockerfile` (сборка на образе Rust, рантайм
+- [x] 7.1 Написать многостадийный `Dockerfile` (сборка на образе Rust, рантайм
   на `debian:*-slim`), `.dockerignore`, чтение порта из `PORT` и `HEALTHCHECK`
   на `/healthz`. Проверка: `docker build` проходит, `docker run` с ключом
   отвечает 200 на `/healthz`, `docker inspect` показывает состояние `healthy`.

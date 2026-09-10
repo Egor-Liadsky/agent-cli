@@ -1,6 +1,7 @@
 use crate::agent::CliAgent;
-use agentcore::agent::{Agent, AgentReply, Message, MessageMeta, Role};
+use agentcore::agent::{AgentReply, Message, MessageMeta, Role};
 use crate::chats::{self, ChatSession};
+use agentclient::{ChatHistory, ChatSummary, ChatsClient};
 use agentcore::config::{
     ChatSettings, Config, Provider, ReasoningMode, ResponseFormat, SamplingParams, ThinkingMode,
 };
@@ -34,12 +35,34 @@ const BILLY_ART: &str = include_str!("assets/billy.ans");
 /// Максимум одновременно открытых на экране чатов (панелей).
 const MAX_PANES: usize = 3;
 
+/// Исход загрузки списка чатов. Список принадлежит сервису, поэтому
+/// «список неизвестен» и «список пуст» — разные состояния: во втором
+/// случае писать некуда, но причина не в отказе (specs/client-chat-storage,
+/// «Клиент работает при недоступном сервисе»).
+enum ChatsLoad {
+    Loading,
+    Loaded,
+    Failed(String),
+}
+
 enum ChatEvent {
     Response(String, anyhow::Result<AgentReply>),
     /// Список локальных моделей Ollama: пришёл фоновой задачей.
     OllamaModels(Result<Vec<String>, String>),
     /// Список облачных моделей сервиса: пришёл фоновой задачей.
     CloudModels(Result<Vec<String>, String>),
+    /// Список чатов сервиса (`GET /v1/chats`).
+    ChatsLoaded(Result<Vec<ChatSummary>, String>),
+    /// История одного чата (`GET /v1/chats/{id}`).
+    HistoryLoaded(String, Result<ChatHistory, String>),
+    /// Созданный сервисом чат (`POST /v1/chats`).
+    ChatCreated(Result<ChatSummary, String>),
+    /// Подтверждённое сервисом изменение чата (`PATCH /v1/chats/{id}`).
+    ChatUpdated(String, Result<ChatSummary, String>),
+    /// Подтверждённое сервисом удаление чата (`DELETE /v1/chats/{id}`).
+    ChatDeleted(String, Result<(), String>),
+    /// Дозапись обмена локального чата (`POST /v1/chats/{id}/messages`).
+    ExchangeSaved(String, Result<(), String>),
 }
 
 #[derive(PartialEq)]
@@ -678,6 +701,20 @@ struct ChatUi {
     max_scroll: u16,
     auto_scroll: bool,
     scroll_to_message: Option<usize>,
+    /// Запрошена история чата у сервиса: ввод заблокирован, пока она не
+    /// пришла, иначе реплика ушла бы с неполным контекстом.
+    history_loading: bool,
+    /// Причина, по которой история чата не загрузилась.
+    history_error: Option<String>,
+    /// Обмен, который не удалось дозаписать в сервис: причина и сами
+    /// реплики для повторной попытки.
+    unsaved: Option<UnsavedExchange>,
+}
+
+/// Обмен локального чата, оставшийся только в памяти клиента.
+struct UnsavedExchange {
+    reason: String,
+    messages: Vec<Message>,
 }
 
 impl Default for ChatUi {
@@ -690,6 +727,9 @@ impl Default for ChatUi {
             max_scroll: 0,
             auto_scroll: true,
             scroll_to_message: None,
+            history_loading: false,
+            history_error: None,
+            unsaved: None,
         }
     }
 }
@@ -697,9 +737,15 @@ impl Default for ChatUi {
 struct AppState {
     /// Глобальный конфиг: ключ API, адрес и модель по умолчанию.
     config: Config,
+    /// Клиент чатов сервиса: хранилища у самого клиента нет.
+    chats_client: Arc<ChatsClient>,
+    /// Взведён, пока идёт запрос на создание чата: второй запрос не нужен.
+    creating_chat: bool,
     /// Взведён, когда изменились ключ или адрес API: агента надо пересобрать.
     agent_dirty: bool,
     chats: Vec<ChatSession>,
+    /// Исход загрузки списка чатов у сервиса.
+    chats_load: ChatsLoad,
     chat_ui: HashMap<String, ChatUi>,
     /// Id чатов, открытых сейчас на экране, по одной панели на элемент.
     panes: Vec<String>,
@@ -727,15 +773,45 @@ struct AppState {
 }
 
 impl AppState {
-    fn active_chat_id(&self) -> String {
-        self.panes[self.active_pane].clone()
+    /// Чат активной панели. `None` — открытых панелей нет: список чатов
+    /// ещё не загружен, не загрузился или пуст.
+    fn active_chat_id(&self) -> Option<String> {
+        self.panes.get(self.active_pane).cloned()
     }
 
-    fn chat_index(&self, id: &str) -> usize {
-        self.chats
-            .iter()
-            .position(|c| c.id == id)
-            .expect("панель ссылается на существующий чат")
+    fn chat_index(&self, id: &str) -> Option<usize> {
+        self.chats.iter().position(|c| c.id == id)
+    }
+
+    /// Чат активной панели вместе с его позицией в списке.
+    fn active_chat_index(&self) -> Option<usize> {
+        self.active_chat_id().and_then(|id| self.chat_index(&id))
+    }
+
+    fn active_pending(&self) -> bool {
+        self.active_chat_id()
+            .map(|id| self.is_pending(&id))
+            .unwrap_or(false)
+    }
+
+    /// Открыть чат в активной панели, создав её, если панелей ещё нет.
+    fn show_in_active_pane(&mut self, id: String) {
+        if self.panes.is_empty() {
+            self.panes.push(id);
+            self.active_pane = 0;
+        } else {
+            self.panes[self.active_pane] = id;
+        }
+    }
+
+    /// Причина, по которой сейчас нельзя ни создать чат, ни отправить
+    /// сообщение: список чатов не получен от сервиса.
+    fn blocked_reason(&self) -> Option<String> {
+        match &self.chats_load {
+            ChatsLoad::Loading => Some("Список чатов ещё загружается с сервиса".to_string()),
+            ChatsLoad::Failed(reason) => Some(reason.clone()),
+            ChatsLoad::Loaded => None,
+        }
     }
 
     fn is_pending(&self, id: &str) -> bool {
@@ -781,7 +857,9 @@ impl AppState {
         if matches!(self.focus, Focus::Import | Focus::Confirm) {
             return;
         }
-        let chat_id = self.active_chat_id();
+        let Some(chat_id) = self.active_chat_id() else {
+            return;
+        };
         if self.is_pending(&chat_id) {
             return;
         }
@@ -796,24 +874,22 @@ async fn run_app(
     mut agent: Arc<CliAgent>,
     config: Config,
 ) -> anyhow::Result<()> {
-    let mut chats: Vec<ChatSession> = chats::list_chats().unwrap_or_default();
-    chats.insert(0, ChatSession::new(config.default_chat_settings()));
-
-    let mut chat_ui: HashMap<String, ChatUi> = HashMap::new();
-    for chat in &chats {
-        chat_ui.insert(chat.id.clone(), ChatUi::default());
-    }
-    let first_id = chats[0].id.clone();
     // встроенный/конфигурный список — стартовое значение, пока сервис не
     // ответил на фоновый запрос (или если он недоступен)
     let model_choices = config.model_choices();
+    let chats = Arc::new(chats_client(&config));
 
     let mut state = AppState {
         config,
+        chats_client: chats,
+        creating_chat: false,
         agent_dirty: false,
-        chats,
-        chat_ui,
-        panes: vec![first_id],
+        // Список чатов принадлежит сервису и приходит фоновой задачей:
+        // пустой список до ответа — состояние загрузки, а не результат.
+        chats: Vec::new(),
+        chats_load: ChatsLoad::Loading,
+        chat_ui: HashMap::new(),
+        panes: Vec::new(),
         active_pane: 0,
         sidebar_selected: 0,
         spinner_frame: 0,
@@ -834,6 +910,9 @@ async fn run_app(
     // список облачных моделей тоже тянем фоном: сервис может быть недоступен,
     // а падать в этом случае незачем — остаёмся на встроенном списке
     fetch_cloud_models(&state.config, &tx);
+    // Список чатов тоже тянем фоном: сервис может быть недоступен, и тогда
+    // TUI открывается с баннером причины, а не падает.
+    fetch_chats(&state, &tx);
     let mut events = EventStream::new();
     let mut tick = tokio::time::interval(Duration::from_millis(80));
 
@@ -869,6 +948,10 @@ async fn run_app(
                                     "Не удалось применить настройки подключения: {err}"
                                 )),
                             }
+                            // Клиент чатов ходит по тому же адресу с тем же
+                            // токеном, поэтому пересобирается вместе с агентом.
+                            state.chats_client = Arc::new(chats_client(&state.config));
+                            fetch_chats(&state, &tx);
                         }
                     }
                     // вставка из буфера обмена приходит одним событием (bracketed paste)
@@ -877,7 +960,7 @@ async fn run_app(
                 }
             }
             Some(chat_event) = rx.recv() => {
-                handle_chat_event(chat_event, &mut state);
+                handle_chat_event(chat_event, &mut state, &tx);
             }
         }
     }
@@ -886,23 +969,27 @@ async fn run_app(
 }
 
 /// Глобальные сочетания клавиш, работающие вне зависимости от фокуса/состояния "pending".
-fn handle_global_key(key: crossterm::event::KeyEvent, state: &mut AppState) -> Option<LoopControl> {
+fn handle_global_key(
+    key: crossterm::event::KeyEvent,
+    state: &mut AppState,
+    tx: &mpsc::UnboundedSender<ChatEvent>,
+) -> Option<LoopControl> {
     if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
         return Some(LoopControl::Break);
     }
     if key.code == KeyCode::Char('n') && key.modifiers.contains(KeyModifiers::CONTROL) {
         if matches!(state.focus, Focus::Settings | Focus::Import | Focus::Confirm)
-            || state.is_pending(&state.active_chat_id())
+            || state.active_pending()
         {
             return Some(LoopControl::Continue);
         }
-        let chat = ChatSession::new(state.config.default_chat_settings());
-        let id = chat.id.clone();
-        state.chats.insert(0, chat);
-        state.chat_ui.insert(id.clone(), ChatUi::default());
-        state.panes[state.active_pane] = id;
-        state.sidebar_selected = 0;
-        state.focus = Focus::Input;
+        // Чат создаёт сервис: пока список чатов не получен, писать некуда.
+        if let Some(reason) = state.blocked_reason() {
+            state.notify(format!("Чат не создать: {reason}"));
+            return Some(LoopControl::Continue);
+        }
+        request_create_chat(state, tx);
+        state.notify("Создаю чат в сервисе…");
         return Some(LoopControl::Continue);
     }
     if key.code == KeyCode::Char('y') && key.modifiers.contains(KeyModifiers::CONTROL) {
@@ -914,6 +1001,30 @@ fn handle_global_key(key: crossterm::event::KeyEvent, state: &mut AppState) -> O
                 Ok(()) => state.notify("Текст ввода скопирован в буфер обмена"),
                 Err(err) => state.notify(format!("Не удалось скопировать: {err}")),
             }
+        }
+        return Some(LoopControl::Continue);
+    }
+    if key.code == KeyCode::Char('e') && key.modifiers.contains(KeyModifiers::CONTROL) {
+        state.chats_load = ChatsLoad::Loading;
+        fetch_chats(state, tx);
+        state.notify("Обновляю список чатов…");
+        return Some(LoopControl::Continue);
+    }
+    if key.code == KeyCode::Char('u') && key.modifiers.contains(KeyModifiers::CONTROL) {
+        let Some(chat_id) = state.active_chat_id() else {
+            return Some(LoopControl::Continue);
+        };
+        let messages = state
+            .chat_ui
+            .get(&chat_id)
+            .and_then(|ui| ui.unsaved.as_ref())
+            .map(|unsaved| unsaved.messages.clone());
+        match messages {
+            Some(messages) => {
+                request_append_exchange(state, &chat_id, messages, tx);
+                state.notify("Повторяю запись обмена в сервис…");
+            }
+            None => state.notify("Несохранённого обмена в этом чате нет"),
         }
         return Some(LoopControl::Continue);
     }
@@ -964,7 +1075,7 @@ fn handle_key(
     agent: &Arc<CliAgent>,
     tx: &mpsc::UnboundedSender<ChatEvent>,
 ) -> LoopControl {
-    if let Some(control) = handle_global_key(key, state) {
+    if let Some(control) = handle_global_key(key, state, tx) {
         return control;
     }
     if key.code == KeyCode::Char('o') && key.modifiers.contains(KeyModifiers::CONTROL) {
@@ -972,9 +1083,10 @@ fn handle_key(
             state.import = None;
             state.focus = Focus::Input;
         } else if !matches!(state.focus, Focus::Settings | Focus::Confirm) {
-            let chat_index = state.chat_index(&state.active_chat_id());
-            state.import = Some(ImportPicker::new(&state.chats[chat_index], &state.chats));
-            state.focus = Focus::Import;
+            if let Some(chat_index) = state.active_chat_index() {
+                state.import = Some(ImportPicker::new(&state.chats[chat_index], &state.chats));
+                state.focus = Focus::Import;
+            }
         }
         return LoopControl::Continue;
     }
@@ -985,8 +1097,7 @@ fn handle_key(
         if state.focus == Focus::Settings {
             state.settings = None;
             state.focus = Focus::Input;
-        } else {
-            let chat_index = state.chat_index(&state.active_chat_id());
+        } else if let Some(chat_index) = state.active_chat_index() {
             state.settings = Some(SettingsEditor::from_chat(
                 &state.chats[chat_index],
                 &state.config,
@@ -1008,11 +1119,11 @@ fn handle_key(
 
     match state.focus {
         Focus::Settings => handle_settings_key(key, state, tx),
-        Focus::Import => handle_import_key(key, state),
-        Focus::Confirm => handle_confirm_key(key, state),
-        Focus::Sidebar => handle_sidebar_key(key, state),
+        Focus::Import => handle_import_key(key, state, tx),
+        Focus::Confirm => handle_confirm_key(key, state, tx),
+        Focus::Sidebar => handle_sidebar_key(key, state, tx),
         Focus::Input => {
-            if state.is_pending(&state.active_chat_id()) {
+            if state.active_pending() || state.active_chat_id().is_none() {
                 LoopControl::Continue
             } else {
                 handle_input_key(key, state, agent, tx)
@@ -1051,8 +1162,8 @@ fn handle_settings_key(
                     let ollama_url = non_empty(&editor.ollama_url);
                     state.settings = None;
                     state.focus = Focus::Input;
-                    if let Some(chat) = state.chats.iter_mut().find(|c| c.id == chat_id) {
-                        chat.settings = ChatSettings {
+                    if state.chat_index(&chat_id).is_some() {
+                        let settings = ChatSettings {
                             provider,
                             model,
                             custom_response_mode: format.is_some(),
@@ -1062,7 +1173,9 @@ fn handle_settings_key(
                             thinking,
                             experts,
                         };
-                        let _ = chats::save_chat(chat);
+                        // Настройки чата хранит сервис: локально они
+                        // применяются ответом на PATCH, а не сразу.
+                        request_update_chat(state, &chat_id, None, Some(settings), tx);
                     }
                     save_connection(state, server_url, client_token, ollama_url);
                 }
@@ -1200,7 +1313,11 @@ fn save_connection(
 }
 
 /// Клавиши окна импорта: ↑/↓ — выбор чата, Space — отметить, Enter — перенести.
-fn handle_import_key(key: crossterm::event::KeyEvent, state: &mut AppState) -> LoopControl {
+fn handle_import_key(
+    key: crossterm::event::KeyEvent,
+    state: &mut AppState,
+    tx: &mpsc::UnboundedSender<ChatEvent>,
+) -> LoopControl {
     let picker = state.import.as_mut().expect("import focus implies picker");
     match key.code {
         KeyCode::Esc => {
@@ -1216,7 +1333,7 @@ fn handle_import_key(key: crossterm::event::KeyEvent, state: &mut AppState) -> L
             state.import = None;
             state.focus = Focus::Input;
             if !ids.is_empty() {
-                import_context(state, &target_id, &ids);
+                import_context(state, &target_id, &ids, tx);
             }
         }
         _ => {}
@@ -1225,12 +1342,32 @@ fn handle_import_key(key: crossterm::event::KeyEvent, state: &mut AppState) -> L
 }
 
 /// Перенести историю выбранных чатов в целевой одним сообщением-контекстом.
-fn import_context(state: &mut AppState, target_id: &str, source_ids: &[String]) {
+/// История берётся у сервиса, поэтому чат-источник без загруженной истории
+/// переносить нельзя (specs/client-chat-storage).
+fn import_context(
+    state: &mut AppState,
+    target_id: &str,
+    source_ids: &[String],
+    tx: &mpsc::UnboundedSender<ChatEvent>,
+) {
     let mut blocks: Vec<String> = Vec::new();
+    let mut waiting: Vec<String> = Vec::new();
     for id in source_ids {
-        if let Some(chat) = state.chats.iter().find(|c| &c.id == id) {
-            blocks.push(chats::context_block(chat));
+        let Some(index) = state.chat_index(id) else {
+            continue;
+        };
+        if state.chats[index].history_loaded {
+            blocks.push(chats::context_block(&state.chats[index]));
+        } else {
+            waiting.push(id.clone());
         }
+    }
+    if !waiting.is_empty() {
+        for id in &waiting {
+            ensure_history(state, id, tx);
+        }
+        state.notify("История чата-источника ещё не загружена: перенос не выполнен");
+        return;
     }
     if blocks.is_empty() {
         return;
@@ -1243,15 +1380,21 @@ fn import_context(state: &mut AppState, target_id: &str, source_ids: &[String]) 
     let Some(chat_index) = state.chats.iter().position(|c| c.id == target_id) else {
         return;
     };
+    // Перенос контекста — реплика пользователя в целевом чате: она уйдёт в
+    // сервис вместе с обменом, когда пользователь отправит сообщение, и
+    // заголовок чата от переноса не меняется.
     state.chats[chat_index].messages.push(Message::user(content));
     state.chats[chat_index].touch_quietly();
-    let _ = chats::save_chat(&state.chats[chat_index]);
     let ui = state.chat_ui.entry(target_id.to_string()).or_default();
     ui.auto_scroll = true;
     ui.scroll_to_message = None;
 }
 
-fn handle_sidebar_key(key: crossterm::event::KeyEvent, state: &mut AppState) -> LoopControl {
+fn handle_sidebar_key(
+    key: crossterm::event::KeyEvent,
+    state: &mut AppState,
+    tx: &mpsc::UnboundedSender<ChatEvent>,
+) -> LoopControl {
     match key.code {
         KeyCode::Up => {
             if state.sidebar_selected > 0 {
@@ -1274,22 +1417,32 @@ fn handle_sidebar_key(key: crossterm::event::KeyEvent, state: &mut AppState) -> 
             }
         }
         KeyCode::Enter => {
-            let id = state.chats[state.sidebar_selected].id.clone();
-            state.panes[state.active_pane] = id;
+            let Some(chat) = state.chats.get(state.sidebar_selected) else {
+                return LoopControl::Continue;
+            };
+            let id = chat.id.clone();
+            state.show_in_active_pane(id.clone());
+            ensure_history(state, &id, tx);
             state.focus = Focus::Input;
         }
         KeyCode::Char('s') => {
-            let id = state.chats[state.sidebar_selected].id.clone();
+            let Some(chat) = state.chats.get(state.sidebar_selected) else {
+                return LoopControl::Continue;
+            };
+            let id = chat.id.clone();
             if let Some(existing) = state.panes.iter().position(|p| p == &id) {
                 state.active_pane = existing;
             } else if state.panes.len() < MAX_PANES {
-                state.panes.push(id);
+                state.panes.push(id.clone());
                 state.active_pane = state.panes.len() - 1;
+                ensure_history(state, &id, tx);
             }
             state.focus = Focus::Input;
         }
         KeyCode::Char('d') => {
-            let chat = &state.chats[state.sidebar_selected];
+            let Some(chat) = state.chats.get(state.sidebar_selected) else {
+                return LoopControl::Continue;
+            };
             if !state.is_pending(&chat.id) {
                 state.delete_confirm = Some(DeleteConfirm {
                     chat_id: chat.id.clone(),
@@ -1305,11 +1458,17 @@ fn handle_sidebar_key(key: crossterm::event::KeyEvent, state: &mut AppState) -> 
 }
 
 /// Клавиши окна подтверждения удаления: y/Enter — удалить, n/Esc — отмена.
-fn handle_confirm_key(key: crossterm::event::KeyEvent, state: &mut AppState) -> LoopControl {
+fn handle_confirm_key(
+    key: crossterm::event::KeyEvent,
+    state: &mut AppState,
+    tx: &mpsc::UnboundedSender<ChatEvent>,
+) -> LoopControl {
     match key.code {
         KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Char('д') | KeyCode::Enter => {
             let confirm = state.delete_confirm.take().expect("confirm focus implies request");
-            delete_chat(state, &confirm.chat_id);
+            // Чат удаляет сервис: из списка клиента он исчезает по
+            // подтверждению, а не до него.
+            request_delete_chat(state, &confirm.chat_id, tx);
             state.focus = Focus::Sidebar;
         }
         KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Char('н') | KeyCode::Esc => {
@@ -1321,37 +1480,28 @@ fn handle_confirm_key(key: crossterm::event::KeyEvent, state: &mut AppState) -> 
     LoopControl::Continue
 }
 
-/// Удалить чат с диска и из состояния, освободив панели, где он был открыт.
-fn delete_chat(state: &mut AppState, chat_id: &str) {
+/// Убрать удалённый сервисом чат из состояния, освободив панели, где он был
+/// открыт.
+fn forget_chat(state: &mut AppState, chat_id: &str) {
     let Some(index) = state.chats.iter().position(|c| c.id == chat_id) else {
         return;
     };
-    let _ = chats::delete_chat(chat_id);
     state.chats.remove(index);
     state.chat_ui.remove(chat_id);
 
-    // в списке всегда должен остаться хотя бы один чат, куда можно писать
-    if state.chats.is_empty() {
-        let chat = ChatSession::new(state.config.default_chat_settings());
-        state.chat_ui.insert(chat.id.clone(), ChatUi::default());
-        state.chats.push(chat);
-    }
-
-    let fallback_id = state.chats[0].id.clone();
-    let mut removed_panes = false;
+    // Пустой список чатов законен: черновой чат вместо удалённого больше не
+    // подставляется, потому что чат создаёт сервис по действию пользователя.
     if state.panes.iter().any(|id| id == chat_id) {
-        if state.panes.len() > 1 {
-            state.panes.retain(|id| id != chat_id);
-            removed_panes = true;
-        } else {
-            state.panes[0] = fallback_id;
+        match state.chats.first().map(|chat| chat.id.clone()) {
+            Some(fallback_id) if state.panes.len() == 1 => state.panes[0] = fallback_id,
+            _ => state.panes.retain(|id| id != chat_id),
         }
     }
-    if removed_panes && state.active_pane >= state.panes.len() {
-        state.active_pane = state.panes.len() - 1;
+    if state.active_pane >= state.panes.len() {
+        state.active_pane = state.panes.len().saturating_sub(1);
     }
     if state.sidebar_selected >= state.chats.len() {
-        state.sidebar_selected = state.chats.len() - 1;
+        state.sidebar_selected = state.chats.len().saturating_sub(1);
     }
 }
 
@@ -1361,7 +1511,9 @@ fn handle_input_key(
     agent: &Arc<CliAgent>,
     tx: &mpsc::UnboundedSender<ChatEvent>,
 ) -> LoopControl {
-    let chat_id = state.active_chat_id();
+    let Some(chat_id) = state.active_chat_id() else {
+        return LoopControl::Continue;
+    };
     match key.code {
         KeyCode::Enter => {
             let line = {
@@ -1376,10 +1528,28 @@ fn handle_input_key(
             if line == "exit" || line == "quit" {
                 return LoopControl::Break;
             }
-            let chat_index = state.chat_index(&chat_id);
-            state.chats[chat_index].messages.push(Message::user(line));
-            state.chats[chat_index].touch();
-            let _ = chats::save_chat(&state.chats[chat_index]);
+            let Some(chat_index) = state.chat_index(&chat_id) else {
+                return LoopControl::Continue;
+            };
+            // Отправлять некуда, пока список чатов не получен от сервиса:
+            // обмену негде записаться.
+            if let Some(reason) = state.blocked_reason() {
+                state.notify(format!("Сообщение не отправлено: {reason}"));
+                return LoopControl::Continue;
+            }
+            // Неполная история испортила бы контекст запроса к модели.
+            if !state.chats[chat_index].history_loaded {
+                ensure_history(state, &chat_id, tx);
+                state.notify("История чата ещё загружается: сообщение не отправлено");
+                return LoopControl::Continue;
+            }
+            state.chats[chat_index].messages.push(Message::user(line.clone()));
+            state.chats[chat_index].touch_quietly();
+            // Заголовок нового чата выводится из первой реплики и уходит в
+            // сервис: без этого список чатов остался бы с «Новым чатом».
+            if let Some(title) = state.chats[chat_index].title_from_first_message() {
+                request_update_chat(state, &chat_id, Some(title), None, tx);
+            }
             {
                 let ui = state.chat_ui.entry(chat_id.clone()).or_default();
                 ui.pending = true;
@@ -1391,11 +1561,14 @@ fn handle_input_key(
             let agent = agent.clone();
             let hist = state.chats[chat_index].messages.clone();
             let settings = state.chats[chat_index].settings.clone();
-            let tx = tx.clone();
+            let tx_response = tx.clone();
             let event_chat_id = chat_id.clone();
+            let request_chat_id = chat_id.clone();
             tokio::spawn(async move {
-                let result = agent.ask(&hist, &settings).await;
-                let _ = tx.send(ChatEvent::Response(event_chat_id, result));
+                let result = agent
+                    .ask_in_chat(&request_chat_id, &line, &hist, &settings)
+                    .await;
+                let _ = tx_response.send(ChatEvent::Response(event_chat_id, result));
             });
         }
         KeyCode::Esc => return LoopControl::Break,
@@ -1430,6 +1603,135 @@ fn handle_input_key(
     LoopControl::Continue
 }
 
+/// Клиент чатов по текущему конфигу: адрес сервиса и клиентский токен те же,
+/// что у облачных запросов.
+fn chats_client(config: &Config) -> ChatsClient {
+    ChatsClient::new(
+        config.effective_server_url(),
+        config.client_token(),
+        crate::logging::exchange_log(),
+    )
+    .with_unauthorized_hint(crate::logging::UNAUTHORIZED_HINT)
+}
+
+/// Текст причины отказа сервиса для баннера и уведомлений: с адресом
+/// сервиса и идентификатором запроса, если сервис его вернул.
+fn failure_text(err: &anyhow::Error) -> String {
+    format!("{err:#}")
+}
+
+/// Фоновый запрос списка чатов.
+fn fetch_chats(state: &AppState, tx: &mpsc::UnboundedSender<ChatEvent>) {
+    let client = state.chats_client.clone();
+    let tx = tx.clone();
+    tokio::spawn(async move {
+        let result = client.list().await.map_err(|err| failure_text(&err));
+        let _ = tx.send(ChatEvent::ChatsLoaded(result));
+    });
+}
+
+/// Фоновый запрос истории чата. Вызывается при первом открытии чата: список
+/// отдаёт только заголовки.
+fn fetch_history(state: &mut AppState, chat_id: &str, tx: &mpsc::UnboundedSender<ChatEvent>) {
+    {
+        let ui = state.chat_ui.entry(chat_id.to_string()).or_default();
+        if ui.history_loading {
+            return;
+        }
+        ui.history_loading = true;
+        ui.history_error = None;
+    }
+    let client = state.chats_client.clone();
+    let tx = tx.clone();
+    let id = chat_id.to_string();
+    tokio::spawn(async move {
+        let result = client.load(&id).await.map_err(|err| failure_text(&err));
+        let _ = tx.send(ChatEvent::HistoryLoaded(id, result));
+    });
+}
+
+/// История нужна перед отправкой реплики и перед переносом контекста.
+fn ensure_history(state: &mut AppState, chat_id: &str, tx: &mpsc::UnboundedSender<ChatEvent>) {
+    let loaded = state
+        .chat_index(chat_id)
+        .map(|index| state.chats[index].history_loaded)
+        .unwrap_or(false);
+    if !loaded {
+        fetch_history(state, chat_id, tx);
+    }
+}
+
+/// Создание чата запросом к сервису: идентификатор назначает он.
+fn request_create_chat(state: &mut AppState, tx: &mpsc::UnboundedSender<ChatEvent>) {
+    if state.creating_chat {
+        return;
+    }
+    state.creating_chat = true;
+    let client = state.chats_client.clone();
+    let settings = state.config.default_chat_settings();
+    let tx = tx.clone();
+    tokio::spawn(async move {
+        let result = client
+            .create(None, &settings)
+            .await
+            .map_err(|err| failure_text(&err));
+        let _ = tx.send(ChatEvent::ChatCreated(result));
+    });
+}
+
+/// Переименование или изменение параметров чата. Локально изменение не
+/// применяется до подтверждения: список должен оставаться в том состоянии,
+/// которое подтвердил сервис (specs/client-chat-storage).
+fn request_update_chat(
+    state: &AppState,
+    chat_id: &str,
+    title: Option<String>,
+    settings: Option<ChatSettings>,
+    tx: &mpsc::UnboundedSender<ChatEvent>,
+) {
+    let client = state.chats_client.clone();
+    let tx = tx.clone();
+    let id = chat_id.to_string();
+    tokio::spawn(async move {
+        let result = client
+            .update(&id, title.as_deref(), settings.as_ref())
+            .await
+            .map_err(|err| failure_text(&err));
+        let _ = tx.send(ChatEvent::ChatUpdated(id, result));
+    });
+}
+
+fn request_delete_chat(state: &AppState, chat_id: &str, tx: &mpsc::UnboundedSender<ChatEvent>) {
+    let client = state.chats_client.clone();
+    let tx = tx.clone();
+    let id = chat_id.to_string();
+    tokio::spawn(async move {
+        let result = client.delete(&id).await.map_err(|err| failure_text(&err));
+        let _ = tx.send(ChatEvent::ChatDeleted(id, result));
+    });
+}
+
+/// Дозапись обмена локального чата: вопрос и ответ уходят одним запросом,
+/// иначе в чате мог бы остаться вопрос без ответа.
+fn request_append_exchange(
+    state: &AppState,
+    chat_id: &str,
+    messages: Vec<Message>,
+    tx: &mpsc::UnboundedSender<ChatEvent>,
+) {
+    let client = state.chats_client.clone();
+    let tx = tx.clone();
+    let id = chat_id.to_string();
+    tokio::spawn(async move {
+        let result = client
+            .append(&id, &messages)
+            .await
+            .map(|_| ())
+            .map_err(|err| failure_text(&err));
+        let _ = tx.send(ChatEvent::ExchangeSaved(id, result));
+    });
+}
+
 /// Фоновый запрос списка локальных моделей Ollama.
 fn fetch_ollama_models(config: &Config, tx: &mpsc::UnboundedSender<ChatEvent>) {
     let url = config.effective_ollama_url();
@@ -1458,7 +1760,11 @@ fn fetch_cloud_models(config: &Config, tx: &mpsc::UnboundedSender<ChatEvent>) {
     });
 }
 
-fn handle_chat_event(chat_event: ChatEvent, state: &mut AppState) {
+fn handle_chat_event(
+    chat_event: ChatEvent,
+    state: &mut AppState,
+    tx: &mpsc::UnboundedSender<ChatEvent>,
+) {
     let chat_event = match chat_event {
         ChatEvent::OllamaModels(result) => {
             handle_ollama_models(result, state);
@@ -1468,11 +1774,36 @@ fn handle_chat_event(chat_event: ChatEvent, state: &mut AppState) {
             handle_cloud_models(result, state);
             return;
         }
+        ChatEvent::ChatsLoaded(result) => {
+            handle_chats_loaded(result, state, tx);
+            return;
+        }
+        ChatEvent::HistoryLoaded(chat_id, result) => {
+            handle_history_loaded(chat_id, result, state);
+            return;
+        }
+        ChatEvent::ChatCreated(result) => {
+            handle_chat_created(result, state);
+            return;
+        }
+        ChatEvent::ChatUpdated(chat_id, result) => {
+            handle_chat_updated(chat_id, result, state);
+            return;
+        }
+        ChatEvent::ChatDeleted(chat_id, result) => {
+            handle_chat_deleted(chat_id, result, state);
+            return;
+        }
+        ChatEvent::ExchangeSaved(chat_id, result) => {
+            handle_exchange_saved(chat_id, result, state);
+            return;
+        }
         other => other,
     };
     let ChatEvent::Response(chat_id, result) = chat_event else {
         return;
     };
+    let failed = result.is_err();
     let mut message = match result {
         Ok(reply) => {
             let mut message = Message::assistant(reply.content);
@@ -1492,15 +1823,169 @@ fn handle_chat_event(chat_event: ChatEvent, state: &mut AppState) {
             ..MessageMeta::default()
         });
     }
-    state.chats[chat_index].messages.push(message);
-    state.chats[chat_index].touch();
-    let _ = chats::save_chat(&state.chats[chat_index]);
+    state.chats[chat_index].messages.push(message.clone());
+    state.chats[chat_index].touch_quietly();
+    // Обмен облачного чата записал сам сервис (запрос шёл с `chat_id`), а
+    // обмен локального записывает клиент: ответ дала модель на машине
+    // пользователя. Неудачный запрос не записывается: текст ошибки — не
+    // реплика модели.
+    if !failed && state.chats[chat_index].settings.provider == Provider::Ollama {
+        let history = &state.chats[chat_index].messages;
+        let exchange: Vec<Message> = history
+            .iter()
+            .rev()
+            .take(2)
+            .rev()
+            .cloned()
+            .collect();
+        state.chat_ui.entry(chat_id.clone()).or_default().unsaved = Some(UnsavedExchange {
+            reason: "запись обмена в сервис ещё не подтверждена".to_string(),
+            messages: exchange.clone(),
+        });
+        request_append_exchange(state, &chat_id, exchange, tx);
+    }
     let last_index = state.chats[chat_index].messages.len() - 1;
     let ui = state.chat_ui.entry(chat_id).or_default();
     ui.pending = false;
     ui.pending_since = None;
     ui.auto_scroll = false;
     ui.scroll_to_message = Some(last_index);
+}
+
+/// Список чатов от сервиса заменяет прежний. Панели, ссылающиеся на
+/// исчезнувшие чаты, закрываются, а первый чат открывается, если панелей
+/// не осталось.
+fn handle_chats_loaded(
+    result: Result<Vec<ChatSummary>, String>,
+    state: &mut AppState,
+    tx: &mpsc::UnboundedSender<ChatEvent>,
+) {
+    match result {
+        Ok(summaries) => {
+            // Состояние ввода и прокрутки переживает перезагрузку списка:
+            // оно привязано к чату, а не к его месту в списке.
+            let mut chats: Vec<ChatSession> = Vec::with_capacity(summaries.len());
+            for summary in summaries {
+                let id = summary.id.clone();
+                let mut chat = ChatSession::from_summary(summary);
+                // Уже загруженную историю не выбрасываем: список её не
+                // содержит, а повторный запрос ни к чему.
+                if let Some(existing) = state.chats.iter().find(|c| c.id == id) {
+                    if existing.history_loaded {
+                        chat.messages = existing.messages.clone();
+                        chat.history_loaded = true;
+                    }
+                }
+                chats.push(chat);
+            }
+            let known: Vec<String> = chats.iter().map(|chat| chat.id.clone()).collect();
+            state.chats = chats;
+            state.chats_load = ChatsLoad::Loaded;
+            state.chat_ui.retain(|id, _| known.contains(id));
+            for id in &known {
+                state.chat_ui.entry(id.clone()).or_default();
+            }
+            state.panes.retain(|id| known.contains(id));
+            if state.panes.is_empty() {
+                if let Some(first) = known.first() {
+                    state.panes.push(first.clone());
+                }
+            }
+            if state.active_pane >= state.panes.len() {
+                state.active_pane = state.panes.len().saturating_sub(1);
+            }
+            if state.sidebar_selected >= state.chats.len() {
+                state.sidebar_selected = state.chats.len().saturating_sub(1);
+            }
+            let open: Vec<String> = state.panes.clone();
+            for id in open {
+                ensure_history(state, &id, tx);
+            }
+        }
+        Err(reason) => {
+            let address = state.config.effective_server_url();
+            state.chats_load = ChatsLoad::Failed(format!("{reason} (сервис: {address})"));
+            state.chats.clear();
+            state.panes.clear();
+            state.active_pane = 0;
+            state.sidebar_selected = 0;
+        }
+    }
+}
+
+fn handle_history_loaded(chat_id: String, result: Result<ChatHistory, String>, state: &mut AppState) {
+    match result {
+        Ok(history) => {
+            if let Some(index) = state.chat_index(&chat_id) {
+                state.chats[index].apply_history(history);
+            }
+            let ui = state.chat_ui.entry(chat_id).or_default();
+            ui.history_loading = false;
+            ui.history_error = None;
+            ui.auto_scroll = true;
+        }
+        Err(reason) => {
+            let ui = state.chat_ui.entry(chat_id).or_default();
+            ui.history_loading = false;
+            ui.history_error = Some(reason.clone());
+            state.notify(format!("История чата не загружена: {reason}"));
+        }
+    }
+}
+
+fn handle_chat_created(result: Result<ChatSummary, String>, state: &mut AppState) {
+    state.creating_chat = false;
+    match result {
+        Ok(summary) => {
+            let id = summary.id.clone();
+            state.chats.insert(0, ChatSession::from_summary(summary));
+            state.chat_ui.insert(id.clone(), ChatUi::default());
+            state.show_in_active_pane(id);
+            state.sidebar_selected = 0;
+            state.focus = Focus::Input;
+        }
+        Err(reason) => state.notify(format!("Чат не создан: {reason}")),
+    }
+}
+
+fn handle_chat_updated(chat_id: String, result: Result<ChatSummary, String>, state: &mut AppState) {
+    match result {
+        Ok(summary) => {
+            if let Some(index) = state.chat_index(&chat_id) {
+                let chat = &mut state.chats[index];
+                chat.title = summary.title;
+                chat.settings = summary.settings;
+                chat.updated_at = summary.updated_at.max(0) as u64;
+            }
+        }
+        Err(reason) => state.notify(format!("Изменение чата не сохранено: {reason}")),
+    }
+}
+
+fn handle_chat_deleted(chat_id: String, result: Result<(), String>, state: &mut AppState) {
+    match result {
+        Ok(()) => forget_chat(state, &chat_id),
+        Err(reason) => state.notify(format!("Чат не удалён: {reason}")),
+    }
+}
+
+fn handle_exchange_saved(chat_id: String, result: Result<(), String>, state: &mut AppState) {
+    match result {
+        Ok(()) => {
+            let ui = state.chat_ui.entry(chat_id).or_default();
+            ui.unsaved = None;
+        }
+        Err(reason) => {
+            state.notify(format!(
+                "Обмен не сохранён в сервисе: {reason}. Ctrl+U — повторить"
+            ));
+            if let Some(ui) = state.chat_ui.get_mut(&chat_id) {
+                if let Some(unsaved) = ui.unsaved.as_mut() {
+                    unsaved.reason = reason;
+                }
+            }
+        }
+    }
 }
 
 /// Обновить список локальных моделей в состоянии и в открытом редакторе
@@ -1576,16 +2061,20 @@ fn render_ui(f: &mut Frame, state: &mut AppState) {
         .constraints([Constraint::Min(3), Constraint::Length(2)])
         .split(outer[1]);
 
-    let pane_count = state.panes.len().max(1) as u32;
-    let pane_constraints: Vec<Constraint> =
-        (0..pane_count).map(|_| Constraint::Ratio(1, pane_count)).collect();
-    let pane_areas = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints(pane_constraints)
-        .split(main[0]);
+    if state.panes.is_empty() {
+        render_no_chat(f, state, main[0]);
+    } else {
+        let pane_count = state.panes.len() as u32;
+        let pane_constraints: Vec<Constraint> =
+            (0..pane_count).map(|_| Constraint::Ratio(1, pane_count)).collect();
+        let pane_areas = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints(pane_constraints)
+            .split(main[0]);
 
-    for (i, area) in pane_areas.iter().enumerate() {
-        render_pane(f, state, i, *area);
+        for (i, area) in pane_areas.iter().enumerate() {
+            render_pane(f, state, i, *area);
+        }
     }
 
     render_help(f, state, main[1]);
@@ -1619,7 +2108,7 @@ fn render_delete_popup(f: &mut Frame, confirm: &DeleteConfirm) {
             Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
         )),
         Line::from(Span::styled(
-            " История будет стёрта с диска без возможности восстановления.",
+            " Чат и его история будут удалены в сервисе без возможности восстановления.",
             Style::default().fg(Color::DarkGray),
         )),
         Line::raw(""),
@@ -1632,8 +2121,14 @@ fn render_delete_popup(f: &mut Frame, confirm: &DeleteConfirm) {
 }
 
 fn render_pane(f: &mut Frame, state: &mut AppState, pane_idx: usize, area: Rect) {
-    let chat_id = state.panes[pane_idx].clone();
-    let chat_index = state.chat_index(&chat_id);
+    let Some(chat_id) = state.panes.get(pane_idx).cloned() else {
+        return;
+    };
+    // Чат мог исчезнуть из списка (удалён или список перезагружен): панель
+    // тогда просто ничего не рисует, вместо паники по индексу.
+    let Some(chat_index) = state.chat_index(&chat_id) else {
+        return;
+    };
     let is_active_pane = pane_idx == state.active_pane;
 
     let chunks = Layout::default()
@@ -1644,6 +2139,51 @@ fn render_pane(f: &mut Frame, state: &mut AppState, pane_idx: usize, area: Rect)
     render_pane_title(f, state, chat_index, is_active_pane, chunks[0]);
     render_history(f, state, &chat_id, chat_index, chunks[1]);
     render_input(f, state, &chat_id, is_active_pane, chunks[2]);
+}
+
+/// Экран без открытых чатов: список ещё грузится, не загрузился или пуст.
+/// Причина отказа видна здесь же, вместе с адресом сервиса.
+fn render_no_chat(f: &mut Frame, state: &AppState, area: Rect) {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::DarkGray));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    let mut lines: Vec<Line> = Vec::new();
+    match &state.chats_load {
+        ChatsLoad::Loading => lines.push(Line::from(Span::styled(
+            " Загружаю список чатов с сервиса…",
+            Style::default().fg(Color::DarkGray),
+        ))),
+        ChatsLoad::Failed(reason) => {
+            lines.push(Line::from(Span::styled(
+                " Список чатов не загружен",
+                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+            )));
+            lines.push(Line::from(Span::styled(
+                format!(" {reason}"),
+                Style::default().fg(Color::White),
+            )));
+            lines.push(Line::raw(""));
+            lines.push(Line::from(Span::styled(
+                " Ctrl+E — повторить загрузку",
+                Style::default().fg(Color::DarkGray),
+            )));
+        }
+        ChatsLoad::Loaded => {
+            lines.push(Line::from(Span::styled(
+                " Чатов пока нет",
+                Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+            )));
+            lines.push(Line::raw(""));
+            lines.push(Line::from(Span::styled(
+                " Ctrl+N — создать чат",
+                Style::default().fg(Color::DarkGray),
+            )));
+        }
+    }
+    f.render_widget(Paragraph::new(Text::from(lines)).wrap(Wrap { trim: false }), inner);
 }
 
 fn render_sidebar(f: &mut Frame, state: &AppState, area: Rect) {
@@ -1828,9 +2368,51 @@ fn render_history(
     let show_reasoning = state.show_reasoning;
     let scroll_to_message = state.chat_ui.get(chat_id).and_then(|u| u.scroll_to_message);
 
+    let history_loading = state
+        .chat_ui
+        .get(chat_id)
+        .map(|ui| ui.history_loading)
+        .unwrap_or(false);
+    let history_error = state
+        .chat_ui
+        .get(chat_id)
+        .and_then(|ui| ui.history_error.clone());
+    let unsaved = state
+        .chat_ui
+        .get(chat_id)
+        .and_then(|ui| ui.unsaved.as_ref().map(|unsaved| unsaved.reason.clone()));
+
     let mut lines: Vec<Line> = Vec::new();
     let mut target_line: Option<usize> = None;
-    if state.chats[chat_index].messages.is_empty() && state.panes.len() == 1 {
+    if history_loading {
+        lines.push(Line::from(Span::styled(
+            " Загружаю историю чата с сервиса…",
+            Style::default().fg(Color::DarkGray),
+        )));
+        lines.push(Line::raw(""));
+    }
+    if let Some(reason) = &history_error {
+        lines.push(Line::from(Span::styled(
+            format!(" История чата не загружена: {reason}"),
+            Style::default().fg(Color::Red),
+        )));
+        lines.push(Line::raw(""));
+    }
+    if !state.chats[chat_index].history_loaded
+        && !history_loading
+        && history_error.is_none()
+        && state.chats[chat_index].messages.is_empty()
+    {
+        lines.push(Line::from(Span::styled(
+            " История чата ещё не запрошена у сервиса",
+            Style::default().fg(Color::DarkGray),
+        )));
+        lines.push(Line::raw(""));
+    }
+    if state.chats[chat_index].messages.is_empty()
+        && state.chats[chat_index].history_loaded
+        && state.panes.len() == 1
+    {
         if let Ok(text) = BILLY_ART.into_text() {
             lines.extend(text.lines);
         }
@@ -1891,6 +2473,13 @@ fn render_history(
             Ok(text) => lines.extend(text.lines),
             Err(_) => lines.push(Line::raw(entry.content.clone())),
         }
+        lines.push(Line::raw(""));
+    }
+    if let Some(reason) = &unsaved {
+        lines.push(Line::from(Span::styled(
+            format!(" ⚠ Обмен не сохранён в сервисе: {reason}. Ctrl+U — повторить"),
+            Style::default().fg(Color::Yellow),
+        )));
         lines.push(Line::raw(""));
     }
     if pending {
@@ -1983,7 +2572,7 @@ fn render_help(f: &mut Frame, state: &AppState, area: Rect) {
     let (text, color) = match state.active_notice() {
         Some(notice) => (notice, Color::Green),
         None => (
-            "Tab — панель · ←/→ — окно · Ctrl+W — закрыть · Ctrl+P — настройки · Ctrl+O — импорт контекста · Ctrl+N — новый чат · Ctrl+Y — копировать ввод · Ctrl+R — рассуждение · Esc/Ctrl+C — выход",
+            "Tab — панель · ←/→ — окно · Ctrl+W — закрыть · Ctrl+P — настройки · Ctrl+O — импорт контекста · Ctrl+N — новый чат · Ctrl+E — обновить список · Ctrl+U — повторить запись · Ctrl+Y — копировать ввод · Ctrl+R — рассуждение · Esc/Ctrl+C — выход",
             Color::DarkGray,
         ),
     };
@@ -2264,4 +2853,372 @@ fn render_import_popup(f: &mut Frame, picker: &ImportPicker) {
         ))),
         rows[1],
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use agentcore::config::ChatSettings;
+
+    fn summary(id: &str, title: &str, message_count: i64) -> ChatSummary {
+        ChatSummary {
+            id: id.to_string(),
+            title: title.to_string(),
+            settings: ChatSettings::default(),
+            created_at: 1000,
+            updated_at: 2000,
+            message_count,
+        }
+    }
+
+    fn test_state() -> AppState {
+        let config = Config::default();
+        AppState {
+            chats_client: Arc::new(chats_client(&config)),
+            creating_chat: false,
+            config,
+            agent_dirty: false,
+            chats: Vec::new(),
+            chats_load: ChatsLoad::Loading,
+            chat_ui: HashMap::new(),
+            panes: Vec::new(),
+            active_pane: 0,
+            sidebar_selected: 0,
+            spinner_frame: 0,
+            focus: Focus::Input,
+            settings: None,
+            import: None,
+            delete_confirm: None,
+            notice: None,
+            show_reasoning: true,
+            ollama_models: Vec::new(),
+            model_choices: Vec::new(),
+        }
+    }
+
+    fn channel() -> mpsc::UnboundedSender<ChatEvent> {
+        mpsc::unbounded_channel().0
+    }
+
+    // --- 4.1 Список чатов приходит от сервиса ---
+
+    #[test]
+    fn loaded_list_opens_first_chat_in_service_order() {
+        let mut state = test_state();
+        handle_chats_loaded(
+            Ok(vec![summary("chat-1", "Первый", 0), summary("chat-2", "Второй", 4)]),
+            &mut state,
+            &channel(),
+        );
+
+        assert!(matches!(state.chats_load, ChatsLoad::Loaded));
+        assert_eq!(
+            state.chats.iter().map(|c| c.id.as_str()).collect::<Vec<_>>(),
+            vec!["chat-1", "chat-2"]
+        );
+        assert_eq!(state.panes, vec!["chat-1".to_string()]);
+        assert!(state.blocked_reason().is_none());
+        // Пустой чат считается загруженным, чат с сообщениями — нет.
+        assert!(state.chats[0].history_loaded);
+        assert!(!state.chats[1].history_loaded);
+    }
+
+    #[test]
+    fn empty_list_is_loaded_state_without_panes() {
+        let mut state = test_state();
+        handle_chats_loaded(Ok(Vec::new()), &mut state, &channel());
+
+        assert!(matches!(state.chats_load, ChatsLoad::Loaded));
+        assert!(state.chats.is_empty());
+        assert!(state.panes.is_empty());
+        assert!(state.active_chat_id().is_none());
+        assert!(state.blocked_reason().is_none());
+    }
+
+    // --- 4.2 Отказ загрузки виден и объясним ---
+
+    #[test]
+    fn failed_list_keeps_reason_with_server_address() {
+        let mut state = test_state();
+        handle_chats_loaded(
+            Ok(vec![summary("chat-1", "Первый", 0)]),
+            &mut state,
+            &channel(),
+        );
+        handle_chats_loaded(Err("сервис не ответил".to_string()), &mut state, &channel());
+
+        let reason = state.blocked_reason().expect("причина недоступности");
+        assert!(reason.contains("сервис не ответил"), "причина потеряна: {reason}");
+        assert!(
+            reason.contains(&state.config.effective_server_url()),
+            "адрес сервиса не назван: {reason}"
+        );
+        assert!(state.chats.is_empty());
+        assert!(state.panes.is_empty());
+    }
+
+    // --- 4.3 Без списка чатов писать некуда ---
+
+    #[test]
+    fn loading_and_failed_states_block_actions() {
+        let mut state = test_state();
+        assert!(state.blocked_reason().is_some(), "во время загрузки писать нельзя");
+
+        state.chats_load = ChatsLoad::Failed("сервис недоступен".to_string());
+        assert_eq!(
+            state.blocked_reason().as_deref(),
+            Some("сервис недоступен"),
+            "причина отказа должна объяснять запрет"
+        );
+    }
+
+    // --- 4.4 История чата приходит отдельным запросом ---
+
+    // Загрузка истории уходит фоновой задачей, поэтому тесту нужен runtime.
+    #[tokio::test]
+    async fn loaded_history_fills_chat_and_unblocks_input() {
+        let mut state = test_state();
+        handle_chats_loaded(Ok(vec![summary("chat-1", "Чат", 2)]), &mut state, &channel());
+        state.chat_ui.entry("chat-1".to_string()).or_default().history_loading = true;
+
+        handle_history_loaded(
+            "chat-1".to_string(),
+            Ok(ChatHistory {
+                chat: summary("chat-1", "Заголовок сервиса", 2),
+                messages: vec![
+                    agentclient::StoredMessage {
+                        seq: 1,
+                        created_at: 1001,
+                        message: Message::user("вопрос"),
+                    },
+                    agentclient::StoredMessage {
+                        seq: 2,
+                        created_at: 1002,
+                        message: Message::assistant("ответ"),
+                    },
+                ],
+            }),
+            &mut state,
+        );
+
+        assert!(state.chats[0].history_loaded);
+        assert_eq!(state.chats[0].title, "Заголовок сервиса");
+        assert_eq!(state.chats[0].messages.len(), 2);
+        assert!(!state.chat_ui["chat-1"].history_loading);
+    }
+
+    // Загрузка истории уходит фоновой задачей, поэтому тесту нужен runtime.
+    #[tokio::test]
+    async fn failed_history_is_reported_and_leaves_chat_unloaded() {
+        let mut state = test_state();
+        handle_chats_loaded(Ok(vec![summary("chat-1", "Чат", 2)]), &mut state, &channel());
+
+        handle_history_loaded("chat-1".to_string(), Err("нет связи".to_string()), &mut state);
+
+        assert!(!state.chats[0].history_loaded);
+        assert_eq!(state.chat_ui["chat-1"].history_error.as_deref(), Some("нет связи"));
+    }
+
+    // --- 4.5 Чат создаёт сервис ---
+
+    #[test]
+    fn created_chat_opens_with_service_identifier() {
+        let mut state = test_state();
+        handle_chats_loaded(Ok(Vec::new()), &mut state, &channel());
+        state.creating_chat = true;
+
+        handle_chat_created(Ok(summary("chat-new", "Новый чат", 0)), &mut state);
+
+        assert!(!state.creating_chat);
+        assert_eq!(state.chats[0].id, "chat-new");
+        assert_eq!(state.active_chat_id().as_deref(), Some("chat-new"));
+    }
+
+    // --- 4.8 Отклонённое изменение не применяется ---
+
+    #[test]
+    fn rejected_create_leaves_list_untouched() {
+        let mut state = test_state();
+        handle_chats_loaded(Ok(vec![summary("chat-1", "Первый", 0)]), &mut state, &channel());
+        state.creating_chat = true;
+
+        handle_chat_created(Err("400 invalid_request (request_id: req-1)".to_string()), &mut state);
+
+        assert_eq!(state.chats.len(), 1, "список не должен меняться");
+        assert!(state.active_notice().expect("уведомление").contains("req-1"));
+    }
+
+    #[test]
+    fn rejected_update_keeps_confirmed_settings() {
+        let mut state = test_state();
+        handle_chats_loaded(Ok(vec![summary("chat-1", "Первый", 0)]), &mut state, &channel());
+
+        handle_chat_updated(
+            "chat-1".to_string(),
+            Err("сервис недоступен (request_id: req-2)".to_string()),
+            &mut state,
+        );
+
+        assert_eq!(state.chats[0].title, "Первый");
+        assert!(state.active_notice().expect("уведомление").contains("req-2"));
+    }
+
+    #[test]
+    fn confirmed_update_applies_service_values() {
+        let mut state = test_state();
+        handle_chats_loaded(Ok(vec![summary("chat-1", "Первый", 0)]), &mut state, &channel());
+
+        handle_chat_updated(
+            "chat-1".to_string(),
+            Ok(summary("chat-1", "Переименован", 0)),
+            &mut state,
+        );
+
+        assert_eq!(state.chats[0].title, "Переименован");
+    }
+
+    // --- 4.7 Удаление подтверждает сервис ---
+
+    #[test]
+    fn confirmed_delete_frees_pane_and_allows_empty_list() {
+        let mut state = test_state();
+        handle_chats_loaded(Ok(vec![summary("chat-1", "Первый", 0)]), &mut state, &channel());
+
+        handle_chat_deleted("chat-1".to_string(), Ok(()), &mut state);
+
+        assert!(state.chats.is_empty());
+        assert!(state.panes.is_empty(), "панель освобождена вместе с чатом");
+        assert!(state.active_chat_id().is_none());
+    }
+
+    #[test]
+    fn rejected_delete_keeps_chat_in_list() {
+        let mut state = test_state();
+        handle_chats_loaded(Ok(vec![summary("chat-1", "Первый", 0)]), &mut state, &channel());
+
+        handle_chat_deleted("chat-1".to_string(), Err("нет связи".to_string()), &mut state);
+
+        assert_eq!(state.chats.len(), 1);
+        assert_eq!(state.panes, vec!["chat-1".to_string()]);
+    }
+
+    // --- 5.3 Несохранённый обмен помечен и повторяем ---
+
+    #[test]
+    fn failed_append_keeps_exchange_for_retry() {
+        let mut state = test_state();
+        handle_chats_loaded(Ok(vec![summary("chat-1", "Первый", 0)]), &mut state, &channel());
+        state.chat_ui.entry("chat-1".to_string()).or_default().unsaved = Some(UnsavedExchange {
+            reason: "ожидание".to_string(),
+            messages: vec![Message::user("вопрос"), Message::assistant("ответ")],
+        });
+
+        handle_exchange_saved(
+            "chat-1".to_string(),
+            Err("сервис недоступен (request_id: req-3)".to_string()),
+            &mut state,
+        );
+
+        let unsaved = state.chat_ui["chat-1"].unsaved.as_ref().expect("обмен сохранён для повтора");
+        assert_eq!(unsaved.messages.len(), 2, "реплики не должны теряться");
+        assert!(unsaved.reason.contains("req-3"), "причина без request_id: {}", unsaved.reason);
+        assert!(state.active_notice().expect("уведомление").contains("Ctrl+U"));
+    }
+
+    #[test]
+    fn successful_append_clears_unsaved_mark() {
+        let mut state = test_state();
+        handle_chats_loaded(Ok(vec![summary("chat-1", "Первый", 0)]), &mut state, &channel());
+        state.chat_ui.entry("chat-1".to_string()).or_default().unsaved = Some(UnsavedExchange {
+            reason: "ожидание".to_string(),
+            messages: vec![Message::user("вопрос")],
+        });
+
+        handle_exchange_saved("chat-1".to_string(), Ok(()), &mut state);
+
+        assert!(state.chat_ui["chat-1"].unsaved.is_none());
+    }
+
+    // --- 4.9 Перенос контекста опирается на историю сервиса ---
+
+    #[tokio::test]
+    async fn import_uses_loaded_history_and_keeps_source_timestamp() {
+        let mut state = test_state();
+        handle_chats_loaded(
+            Ok(vec![summary("target", "Цель", 0), summary("source", "Источник", 1)]),
+            &mut state,
+            &channel(),
+        );
+        handle_history_loaded(
+            "source".to_string(),
+            Ok(ChatHistory {
+                chat: summary("source", "Источник", 1),
+                messages: vec![agentclient::StoredMessage {
+                    seq: 1,
+                    created_at: 1001,
+                    message: Message::user("важный контекст"),
+                }],
+            }),
+            &mut state,
+        );
+        let source_index = state.chat_index("source").expect("чат-источник");
+        let source_updated_at = state.chats[source_index].updated_at;
+
+        import_context(&mut state, "target", &["source".to_string()], &channel());
+
+        let target = &state.chats[state.chat_index("target").expect("целевой чат")];
+        assert_eq!(target.messages.len(), 1, "контекст переносится одной репликой");
+        assert!(target.messages[0].content.contains("важный контекст"));
+        assert_eq!(
+            state.chats[state.chat_index("source").expect("чат-источник")].updated_at,
+            source_updated_at,
+            "перенос не меняет время изменения чата-источника"
+        );
+        assert_eq!(target.title, "Цель", "перенос не меняет заголовок");
+    }
+
+    #[tokio::test]
+    async fn import_is_refused_while_source_history_is_missing() {
+        let mut state = test_state();
+        handle_chats_loaded(
+            Ok(vec![summary("target", "Цель", 0), summary("source", "Источник", 3)]),
+            &mut state,
+            &channel(),
+        );
+
+        import_context(&mut state, "target", &["source".to_string()], &channel());
+
+        let target = &state.chats[state.chat_index("target").expect("целевой чат")];
+        assert!(target.messages.is_empty(), "без истории источника перенос не выполняется");
+        assert!(state
+            .active_notice()
+            .expect("уведомление")
+            .contains("не загружена"));
+    }
+
+    // --- Список перезагружается, не теряя загруженную историю ---
+
+    // Загрузка истории уходит фоновой задачей, поэтому тесту нужен runtime.
+    #[tokio::test]
+    async fn reload_keeps_already_loaded_history() {
+        let mut state = test_state();
+        handle_chats_loaded(Ok(vec![summary("chat-1", "Первый", 1)]), &mut state, &channel());
+        handle_history_loaded(
+            "chat-1".to_string(),
+            Ok(ChatHistory {
+                chat: summary("chat-1", "Первый", 1),
+                messages: vec![agentclient::StoredMessage {
+                    seq: 1,
+                    created_at: 1001,
+                    message: Message::user("вопрос"),
+                }],
+            }),
+            &mut state,
+        );
+
+        handle_chats_loaded(Ok(vec![summary("chat-1", "Первый", 1)]), &mut state, &channel());
+
+        assert!(state.chats[0].history_loaded, "повторный запрос истории не нужен");
+        assert_eq!(state.chats[0].messages.len(), 1);
+    }
 }

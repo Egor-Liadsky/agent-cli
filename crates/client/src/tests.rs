@@ -332,3 +332,43 @@ async fn models_fail_when_service_is_down() {
         other => panic!("ожидался Transport, получено: {other:?}"),
     }
 }
+
+// --- Диалог в чате сервиса (5.1) ---
+
+#[tokio::test]
+async fn ask_in_chat_sends_chat_id_and_prompt_only() {
+    let server = MockServer::start().await;
+    mount_chat(&server, 200, success_body()).await;
+
+    let reply = agent(&server, "token")
+        .ask_in_chat("chat-1", "привет", &cloud_settings())
+        .await
+        .expect("ответ сервиса");
+    assert_eq!(reply.content, "ответ");
+
+    let requests = server.received_requests().await.expect("записанные запросы");
+    let body: serde_json::Value = serde_json::from_slice(&requests[0].body).expect("тело");
+    assert_eq!(body["chat_id"], "chat-1");
+    assert_eq!(body["prompt"], "привет");
+    assert!(
+        body.get("messages").is_none(),
+        "вместе с chat_id история не отправляется: {body}"
+    );
+    assert_eq!(body["settings"]["provider"], "cloud");
+}
+
+#[tokio::test]
+async fn ask_without_chat_id_still_sends_history() {
+    let server = MockServer::start().await;
+    mount_chat(&server, 200, success_body()).await;
+
+    agent(&server, "token")
+        .ask(&history(), &cloud_settings())
+        .await
+        .expect("ответ сервиса");
+
+    let requests = server.received_requests().await.expect("записанные запросы");
+    let body: serde_json::Value = serde_json::from_slice(&requests[0].body).expect("тело");
+    assert!(body.get("chat_id").is_none(), "разовый запрос без чата: {body}");
+    assert_eq!(body["messages"][0]["content"], "привет");
+}
