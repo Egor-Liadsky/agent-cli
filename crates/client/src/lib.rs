@@ -145,6 +145,8 @@ struct ChatSettingsPayload {
     frequency_penalty: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     presence_penalty: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_context_tokens: Option<u32>,
 }
 
 #[derive(Serialize)]
@@ -322,6 +324,7 @@ impl ServerAgent {
                 top_k: sampling.top_k,
                 frequency_penalty: sampling.frequency_penalty,
                 presence_penalty: sampling.presence_penalty,
+                max_context_tokens: settings.max_context_tokens,
             },
         }
     }

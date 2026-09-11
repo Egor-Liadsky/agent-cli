@@ -87,6 +87,7 @@ enum FormatField {
     ServerUrl,
     ClientToken,
     OllamaUrl,
+    ContextLimit,
     Mode,
     Reasoning,
     Thinking,
@@ -136,6 +137,7 @@ impl SettingsSection {
                 FormatField::ServerUrl,
                 FormatField::ClientToken,
                 FormatField::OllamaUrl,
+                FormatField::ContextLimit,
             ],
             SettingsSection::Format => &[
                 FormatField::Mode,
@@ -236,6 +238,7 @@ impl FormatField {
             FormatField::ServerUrl => "Адрес сервиса agentd (общий для всех чатов)",
             FormatField::ClientToken => "Токен сервиса (общий для всех чатов)",
             FormatField::OllamaUrl => "Адрес Ollama (общий для всех чатов)",
+            FormatField::ContextLimit => "Лимит контекста (токены, только для этого чата)",
             FormatField::Mode => "Режим",
             FormatField::Reasoning => "Стратегия рассуждения",
             FormatField::Thinking => "Режим thinking у модели",
@@ -277,6 +280,7 @@ impl FormatField {
                 | FormatField::ServerUrl
                 | FormatField::ClientToken
                 | FormatField::OllamaUrl
+                | FormatField::ContextLimit
         )
     }
 
@@ -308,6 +312,9 @@ struct SettingsEditor {
     client_token: String,
     /// Адрес локального Ollama — тоже общий для всех чатов.
     ollama_url: String,
+    /// Клиентский лимит контекста в токенах — настройка этого чата. Пусто —
+    /// лимит не задан.
+    context_limit: String,
     /// Облачные модели для переключения стрелками в поле «Модель».
     model_choices: Vec<String>,
     /// Локально скачанные модели Ollama, полученные с `/api/tags`.
@@ -360,6 +367,10 @@ impl SettingsEditor {
             server_url: config.server_url.clone().unwrap_or_default(),
             client_token: config.client_token.clone().unwrap_or_default(),
             ollama_url: config.ollama_url.clone().unwrap_or_default(),
+            context_limit: settings
+                .max_context_tokens
+                .map(|v| v.to_string())
+                .unwrap_or_default(),
             // приходит из AppState.model_choices: список сервиса, если фоновый
             // запрос уже ответил, иначе — встроенный/конфигурный список
             model_choices: model_choices.to_vec(),
@@ -408,7 +419,7 @@ impl SettingsEditor {
                 // состав экспертов имеет смысл только для своей стратегии
                 FormatField::Experts => self.reasoning == ReasoningMode::ExpertPanel,
                 // адрес и ключ облака не нужны локальным моделям, и наоборот
-                FormatField::ServerUrl | FormatField::ClientToken => {
+                FormatField::ServerUrl | FormatField::ClientToken | FormatField::ContextLimit => {
                     self.provider == Provider::Cloud
                 }
                 FormatField::OllamaUrl => self.provider == Provider::Ollama,
@@ -550,6 +561,7 @@ impl SettingsEditor {
             FormatField::ServerUrl => Some(&mut self.server_url),
             FormatField::ClientToken => Some(&mut self.client_token),
             FormatField::OllamaUrl => Some(&mut self.ollama_url),
+            FormatField::ContextLimit => Some(&mut self.context_limit),
             FormatField::Experts => Some(&mut self.experts),
             FormatField::Description => Some(&mut self.description),
             FormatField::MaxLength => Some(&mut self.max_length),
@@ -641,6 +653,22 @@ impl SettingsEditor {
             frequency_penalty,
             presence_penalty,
         })
+    }
+
+    /// Разобрать лимит контекста: пусто — `None`, иначе положительное целое.
+    fn build_context_limit(&self) -> Result<Option<u32>, String> {
+        if self.context_limit.trim().is_empty() {
+            return Ok(None);
+        }
+        let parsed = self
+            .context_limit
+            .trim()
+            .parse::<u32>()
+            .map_err(|_| "Лимит контекста должен быть целым числом".to_string())?;
+        if parsed == 0 {
+            return Err("Лимит контекста должен быть больше нуля".to_string());
+        }
+        Ok(Some(parsed))
     }
 }
 
@@ -1147,8 +1175,13 @@ fn handle_settings_key(
             match editor
                 .build()
                 .and_then(|format| editor.build_sampling().map(|sampling| (format, sampling)))
+                .and_then(|(format, sampling)| {
+                    editor
+                        .build_context_limit()
+                        .map(|context_limit| (format, sampling, context_limit))
+                })
             {
-                Ok((format, sampling)) => {
+                Ok((format, sampling, context_limit)) => {
                     let reasoning = editor.reasoning;
                     let thinking = editor.thinking;
                     // состав сохраняем всегда: при возврате к «Группе экспертов»
@@ -1172,6 +1205,7 @@ fn handle_settings_key(
                             reasoning,
                             thinking,
                             experts,
+                            max_context_tokens: context_limit,
                         };
                         // Настройки чата хранит сервис: локально они
                         // применяются ответом на PATCH, а не сразу.
@@ -2131,14 +2165,62 @@ fn render_pane(f: &mut Frame, state: &mut AppState, pane_idx: usize, area: Rect)
     };
     let is_active_pane = pane_idx == state.active_pane;
 
+    // Строку телеметрии токенов резервируем только когда есть что показать:
+    // иначе высота панели ввода будет дёргаться между кадрами без ответа.
+    let footer = token_footer_line(&state.chats[chat_index].messages);
+    let mut constraints = vec![Constraint::Length(1), Constraint::Min(3)];
+    if footer.is_some() {
+        constraints.push(Constraint::Length(1));
+    }
+    constraints.push(Constraint::Length(3));
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(1), Constraint::Min(3), Constraint::Length(3)])
+        .constraints(constraints)
         .split(area);
 
     render_pane_title(f, state, chat_index, is_active_pane, chunks[0]);
     render_history(f, state, &chat_id, chat_index, chunks[1]);
-    render_input(f, state, &chat_id, is_active_pane, chunks[2]);
+    let input_area = if let Some(footer) = &footer {
+        render_token_footer(f, footer, chunks[2]);
+        chunks[3]
+    } else {
+        chunks[2]
+    };
+    render_input(f, state, &chat_id, is_active_pane, input_area);
+}
+
+/// Строка телеметрии токенов под историей чата: слева — последний обмен,
+/// справа — накопленный итог по всему чату. `None`, если телеметрии нет ни
+/// у одного сообщения — тогда строка не резервирует место в layout.
+fn token_footer_line(messages: &[Message]) -> Option<String> {
+    let exchange = messages
+        .iter()
+        .rev()
+        .find(|message| matches!(message.role, Role::Assistant))
+        .and_then(|message| message.meta.as_ref())
+        .map(meta_token_summary)
+        .filter(|summary| !summary.is_empty());
+    let chat = token_counters(&chat_token_totals(messages));
+
+    let mut parts = Vec::new();
+    if let Some(exchange) = exchange {
+        parts.push(format!("Обмен: {exchange}"));
+    }
+    if let Some(chat) = chat {
+        parts.push(format!("Чат: {chat}"));
+    }
+    if parts.is_empty() {
+        return None;
+    }
+    Some(parts.join("   ·   "))
+}
+
+fn render_token_footer(f: &mut Frame, text: &str, area: Rect) {
+    let footer = Paragraph::new(Line::from(Span::styled(
+        format!(" {text}"),
+        Style::default().fg(Color::DarkGray),
+    )));
+    f.render_widget(footer, area);
 }
 
 /// Экран без открытых чатов: список ещё грузится, не загрузился или пуст.
@@ -2318,8 +2400,8 @@ fn render_pane_title(
     f.render_widget(title, area);
 }
 
-/// Компактная телеметрия сообщения для заголовка: время, длительность,
-/// токены и скорость генерации.
+/// Заголовок сообщения: чем и когда отвечено. Числа токенов сюда не идут —
+/// они выводятся строкой под самим ответом.
 fn meta_summary(meta: &MessageMeta) -> String {
     let mut parts = Vec::new();
     // Модель из ответа: фактическая, а не запрошенная чатом.
@@ -2329,22 +2411,90 @@ fn meta_summary(meta: &MessageMeta) -> String {
     if let Some(received) = meta.received_at.or(meta.sent_at) {
         parts.push(format_clock(received));
     }
+    parts.join(" · ")
+}
+
+/// Счётчики одного обмена: они читаются после ответа, поэтому строка
+/// показывается под сообщением, а не в его заголовке.
+fn meta_token_summary(meta: &MessageMeta) -> String {
+    let mut parts = Vec::new();
+    if let Some(tokens) = token_counters(&TokenTotals::from_meta(meta)) {
+        parts.push(tokens);
+    }
     if let Some(ms) = meta.duration_ms {
         parts.push(format!("{:.1} с", ms as f64 / 1000.0));
-    }
-    match (meta.prompt_tokens, meta.completion_tokens) {
-        (Some(prompt), Some(completion)) => parts.push(format!("↑{prompt} ↓{completion} ток.")),
-        (Some(prompt), None) => parts.push(format!("↑{prompt} ток.")),
-        (None, Some(completion)) => parts.push(format!("↓{completion} ток.")),
-        (None, None) => {}
-    }
-    if let Some(reasoning) = meta.reasoning_tokens {
-        parts.push(format!("рассужд. {reasoning} ток."));
     }
     if let Some(speed) = meta.tokens_per_second() {
         parts.push(format!("{speed:.0} ток/с"));
     }
     parts.join(" · ")
+}
+
+/// Сумма токенов: по одному обмену или по всему чату.
+#[derive(Default, Clone, Copy)]
+struct TokenTotals {
+    prompt: Option<u32>,
+    completion: Option<u32>,
+    reasoning: Option<u32>,
+    total: Option<u32>,
+}
+
+impl TokenTotals {
+    fn from_meta(meta: &MessageMeta) -> Self {
+        Self {
+            prompt: meta.prompt_tokens,
+            completion: meta.completion_tokens,
+            reasoning: meta.reasoning_tokens,
+            // Не каждый провайдер отдаёт total_tokens, поэтому при его
+            // отсутствии складываем запрос и ответ сами.
+            total: meta.total_tokens.or(match (meta.prompt_tokens, meta.completion_tokens) {
+                (Some(prompt), Some(completion)) => Some(prompt + completion),
+                _ => None,
+            }),
+        }
+    }
+
+    fn add(&mut self, other: &Self) {
+        fn merge(acc: &mut Option<u32>, value: Option<u32>) {
+            if let Some(value) = value {
+                *acc = Some(acc.unwrap_or(0) + value);
+            }
+        }
+        merge(&mut self.prompt, other.prompt);
+        merge(&mut self.completion, other.completion);
+        merge(&mut self.reasoning, other.reasoning);
+        merge(&mut self.total, other.total);
+    }
+}
+
+/// Читаемая строка счётчиков; `None`, если провайдер не прислал ни одного.
+fn token_counters(totals: &TokenTotals) -> Option<String> {
+    let mut parts = Vec::new();
+    if let Some(prompt) = totals.prompt {
+        parts.push(format!("↑ запрос {prompt}"));
+    }
+    if let Some(completion) = totals.completion {
+        parts.push(format!("↓ ответ {completion}"));
+    }
+    if let Some(reasoning) = totals.reasoning {
+        parts.push(format!("рассужд. {reasoning}"));
+    }
+    if let Some(total) = totals.total {
+        parts.push(format!("всего {total}"));
+    }
+    if parts.is_empty() {
+        return None;
+    }
+    Some(format!("{} ток.", parts.join(" · ")))
+}
+
+/// Счётчики за весь чат: складываем телеметрию всех сообщений.
+fn chat_token_totals(messages: &[Message]) -> TokenTotals {
+    let mut totals = TokenTotals::default();
+    for meta in messages.iter().filter_map(|message| message.meta.as_ref()) {
+        totals.add(&TokenTotals::from_meta(meta));
+    }
+    totals
 }
 
 fn format_clock(timestamp: i64) -> String {
@@ -2684,6 +2834,9 @@ fn empty_field_hint(field: FormatField, editor: &SettingsEditor) -> String {
         FormatField::OllamaUrl => {
             format!("не задан — {}", agentcore::config::DEFAULT_OLLAMA_URL)
         }
+        FormatField::ContextLimit => {
+            "не задан — действует операторский лимит сервиса".to_string()
+        }
         _ => "не задано — используется значение модели".to_string(),
     }
 }
@@ -2727,6 +2880,7 @@ fn render_settings_fields(f: &mut Frame, editor: &SettingsEditor, area: Rect) {
             FormatField::ServerUrl => editor.server_url.clone(),
             FormatField::ClientToken => mask_secret(&editor.client_token),
             FormatField::OllamaUrl => editor.ollama_url.clone(),
+            FormatField::ContextLimit => editor.context_limit.clone(),
             FormatField::Mode => {
                 if editor.custom_mode {
                     "Кастомный (◀/▶ или Space — переключить)".to_string()
@@ -3220,5 +3374,94 @@ mod tests {
 
         assert!(state.chats[0].history_loaded, "повторный запрос истории не нужен");
         assert_eq!(state.chats[0].messages.len(), 1);
+    }
+
+    fn assistant_with_meta(meta: MessageMeta) -> Message {
+        let mut message = Message::assistant("ответ");
+        message.meta = Some(meta);
+        message
+    }
+
+    #[test]
+    fn chat_token_totals_sums_partial_fields_across_messages() {
+        let messages = vec![
+            Message::user("вопрос"),
+            assistant_with_meta(MessageMeta {
+                prompt_tokens: Some(10),
+                completion_tokens: Some(5),
+                total_tokens: Some(15),
+                reasoning_tokens: None,
+                ..Default::default()
+            }),
+            Message::user("ещё вопрос"),
+            assistant_with_meta(MessageMeta {
+                prompt_tokens: Some(20),
+                completion_tokens: Some(8),
+                total_tokens: None,
+                reasoning_tokens: Some(3),
+                ..Default::default()
+            }),
+        ];
+
+        let totals = chat_token_totals(&messages);
+
+        assert_eq!(totals.prompt, Some(30));
+        assert_eq!(totals.completion, Some(13));
+        assert_eq!(totals.reasoning, Some(3));
+        // total_tokens второго сообщения отсутствует, но TokenTotals::from_meta
+        // достраивает его как prompt+completion, поэтому в итоге складываются
+        // оба варианта: явные 15 и достроенные 28.
+        assert_eq!(totals.total, Some(43));
+    }
+
+    #[test]
+    fn chat_token_totals_of_empty_history_has_no_fields() {
+        let totals = chat_token_totals(&[]);
+
+        assert_eq!(totals.prompt, None);
+        assert_eq!(totals.completion, None);
+        assert_eq!(totals.reasoning, None);
+        assert_eq!(totals.total, None);
+    }
+
+    #[test]
+    fn token_counters_is_none_for_empty_totals() {
+        assert!(token_counters(&TokenTotals::default()).is_none());
+    }
+
+    #[test]
+    fn token_counters_orders_parts_prompt_completion_reasoning_total() {
+        let totals = TokenTotals {
+            prompt: Some(10),
+            completion: Some(5),
+            reasoning: Some(2),
+            total: Some(15),
+        };
+
+        let summary = token_counters(&totals).expect("есть телеметрия");
+
+        assert_eq!(summary, "↑ запрос 10 · ↓ ответ 5 · рассужд. 2 · всего 15 ток.");
+    }
+
+    #[test]
+    fn token_footer_line_is_none_without_any_telemetry() {
+        let messages = vec![Message::user("вопрос"), Message::assistant("ответ")];
+
+        assert!(token_footer_line(&messages).is_none());
+    }
+
+    #[test]
+    fn token_footer_line_combines_exchange_and_chat_totals() {
+        let messages = vec![assistant_with_meta(MessageMeta {
+            prompt_tokens: Some(10),
+            completion_tokens: Some(5),
+            total_tokens: Some(15),
+            ..Default::default()
+        })];
+
+        let footer = token_footer_line(&messages).expect("есть телеметрия");
+
+        assert!(footer.starts_with("Обмен: "), "footer: {footer}");
+        assert!(footer.contains("Чат: "), "footer: {footer}");
     }
 }

@@ -194,6 +194,7 @@ fn settings_with(provider: Provider, model: &str) -> ChatSettings {
             temperature: Some(0.3),
             ..SamplingParams::default()
         },
+        max_context_tokens: None,
     }
 }
 
@@ -275,6 +276,41 @@ async fn update_sends_only_given_fields_and_nulls_cleared_sampling() {
         bodies[1]
     );
     assert_eq!(bodies[1]["settings"]["custom_response_mode"], false);
+}
+
+#[tokio::test]
+async fn update_sends_max_context_tokens_as_null_when_absent_and_number_when_set() {
+    let server = MockServer::start().await;
+    Mock::given(method("PATCH"))
+        .and(path("/v1/chats/chat-1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(chat_body("chat-1", "Чат")))
+        .mount(&server)
+        .await;
+
+    let client = chats(&server, "token-a");
+    client
+        .update("chat-1", None, Some(&ChatSettings::default()))
+        .await
+        .expect("сброс лимита");
+    client
+        .update(
+            "chat-1",
+            None,
+            Some(&ChatSettings {
+                max_context_tokens: Some(4000),
+                ..ChatSettings::default()
+            }),
+        )
+        .await
+        .expect("установка лимита");
+
+    let bodies = received_bodies(&server).await;
+    assert!(
+        bodies[0]["settings"]["max_context_tokens"].is_null(),
+        "пустой лимит уходит явным null: {}",
+        bodies[0]
+    );
+    assert_eq!(bodies[1]["settings"]["max_context_tokens"], 4000);
 }
 
 #[tokio::test]

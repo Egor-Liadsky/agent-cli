@@ -26,6 +26,13 @@ fn cloud_settings() -> ChatSettings {
     }
 }
 
+fn cloud_settings_with_context_limit(max_context_tokens: u32) -> ChatSettings {
+    ChatSettings {
+        max_context_tokens: Some(max_context_tokens),
+        ..cloud_settings()
+    }
+}
+
 fn success_body() -> serde_json::Value {
     json!({
         "request_id": "req-1",
@@ -265,6 +272,40 @@ async fn request_body_has_no_api_key_and_carries_history() {
     assert_eq!(body["settings"]["temperature"], 0.4);
     assert_eq!(body["settings"]["response_format"]["max_length"], 500);
     assert_eq!(body["settings"]["reasoning"], "step-by-step");
+    assert!(
+        body["settings"].get("max_context_tokens").is_none(),
+        "лимит не задан — поле не отправляется: {body}"
+    );
+}
+
+#[tokio::test]
+async fn max_context_tokens_is_sent_when_configured() {
+    let server = MockServer::start().await;
+    mount_chat(&server, 200, success_body()).await;
+
+    agent(&server, "token")
+        .ask(&history(), &cloud_settings_with_context_limit(4000))
+        .await
+        .expect("ответ сервиса");
+
+    let requests = server.received_requests().await.expect("запросы");
+    let body: serde_json::Value = serde_json::from_slice(&requests[0].body).expect("тело запроса");
+    assert_eq!(body["settings"]["max_context_tokens"], 4000);
+}
+
+#[tokio::test]
+async fn max_context_tokens_is_sent_in_ask_in_chat_when_configured() {
+    let server = MockServer::start().await;
+    mount_chat(&server, 200, success_body()).await;
+
+    agent(&server, "token")
+        .ask_in_chat("chat-1", "привет", &cloud_settings_with_context_limit(4000))
+        .await
+        .expect("ответ сервиса");
+
+    let requests = server.received_requests().await.expect("запросы");
+    let body: serde_json::Value = serde_json::from_slice(&requests[0].body).expect("тело запроса");
+    assert_eq!(body["settings"]["max_context_tokens"], 4000);
 }
 
 #[tokio::test]

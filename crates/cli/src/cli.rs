@@ -93,6 +93,25 @@ pub enum ConfigAction {
         #[arg(long)]
         thinking: Option<String>,
     },
+    /// Лимит контекста (токены) по умолчанию для НОВЫХ чатов; лимит уже
+    /// созданного чата меняется в TUI (Ctrl+P)
+    ContextLimit {
+        #[command(subcommand)]
+        action: ContextLimitAction,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum ContextLimitAction {
+    /// Задать лимит контекста по умолчанию для новых чатов
+    Set {
+        /// Положительное число токенов
+        tokens: u32,
+    },
+    /// Снять умолчание: новые чаты создаются без лимита
+    Clear,
+    /// Показать текущее умолчание для новых чатов
+    Show,
 }
 
 #[derive(Subcommand)]

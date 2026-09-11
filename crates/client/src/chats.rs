@@ -292,6 +292,7 @@ fn settings_payload(settings: &ChatSettings) -> serde_json::Value {
         top_k: sampling.top_k,
         frequency_penalty: sampling.frequency_penalty,
         presence_penalty: sampling.presence_penalty,
+        max_context_tokens: settings.max_context_tokens,
     };
     serde_json::to_value(payload).unwrap_or(serde_json::Value::Null)
 }
@@ -312,6 +313,7 @@ struct ChatSettingsUpdate {
     top_k: Option<u32>,
     frequency_penalty: Option<f32>,
     presence_penalty: Option<f32>,
+    max_context_tokens: Option<u32>,
 }
 
 #[derive(Serialize)]

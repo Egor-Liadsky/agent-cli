@@ -240,6 +240,12 @@ pub struct ChatSettings {
     /// Пустой список — состав по умолчанию (аналитик, инженер, критик).
     #[serde(default)]
     pub experts: Vec<String>,
+    /// Клиентский лимит контекста этого чата в токенах: сужает операторский
+    /// лимит сервиса `agentd` (`settings.max_context_tokens` в
+    /// `POST /v1/chat`). Не задано — поле не отправляется, действует
+    /// операторский лимит сервиса по умолчанию.
+    #[serde(default)]
+    pub max_context_tokens: Option<u32>,
 }
 
 impl ChatSettings {
@@ -295,6 +301,11 @@ pub struct Config {
     /// Состав группы экспертов по умолчанию для новых чатов
     #[serde(default)]
     pub experts: Vec<String>,
+    /// Лимит контекста по умолчанию для НОВЫХ чатов: копируется в
+    /// `ChatSettings.max_context_tokens` при создании чата
+    /// (`default_chat_settings`). Изменение этого поля не влияет на уже
+    /// созданные чаты — как и `Config.model`.
+    pub max_context_tokens: Option<u32>,
 }
 
 impl Config {
@@ -356,6 +367,7 @@ impl Config {
             reasoning: self.reasoning,
             thinking: self.thinking,
             experts: self.experts.clone(),
+            max_context_tokens: self.max_context_tokens,
         }
     }
 
@@ -460,6 +472,43 @@ model = "deepseek-chat"
         // Ключ провайдера читается, но игнорируется: места для него нет.
         assert_eq!(config.effective_server_url(), DEFAULT_SERVER_URL);
         assert_eq!(legacy, vec!["api_key", "base_url"]);
+    }
+
+    #[test]
+    fn max_context_tokens_defaults_to_none_for_old_config() {
+        let content = r#"
+server_url = "http://127.0.0.1:9000"
+client_token = "t"
+"#;
+        let (config, _legacy) = Config::parse_with_legacy_fields(content).expect("конфиг");
+        assert_eq!(config.max_context_tokens, None);
+    }
+
+    #[test]
+    fn old_chat_settings_without_field_parse_as_none() {
+        let settings: ChatSettings = serde_json::from_str("{}").expect("настройки чата");
+        assert_eq!(settings.max_context_tokens, None);
+    }
+
+    #[test]
+    fn new_chat_inherits_default_context_limit_from_config() {
+        let config = Config {
+            max_context_tokens: Some(4000),
+            ..Config::default()
+        };
+        let chat = config.default_chat_settings();
+        assert_eq!(chat.max_context_tokens, Some(4000));
+    }
+
+    #[test]
+    fn changing_config_default_does_not_affect_already_built_chat_settings() {
+        let mut config = Config {
+            max_context_tokens: Some(4000),
+            ..Config::default()
+        };
+        let chat = config.default_chat_settings();
+        config.max_context_tokens = Some(8000);
+        assert_eq!(chat.max_context_tokens, Some(4000));
     }
 
     #[test]

@@ -10,7 +10,7 @@ use agent::CliAgent;
 use agentcore::agent::{Agent, AgentReply, Message, MessageMeta};
 use anyhow::Context;
 use clap::Parser;
-use cli::{Cli, Commands, ConfigAction, FormatAction, OllamaAction, SamplingAction};
+use cli::{Cli, Commands, ConfigAction, ContextLimitAction, FormatAction, OllamaAction, SamplingAction};
 use agentcore::config::{Config, Provider, ReasoningMode, ThinkingMode};
 use console::style;
 use indicatif::{ProgressBar, ProgressStyle};
@@ -123,8 +123,58 @@ fn run_config(action: ConfigAction) -> anyhow::Result<()> {
             experts,
             thinking,
         } => run_reasoning_action(mode, experts, thinking)?,
+        ConfigAction::ContextLimit { action } => run_context_limit_action(action)?,
     }
     Ok(())
+}
+
+fn run_context_limit_action(action: ContextLimitAction) -> anyhow::Result<()> {
+    match action {
+        ContextLimitAction::Set { tokens } => {
+            if tokens == 0 {
+                anyhow::bail!("лимит контекста должен быть больше нуля");
+            }
+            let mut config = load_config()?;
+            config.max_context_tokens = Some(tokens);
+            config.save()?;
+            println!(
+                "{}",
+                style("Умолчание лимита контекста для новых чатов сохранено.")
+                    .green()
+                    .bold()
+            );
+            print_context_limit(&config);
+        }
+        ContextLimitAction::Clear => {
+            let mut config = load_config()?;
+            config.max_context_tokens = None;
+            config.save()?;
+            println!(
+                "{}",
+                style("Умолчание лимита контекста для новых чатов снято.")
+                    .green()
+                    .bold()
+            );
+        }
+        ContextLimitAction::Show => {
+            let config = load_config()?;
+            print_context_limit(&config);
+        }
+    }
+    Ok(())
+}
+
+fn print_context_limit(config: &Config) {
+    println!(
+        "{} {}",
+        style("лимит контекста по умолчанию для новых чатов (токены):")
+            .cyan()
+            .bold(),
+        config
+            .max_context_tokens
+            .map(|v| v.to_string())
+            .unwrap_or_else(|| "<не задан>".to_string())
+    );
 }
 
 /// Команды локального Ollama: список моделей, выбор модели, адрес сервера.
@@ -244,6 +294,7 @@ fn show_config() -> anyhow::Result<()> {
     print_reasoning(&config);
     print_response_format(&config.response_format);
     print_sampling_params(&config.sampling);
+    print_context_limit(&config);
     Ok(())
 }
 
