@@ -282,6 +282,10 @@ pub struct ContextObservability {
     /// `facts`).
     #[serde(default)]
     pub dropped_messages: Option<u32>,
+    /// Сколько сохранённых сообщений заменено пересказом на этом запросе
+    /// (стратегия `summary`).
+    #[serde(default)]
+    pub replaced_messages: Option<u32>,
     /// Строился ли новый пересказ на этом запросе (стратегия `summary`).
     #[serde(default)]
     pub summary_built: Option<bool>,

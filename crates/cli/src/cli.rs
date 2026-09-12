@@ -26,6 +26,46 @@ pub enum Commands {
         #[command(subcommand)]
         action: OllamaAction,
     },
+    /// Факты чата стратегии `facts` (specs/context-facts): без TUI, по
+    /// идентификатору существующего чата
+    Facts {
+        /// Идентификатор чата, выданный сервисом при создании
+        chat_id: String,
+        #[command(subcommand)]
+        action: FactsAction,
+    },
+    /// Ветки чата стратегии `branching` (specs/chat-branching): без TUI, по
+    /// идентификатору существующего чата
+    Branches {
+        chat_id: String,
+        #[command(subcommand)]
+        action: BranchesAction,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum FactsAction {
+    /// Показать все факты чата
+    List,
+    /// Задать значение факта (создаёт ключ или заменяет значение)
+    Set { key: String, value: String },
+    /// Удалить ключ
+    Delete { key: String },
+}
+
+#[derive(Subcommand)]
+pub enum BranchesAction {
+    /// Показать ветки чата с активной веткой
+    List,
+    /// Создать ветку от сообщения с указанным порядковым номером (`seq` из
+    /// `facts list`/`branches list` или из истории чата)
+    Create {
+        from_seq: i64,
+        /// Имя ветки; без значения — «ветка от <from_seq>»
+        name: Option<String>,
+    },
+    /// Переключить активную ветку
+    Activate { branch_id: String },
 }
 
 #[derive(Subcommand)]

@@ -218,6 +218,8 @@ struct ContextPayload {
     #[serde(default)]
     dropped_messages: Option<u32>,
     #[serde(default)]
+    replaced_messages: Option<u32>,
+    #[serde(default)]
     summary_built: Option<bool>,
     #[serde(default)]
     facts_applied: Option<u32>,
@@ -233,6 +235,7 @@ impl From<ContextPayload> for agentcore::config::ContextObservability {
             strategy: payload.strategy,
             sent_messages: payload.sent_messages,
             dropped_messages: payload.dropped_messages,
+            replaced_messages: payload.replaced_messages,
             summary_built: payload.summary_built,
             facts_applied: payload.facts_applied,
             facts_updated: payload.facts_updated,
@@ -546,7 +549,7 @@ pub async fn list_models(server_url: &str, token: &str) -> Result<Vec<String>> {
 }
 
 mod chats;
-pub use chats::{ChatHistory, ChatSummary, ChatsClient, StoredMessage};
+pub use chats::{Branch, ChatHistory, ChatSummary, ChatsClient, Fact, StoredMessage};
 
 #[cfg(test)]
 mod tests;

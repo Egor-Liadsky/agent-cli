@@ -11,8 +11,8 @@ use agentcore::agent::{Agent, AgentReply, Message, MessageMeta};
 use anyhow::Context;
 use clap::Parser;
 use cli::{
-    Cli, Commands, ConfigAction, ContextLimitAction, FormatAction, OllamaAction, SamplingAction,
-    SummaryAction,
+    BranchesAction, Cli, Commands, ConfigAction, ContextLimitAction, FactsAction, FormatAction,
+    OllamaAction, SamplingAction, SummaryAction,
 };
 use agentcore::config::{Config, Provider, ReasoningMode, ThinkingMode};
 use console::style;
@@ -34,8 +34,62 @@ async fn main() -> anyhow::Result<()> {
             action => run_config(action)?,
         },
         Commands::Ollama { action } => run_ollama(action).await?,
+        Commands::Facts { chat_id, action } => run_facts(chat_id, action).await?,
+        Commands::Branches { chat_id, action } => run_branches(chat_id, action).await?,
     }
 
+    Ok(())
+}
+
+async fn run_facts(chat_id: String, action: FactsAction) -> anyhow::Result<()> {
+    let config = load_config()?;
+    let client = tui::chats_client(&config);
+    match action {
+        FactsAction::List => {
+            let facts = client.facts(&chat_id).await?;
+            if facts.is_empty() {
+                println!("Фактов нет.");
+            }
+            for fact in facts {
+                println!("{}: {} (через сообщение {})", fact.key, fact.value, fact.through_seq);
+            }
+        }
+        FactsAction::Set { key, value } => {
+            let fact = client.set_fact(&chat_id, &key, &value).await?;
+            println!("{}: {}", fact.key, fact.value);
+        }
+        FactsAction::Delete { key } => {
+            client.delete_fact(&chat_id, &key).await?;
+            println!("Факт «{key}» удалён.");
+        }
+    }
+    Ok(())
+}
+
+async fn run_branches(chat_id: String, action: BranchesAction) -> anyhow::Result<()> {
+    let config = load_config()?;
+    let client = tui::chats_client(&config);
+    match action {
+        BranchesAction::List => {
+            let branches = client.branches(&chat_id).await?;
+            for branch in branches {
+                let mark = if branch.active { "*" } else { " " };
+                println!(
+                    "{mark} {} ({}) — {} сообщ.",
+                    branch.name, branch.id, branch.message_count
+                );
+            }
+        }
+        BranchesAction::Create { from_seq, name } => {
+            let name = name.unwrap_or_else(|| format!("ветка от {from_seq}"));
+            let branch = client.create_branch(&chat_id, from_seq, &name).await?;
+            println!("Создана ветка {} ({}).", branch.name, branch.id);
+        }
+        BranchesAction::Activate { branch_id } => {
+            client.activate_branch(&chat_id, &branch_id).await?;
+            println!("Ветка {branch_id} активна.");
+        }
+    }
     Ok(())
 }
 

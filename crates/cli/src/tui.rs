@@ -1,7 +1,7 @@
 use crate::agent::CliAgent;
 use agentcore::agent::{AgentReply, Message, MessageMeta, Role};
 use crate::chats::{self, ChatSession};
-use agentclient::{ChatHistory, ChatSummary, ChatsClient};
+use agentclient::{Branch, ChatHistory, ChatSummary, ChatsClient, Fact, StoredMessage};
 use agentcore::config::{
     ChatSettings, Config, ContextStrategy, Provider, ReasoningMode, ResponseFormat, SamplingParams,
     ThinkingMode,
@@ -64,6 +64,21 @@ enum ChatEvent {
     ChatDeleted(String, Result<(), String>),
     /// Дозапись обмена локального чата (`POST /v1/chats/{id}/messages`).
     ExchangeSaved(String, Result<(), String>),
+    /// Факты чата (`GET /v1/chats/{id}/facts`).
+    FactsLoaded(String, Result<Vec<Fact>, String>),
+    /// Установка значения факта (`PUT /v1/chats/{id}/facts/{key}`).
+    FactSet(String, Result<Fact, String>),
+    /// Удаление факта (`DELETE /v1/chats/{id}/facts/{key}`).
+    FactDeleted(String, Result<String, String>),
+    /// Ветки чата (`GET /v1/chats/{id}/branches`).
+    BranchesLoaded(String, Result<Vec<Branch>, String>),
+    /// Сообщения чата для выбора точки ветвления (`GET /v1/chats/{id}`).
+    BranchSourceMessagesLoaded(String, Result<Vec<StoredMessage>, String>),
+    /// Созданная ветка (`POST /v1/chats/{id}/branches`).
+    BranchCreated(String, Result<Branch, String>),
+    /// Подтверждённое переключение активной ветки
+    /// (`POST /v1/chats/{id}/branches/{branch_id}/activate`).
+    BranchActivated(String, Result<String, String>),
 }
 
 #[derive(PartialEq)]
@@ -73,12 +88,112 @@ enum Focus {
     Settings,
     Import,
     Confirm,
+    Facts,
+    Branches,
 }
 
 /// Запрос подтверждения на удаление чата.
 struct DeleteConfirm {
     chat_id: String,
     chat_title: String,
+}
+
+/// Экран фактов чата: список, правка значения, удаление ключа, добавление
+/// нового ключа (specs/context-facts, «Факты читаются и правятся вручную»).
+struct FactsPicker {
+    chat_id: String,
+    chat_title: String,
+    facts: Vec<Fact>,
+    cursor: usize,
+    loading: bool,
+    error: Option<String>,
+    /// Открытый редактор факта: `Some` — идёт правка значения или создание
+    /// новой пары «ключ-значение».
+    editor: Option<FactEditor>,
+}
+
+struct FactEditor {
+    /// Пусто и редактируемо — создание новой пары; иначе — правка значения
+    /// существующего ключа, и поле ключа недоступно вводу.
+    key: String,
+    value: String,
+    /// Поле, принимающее ввод: ключ — только у новой записи.
+    editing_key: bool,
+}
+
+impl FactsPicker {
+    fn new(chat_id: &str, chat_title: &str) -> Self {
+        Self {
+            chat_id: chat_id.to_string(),
+            chat_title: chat_title.to_string(),
+            facts: Vec::new(),
+            cursor: 0,
+            loading: true,
+            error: None,
+            editor: None,
+        }
+    }
+
+    fn move_cursor(&mut self, delta: i32) {
+        let len = self.facts.len() as i32;
+        if len == 0 {
+            return;
+        }
+        self.cursor = (self.cursor as i32 + delta).rem_euclid(len) as usize;
+    }
+
+    fn selected_key(&self) -> Option<&str> {
+        self.facts.get(self.cursor).map(|f| f.key.as_str())
+    }
+}
+
+/// Экран веток чата: список с активной веткой, создание ветки от выбранного
+/// сообщения, переключение (specs/chat-branching, «Управление ветками из
+/// клиента»).
+struct BranchesPicker {
+    chat_id: String,
+    chat_title: String,
+    branches: Vec<Branch>,
+    branch_cursor: usize,
+    loading: bool,
+    error: Option<String>,
+    /// Выбор точки ветвления и имени новой ветки, если он открыт.
+    creating: Option<BranchCreation>,
+}
+
+struct BranchCreation {
+    /// Сообщения чата — источник точек ветвления, с их `seq`.
+    messages: Vec<StoredMessage>,
+    message_cursor: usize,
+    loading: bool,
+    /// `Some` — сообщение выбрано, идёт ввод имени новой ветки.
+    name: Option<String>,
+}
+
+impl BranchesPicker {
+    fn new(chat_id: &str, chat_title: &str) -> Self {
+        Self {
+            chat_id: chat_id.to_string(),
+            chat_title: chat_title.to_string(),
+            branches: Vec::new(),
+            branch_cursor: 0,
+            loading: true,
+            error: None,
+            creating: None,
+        }
+    }
+
+    fn move_cursor(&mut self, delta: i32) {
+        let len = self.branches.len() as i32;
+        if len == 0 {
+            return;
+        }
+        self.branch_cursor = (self.branch_cursor as i32 + delta).rem_euclid(len) as usize;
+    }
+
+    fn selected_branch_id(&self) -> Option<&str> {
+        self.branches.get(self.branch_cursor).map(|b| b.id.as_str())
+    }
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -978,6 +1093,9 @@ struct ChatUi {
     /// Обмен, который не удалось дозаписать в сервис: причина и сами
     /// реплики для повторной попытки.
     unsaved: Option<UnsavedExchange>,
+    /// Блок наблюдаемости стратегии контекста последнего ответа
+    /// (specs/context-strategies, «Переключение стратегии из клиента»).
+    last_context: Option<agentcore::config::ContextObservability>,
 }
 
 /// Обмен локального чата, оставшийся только в памяти клиента.
@@ -999,6 +1117,7 @@ impl Default for ChatUi {
             history_loading: false,
             history_error: None,
             unsaved: None,
+            last_context: None,
         }
     }
 }
@@ -1027,6 +1146,10 @@ struct AppState {
     import: Option<ImportPicker>,
     /// Запрос подтверждения удаления чата, если он открыт.
     delete_confirm: Option<DeleteConfirm>,
+    /// Экран фактов чата, если он открыт.
+    facts: Option<FactsPicker>,
+    /// Экран веток чата, если он открыт.
+    branches: Option<BranchesPicker>,
     /// Короткое уведомление внизу экрана (например, «скопировано»).
     notice: Option<(String, Instant)>,
     /// Показывать ли цепочку рассуждений модели в истории.
@@ -1123,7 +1246,7 @@ impl AppState {
             }
             return;
         }
-        if matches!(self.focus, Focus::Import | Focus::Confirm) {
+        if matches!(self.focus, Focus::Import | Focus::Confirm | Focus::Facts | Focus::Branches) {
             return;
         }
         let Some(chat_id) = self.active_chat_id() else {
@@ -1166,6 +1289,8 @@ async fn run_app(
         settings: None,
         import: None,
         delete_confirm: None,
+        facts: None,
+        branches: None,
         notice: None,
         show_reasoning: true,
         ollama_models: Vec::new(),
@@ -1247,7 +1372,7 @@ fn handle_global_key(
         return Some(LoopControl::Break);
     }
     if key.code == KeyCode::Char('n') && key.modifiers.contains(KeyModifiers::CONTROL) {
-        if matches!(state.focus, Focus::Settings | Focus::Import | Focus::Confirm)
+        if matches!(state.focus, Focus::Settings | Focus::Import | Focus::Confirm | Focus::Facts | Focus::Branches)
             || state.active_pending()
         {
             return Some(LoopControl::Continue);
@@ -1306,7 +1431,7 @@ fn handle_global_key(
         });
         return Some(LoopControl::Continue);
     }
-    if matches!(state.focus, Focus::Settings | Focus::Import | Focus::Confirm) {
+    if matches!(state.focus, Focus::Settings | Focus::Import | Focus::Confirm | Focus::Facts | Focus::Branches) {
         return None;
     }
     if key.code == KeyCode::Char('w') && key.modifiers.contains(KeyModifiers::CONTROL) {
@@ -1351,7 +1476,7 @@ fn handle_key(
         if state.focus == Focus::Import {
             state.import = None;
             state.focus = Focus::Input;
-        } else if !matches!(state.focus, Focus::Settings | Focus::Confirm)
+        } else if !matches!(state.focus, Focus::Settings | Focus::Confirm | Focus::Facts | Focus::Branches)
             && let Some(chat_index) = state.active_chat_index() {
                 state.import = Some(ImportPicker::new(&state.chats[chat_index], &state.chats));
                 state.focus = Focus::Import;
@@ -1359,7 +1484,7 @@ fn handle_key(
         return LoopControl::Continue;
     }
     if key.code == KeyCode::Char('p') && key.modifiers.contains(KeyModifiers::CONTROL) {
-        if matches!(state.focus, Focus::Import | Focus::Confirm) {
+        if matches!(state.focus, Focus::Import | Focus::Confirm | Focus::Facts | Focus::Branches) {
             return LoopControl::Continue;
         }
         if state.focus == Focus::Settings {
@@ -1376,11 +1501,46 @@ fn handle_key(
         }
         return LoopControl::Continue;
     }
-    if key.code == KeyCode::Tab && !matches!(state.focus, Focus::Settings | Focus::Import | Focus::Confirm) {
+    if key.code == KeyCode::Char('f') && key.modifiers.contains(KeyModifiers::CONTROL) {
+        if state.focus == Focus::Facts {
+            state.facts = None;
+            state.focus = Focus::Input;
+        } else if matches!(state.focus, Focus::Input | Focus::Sidebar)
+            && let Some(chat_index) = state.active_chat_index()
+        {
+            let chat_id = state.chats[chat_index].id.clone();
+            let chat_title = state.chats[chat_index].title.clone();
+            state.facts = Some(FactsPicker::new(&chat_id, &chat_title));
+            state.focus = Focus::Facts;
+            request_facts(state, &chat_id, tx);
+        }
+        return LoopControl::Continue;
+    }
+    if key.code == KeyCode::Char('b') && key.modifiers.contains(KeyModifiers::CONTROL) {
+        if state.focus == Focus::Branches {
+            state.branches = None;
+            state.focus = Focus::Input;
+        } else if matches!(state.focus, Focus::Input | Focus::Sidebar)
+            && let Some(chat_index) = state.active_chat_index()
+        {
+            let chat_id = state.chats[chat_index].id.clone();
+            let chat_title = state.chats[chat_index].title.clone();
+            state.branches = Some(BranchesPicker::new(&chat_id, &chat_title));
+            state.focus = Focus::Branches;
+            request_branches(state, &chat_id, tx);
+        }
+        return LoopControl::Continue;
+    }
+    if key.code == KeyCode::Tab
+        && !matches!(
+            state.focus,
+            Focus::Settings | Focus::Import | Focus::Confirm | Focus::Facts | Focus::Branches
+        )
+    {
         state.focus = match state.focus {
             Focus::Input => Focus::Sidebar,
             Focus::Sidebar => Focus::Input,
-            Focus::Settings | Focus::Import | Focus::Confirm => unreachable!(),
+            Focus::Settings | Focus::Import | Focus::Confirm | Focus::Facts | Focus::Branches => unreachable!(),
         };
         return LoopControl::Continue;
     }
@@ -1389,6 +1549,8 @@ fn handle_key(
         Focus::Settings => handle_settings_key(key, state, tx),
         Focus::Import => handle_import_key(key, state, tx),
         Focus::Confirm => handle_confirm_key(key, state, tx),
+        Focus::Facts => handle_facts_key(key, state, tx),
+        Focus::Branches => handle_branches_key(key, state, tx),
         Focus::Sidebar => handle_sidebar_key(key, state, tx),
         Focus::Input => {
             if state.active_pending() || state.active_chat_id().is_none() {
@@ -1802,6 +1964,159 @@ fn handle_sidebar_key(
 }
 
 /// Клавиши окна подтверждения удаления: y/Enter — удалить, n/Esc — отмена.
+fn handle_facts_key(
+    key: crossterm::event::KeyEvent,
+    state: &mut AppState,
+    tx: &mpsc::UnboundedSender<ChatEvent>,
+) -> LoopControl {
+    let picker = state.facts.as_mut().expect("facts focus implies picker");
+
+    if let Some(editor) = picker.editor.as_mut() {
+        match key.code {
+            KeyCode::Esc => picker.editor = None,
+            KeyCode::Tab if editor.key.is_empty() || editor.editing_key => {
+                editor.editing_key = !editor.editing_key;
+            }
+            KeyCode::Enter => {
+                let key_text = editor.key.trim().to_string();
+                let value_text = editor.value.trim().to_string();
+                if key_text.is_empty() {
+                    state.notify("Ключ факта не может быть пустым");
+                    return LoopControl::Continue;
+                }
+                let chat_id = picker.chat_id.clone();
+                request_set_fact(state, &chat_id, &key_text, &value_text, tx);
+            }
+            KeyCode::Backspace => {
+                if editor.editing_key {
+                    editor.key.pop();
+                } else {
+                    editor.value.pop();
+                }
+            }
+            KeyCode::Char(c) => {
+                if editor.editing_key {
+                    editor.key.push(c);
+                } else {
+                    editor.value.push(c);
+                }
+            }
+            _ => {}
+        }
+        return LoopControl::Continue;
+    }
+
+    match key.code {
+        KeyCode::Esc => {
+            state.facts = None;
+            state.focus = Focus::Input;
+        }
+        KeyCode::Up => picker.move_cursor(-1),
+        KeyCode::Down => picker.move_cursor(1),
+        KeyCode::Char('n') => {
+            picker.editor = Some(FactEditor {
+                key: String::new(),
+                value: String::new(),
+                editing_key: true,
+            });
+        }
+        KeyCode::Enter => {
+            if let Some(fact) = picker.facts.get(picker.cursor) {
+                picker.editor = Some(FactEditor {
+                    key: fact.key.clone(),
+                    value: fact.value.clone(),
+                    editing_key: false,
+                });
+            }
+        }
+        KeyCode::Char('d') => {
+            if let Some(key) = picker.selected_key().map(str::to_string) {
+                let chat_id = picker.chat_id.clone();
+                request_delete_fact(state, &chat_id, &key, tx);
+            }
+        }
+        _ => {}
+    }
+    LoopControl::Continue
+}
+
+fn handle_branches_key(
+    key: crossterm::event::KeyEvent,
+    state: &mut AppState,
+    tx: &mpsc::UnboundedSender<ChatEvent>,
+) -> LoopControl {
+    let picker = state.branches.as_mut().expect("branches focus implies picker");
+
+    if let Some(creation) = picker.creating.as_mut() {
+        if let Some(name) = creation.name.as_mut() {
+            match key.code {
+                KeyCode::Esc => picker.creating = None,
+                KeyCode::Backspace => {
+                    name.pop();
+                }
+                KeyCode::Char(c) => name.push(c),
+                KeyCode::Enter => {
+                    let Some(message) = creation.messages.get(creation.message_cursor) else {
+                        return LoopControl::Continue;
+                    };
+                    let from_seq = message.seq;
+                    let branch_name = if name.trim().is_empty() {
+                        format!("ветка от {from_seq}")
+                    } else {
+                        name.trim().to_string()
+                    };
+                    let chat_id = picker.chat_id.clone();
+                    request_create_branch(state, &chat_id, from_seq, &branch_name, tx);
+                }
+                _ => {}
+            }
+            return LoopControl::Continue;
+        }
+        match key.code {
+            KeyCode::Esc => picker.creating = None,
+            KeyCode::Up => {
+                creation.message_cursor = creation.message_cursor.saturating_sub(1);
+            }
+            KeyCode::Down => {
+                creation.message_cursor =
+                    (creation.message_cursor + 1).min(creation.messages.len().saturating_sub(1));
+            }
+            KeyCode::Enter if !creation.messages.is_empty() => {
+                creation.name = Some(String::new());
+            }
+            _ => {}
+        }
+        return LoopControl::Continue;
+    }
+
+    match key.code {
+        KeyCode::Esc => {
+            state.branches = None;
+            state.focus = Focus::Input;
+        }
+        KeyCode::Up => picker.move_cursor(-1),
+        KeyCode::Down => picker.move_cursor(1),
+        KeyCode::Char('n') => {
+            let chat_id = picker.chat_id.clone();
+            picker.creating = Some(BranchCreation {
+                messages: Vec::new(),
+                message_cursor: 0,
+                loading: true,
+                name: None,
+            });
+            request_branch_source_messages(state, &chat_id, tx);
+        }
+        KeyCode::Enter => {
+            if let Some(branch_id) = picker.selected_branch_id().map(str::to_string) {
+                let chat_id = picker.chat_id.clone();
+                request_activate_branch(state, &chat_id, &branch_id, tx);
+            }
+        }
+        _ => {}
+    }
+    LoopControl::Continue
+}
+
 fn handle_confirm_key(
     key: crossterm::event::KeyEvent,
     state: &mut AppState,
@@ -1949,7 +2264,7 @@ fn handle_input_key(
 
 /// Клиент чатов по текущему конфигу: адрес сервиса и клиентский токен те же,
 /// что у облачных запросов.
-fn chats_client(config: &Config) -> ChatsClient {
+pub(crate) fn chats_client(config: &Config) -> ChatsClient {
     ChatsClient::new(
         config.effective_server_url(),
         config.client_token(),
@@ -2076,6 +2391,99 @@ fn request_append_exchange(
     });
 }
 
+/// Факты чата (`GET /v1/chats/{id}/facts`).
+fn request_facts(state: &AppState, chat_id: &str, tx: &mpsc::UnboundedSender<ChatEvent>) {
+    let client = state.chats_client.clone();
+    let tx = tx.clone();
+    let id = chat_id.to_string();
+    tokio::spawn(async move {
+        let result = client.facts(&id).await.map_err(|err| failure_text(&err));
+        let _ = tx.send(ChatEvent::FactsLoaded(id, result));
+    });
+}
+
+fn request_set_fact(state: &AppState, chat_id: &str, key: &str, value: &str, tx: &mpsc::UnboundedSender<ChatEvent>) {
+    let client = state.chats_client.clone();
+    let tx = tx.clone();
+    let id = chat_id.to_string();
+    let key = key.to_string();
+    let value = value.to_string();
+    tokio::spawn(async move {
+        let result = client.set_fact(&id, &key, &value).await.map_err(|err| failure_text(&err));
+        let _ = tx.send(ChatEvent::FactSet(id, result));
+    });
+}
+
+fn request_delete_fact(state: &AppState, chat_id: &str, key: &str, tx: &mpsc::UnboundedSender<ChatEvent>) {
+    let client = state.chats_client.clone();
+    let tx = tx.clone();
+    let id = chat_id.to_string();
+    let key = key.to_string();
+    tokio::spawn(async move {
+        let result = client
+            .delete_fact(&id, &key)
+            .await
+            .map(|()| key.clone())
+            .map_err(|err| failure_text(&err));
+        let _ = tx.send(ChatEvent::FactDeleted(id, result));
+    });
+}
+
+/// Ветки чата (`GET /v1/chats/{id}/branches`).
+fn request_branches(state: &AppState, chat_id: &str, tx: &mpsc::UnboundedSender<ChatEvent>) {
+    let client = state.chats_client.clone();
+    let tx = tx.clone();
+    let id = chat_id.to_string();
+    tokio::spawn(async move {
+        let result = client.branches(&id).await.map_err(|err| failure_text(&err));
+        let _ = tx.send(ChatEvent::BranchesLoaded(id, result));
+    });
+}
+
+/// Сообщения чата как источник точек ветвления — отдельным запросом, а не
+/// из уже загрученной `ChatSession`: там нет `seq`, нужного для выбора
+/// точки ветвления (specs/chat-branching, «Ветка создаётся от выбранного
+/// сообщения»).
+fn request_branch_source_messages(state: &AppState, chat_id: &str, tx: &mpsc::UnboundedSender<ChatEvent>) {
+    let client = state.chats_client.clone();
+    let tx = tx.clone();
+    let id = chat_id.to_string();
+    tokio::spawn(async move {
+        let result = client
+            .load(&id)
+            .await
+            .map(|history| history.messages)
+            .map_err(|err| failure_text(&err));
+        let _ = tx.send(ChatEvent::BranchSourceMessagesLoaded(id, result));
+    });
+}
+
+fn request_create_branch(state: &AppState, chat_id: &str, from_seq: i64, name: &str, tx: &mpsc::UnboundedSender<ChatEvent>) {
+    let client = state.chats_client.clone();
+    let tx = tx.clone();
+    let id = chat_id.to_string();
+    let name = name.to_string();
+    tokio::spawn(async move {
+        let result = client.create_branch(&id, from_seq, &name).await.map_err(|err| failure_text(&err));
+        let _ = tx.send(ChatEvent::BranchCreated(id, result));
+    });
+}
+
+fn request_activate_branch(state: &AppState, chat_id: &str, branch_id: &str, tx: &mpsc::UnboundedSender<ChatEvent>) {
+    let client = state.chats_client.clone();
+    let tx = tx.clone();
+    let id = chat_id.to_string();
+    let branch_id = branch_id.to_string();
+    tokio::spawn(async move {
+        let result = client
+            .activate_branch(&id, &branch_id)
+            .await
+            .map(|()| branch_id.clone())
+            .map_err(|err| failure_text(&err));
+        let _ = tx.send(ChatEvent::BranchActivated(id, result));
+    });
+}
+
 /// Фоновый запрос списка локальных моделей Ollama.
 fn fetch_ollama_models(config: &Config, tx: &mpsc::UnboundedSender<ChatEvent>) {
     let url = config.effective_ollama_url();
@@ -2142,14 +2550,44 @@ fn handle_chat_event(
             handle_exchange_saved(chat_id, result, state);
             return;
         }
+        ChatEvent::FactsLoaded(chat_id, result) => {
+            handle_facts_loaded(chat_id, result, state);
+            return;
+        }
+        ChatEvent::FactSet(chat_id, result) => {
+            handle_fact_set(chat_id, result, state);
+            return;
+        }
+        ChatEvent::FactDeleted(chat_id, result) => {
+            handle_fact_deleted(chat_id, result, state);
+            return;
+        }
+        ChatEvent::BranchesLoaded(chat_id, result) => {
+            handle_branches_loaded(chat_id, result, state);
+            return;
+        }
+        ChatEvent::BranchSourceMessagesLoaded(chat_id, result) => {
+            handle_branch_source_messages_loaded(chat_id, result, state);
+            return;
+        }
+        ChatEvent::BranchCreated(chat_id, result) => {
+            handle_branch_created(chat_id, result, state, tx);
+            return;
+        }
+        ChatEvent::BranchActivated(chat_id, result) => {
+            handle_branch_activated(chat_id, result, state, tx);
+            return;
+        }
         other => other,
     };
     let ChatEvent::Response(chat_id, result) = chat_event else {
         return;
     };
     let failed = result.is_err();
+    let mut reply_context = None;
     let mut message = match result {
         Ok(reply) => {
+            reply_context = reply.context;
             let mut message = Message::assistant(reply.content);
             message.reasoning = reply.reasoning;
             message.meta = Some(reply.meta);
@@ -2160,6 +2598,9 @@ fn handle_chat_event(
     let Some(chat_index) = state.chats.iter().position(|c| c.id == chat_id) else {
         return;
     };
+    if let Some(context) = reply_context {
+        state.chat_ui.entry(chat_id.clone()).or_default().last_context = Some(context);
+    }
     // у ошибки телеметрии нет — оставляем хотя бы время получения
     if message.meta.is_none() {
         message.meta = Some(MessageMeta {
@@ -2329,6 +2770,137 @@ fn handle_exchange_saved(chat_id: String, result: Result<(), String>, state: &mu
     }
 }
 
+fn handle_facts_loaded(chat_id: String, result: Result<Vec<Fact>, String>, state: &mut AppState) {
+    let Some(picker) = state.facts.as_mut() else { return };
+    if picker.chat_id != chat_id {
+        return;
+    }
+    picker.loading = false;
+    match result {
+        Ok(facts) => {
+            picker.facts = facts;
+            picker.cursor = picker.cursor.min(picker.facts.len().saturating_sub(1));
+            picker.error = None;
+        }
+        Err(reason) => picker.error = Some(reason),
+    }
+}
+
+fn handle_fact_set(chat_id: String, result: Result<Fact, String>, state: &mut AppState) {
+    let Some(picker) = state.facts.as_mut() else { return };
+    if picker.chat_id != chat_id {
+        return;
+    }
+    match result {
+        Ok(fact) => {
+            picker.editor = None;
+            if let Some(existing) = picker.facts.iter_mut().find(|f| f.key == fact.key) {
+                *existing = fact;
+            } else {
+                picker.facts.push(fact);
+                picker.facts.sort_by(|a, b| a.key.cmp(&b.key));
+            }
+        }
+        Err(reason) => state.notify(format!("Не удалось сохранить факт: {reason}")),
+    }
+}
+
+fn handle_fact_deleted(chat_id: String, result: Result<String, String>, state: &mut AppState) {
+    let Some(picker) = state.facts.as_mut() else { return };
+    if picker.chat_id != chat_id {
+        return;
+    }
+    match result {
+        Ok(key) => {
+            picker.facts.retain(|f| f.key != key);
+            picker.cursor = picker.cursor.min(picker.facts.len().saturating_sub(1));
+        }
+        Err(reason) => state.notify(format!("Не удалось удалить факт: {reason}")),
+    }
+}
+
+fn handle_branches_loaded(chat_id: String, result: Result<Vec<Branch>, String>, state: &mut AppState) {
+    let Some(picker) = state.branches.as_mut() else { return };
+    if picker.chat_id != chat_id {
+        return;
+    }
+    picker.loading = false;
+    match result {
+        Ok(branches) => {
+            picker.branch_cursor = picker.branch_cursor.min(branches.len().saturating_sub(1));
+            picker.branches = branches;
+            picker.error = None;
+        }
+        Err(reason) => picker.error = Some(reason),
+    }
+}
+
+fn handle_branch_source_messages_loaded(
+    chat_id: String,
+    result: Result<Vec<StoredMessage>, String>,
+    state: &mut AppState,
+) {
+    let Some(picker) = state.branches.as_mut() else { return };
+    if picker.chat_id != chat_id {
+        return;
+    }
+    let Some(creation) = picker.creating.as_mut() else { return };
+    creation.loading = false;
+    match result {
+        Ok(messages) => {
+            creation.message_cursor = messages.len().saturating_sub(1);
+            creation.messages = messages;
+        }
+        Err(reason) => {
+            picker.creating = None;
+            picker.error = Some(reason);
+        }
+    }
+}
+
+fn handle_branch_created(
+    chat_id: String,
+    result: Result<Branch, String>,
+    state: &mut AppState,
+    tx: &mpsc::UnboundedSender<ChatEvent>,
+) {
+    let Some(picker) = state.branches.as_mut() else { return };
+    if picker.chat_id != chat_id {
+        return;
+    }
+    picker.creating = None;
+    match result {
+        Ok(_) => request_branches(state, &chat_id, tx),
+        Err(reason) => state.notify(format!("Не удалось создать ветку: {reason}")),
+    }
+}
+
+fn handle_branch_activated(
+    chat_id: String,
+    result: Result<String, String>,
+    state: &mut AppState,
+    tx: &mpsc::UnboundedSender<ChatEvent>,
+) {
+    match result {
+        Ok(_) => {
+            if let Some(picker) = state.branches.as_ref()
+                && picker.chat_id == chat_id
+            {
+                request_branches(state, &chat_id, tx);
+            }
+            // Активная ветка сменилась: перечитываем историю чата.
+            if let Some(ui) = state.chat_ui.get_mut(&chat_id) {
+                ui.history_loading = false;
+            }
+            if let Some(index) = state.chat_index(&chat_id) {
+                state.chats[index].history_loaded = false;
+            }
+            fetch_history(state, &chat_id, tx);
+        }
+        Err(reason) => state.notify(format!("Не удалось переключить ветку: {reason}")),
+    }
+}
+
 /// Обновить список локальных моделей в состоянии и в открытом редакторе
 /// настроек. Ошибка не мешает работе: облачные чаты от неё не зависят.
 fn handle_ollama_models(result: Result<Vec<String>, String>, state: &mut AppState) {
@@ -2429,6 +3001,12 @@ fn render_ui(f: &mut Frame, state: &mut AppState) {
     if let Some(confirm) = &state.delete_confirm {
         render_delete_popup(f, confirm);
     }
+    if let Some(picker) = &state.facts {
+        render_facts_popup(f, picker);
+    }
+    if let Some(picker) = &state.branches {
+        render_branches_popup(f, picker);
+    }
 }
 
 /// Подтверждение удаления чата: удаление необратимо, поэтому спрашиваем явно.
@@ -2474,7 +3052,14 @@ fn render_pane(f: &mut Frame, state: &mut AppState, pane_idx: usize, area: Rect)
 
     // Строку телеметрии токенов резервируем только когда есть что показать:
     // иначе высота панели ввода будет дёргаться между кадрами без ответа.
-    let footer = token_footer_line(&state.chats[chat_index].messages);
+    let mut footer = token_footer_line(&state.chats[chat_index].messages);
+    if let Some(context) = state.chat_ui.get(&chat_id).and_then(|ui| ui.last_context.as_ref()) {
+        let strategy_line = context_status_line(context);
+        footer = Some(match footer {
+            Some(existing) => format!("{existing} · {strategy_line}"),
+            None => strategy_line,
+        });
+    }
     let mut constraints = vec![Constraint::Length(1), Constraint::Min(3)];
     if footer.is_some() {
         constraints.push(Constraint::Length(1));
@@ -2494,6 +3079,43 @@ fn render_pane(f: &mut Frame, state: &mut AppState, pane_idx: usize, area: Rect)
         chunks[2]
     };
     render_input(f, state, &chat_id, is_active_pane, input_area);
+}
+
+/// Строка «что сделала стратегия контекста» для последнего ответа
+/// (specs/context-strategies, «Переключение стратегии из клиента»): поля,
+/// не имеющие смысла для действующей стратегии, сервис не присылает —
+/// здесь это выражено пропуском, а не нулём.
+fn context_status_line(context: &agentcore::config::ContextObservability) -> String {
+    let strategy_label = context
+        .strategy
+        .map(|s| s.label())
+        .unwrap_or("умолчание сервиса");
+    let mut parts = vec![format!("Стратегия: {strategy_label}")];
+    if let Some(sent) = context.sent_messages {
+        parts.push(format!("отправлено {sent}"));
+    }
+    if let Some(dropped) = context.dropped_messages {
+        parts.push(format!("отброшено {dropped}"));
+    }
+    if let Some(replaced) = context.replaced_messages {
+        parts.push(format!("заменено пересказом {replaced}"));
+    }
+    if let Some(true) = context.summary_built {
+        parts.push("пересказ перестроен".to_string());
+    }
+    if let Some(applied) = context.facts_applied {
+        parts.push(format!("фактов {applied}"));
+    }
+    match context.facts_updated {
+        Some(true) => parts.push("факты обновлены".to_string()),
+        Some(false) => parts.push("факты не обновлены".to_string()),
+        None => {}
+    }
+    if let Some(branch_id) = &context.branch_id {
+        let short: String = branch_id.chars().take(8).collect();
+        parts.push(format!("ветка {short}"));
+    }
+    parts.join(" · ")
 }
 
 /// Строка телеметрии токенов под историей чата: слева — последний обмен,
@@ -3369,6 +3991,201 @@ fn render_import_popup(f: &mut Frame, picker: &ImportPicker) {
     );
 }
 
+/// Экран фактов чата: список пар «ключ-значение», либо редактор одной
+/// записи, если он открыт (specs/context-facts, «Факты читаются и
+/// правятся вручную»).
+fn render_facts_popup(f: &mut Frame, picker: &FactsPicker) {
+    let area = centered_rect(72, 20, f.area());
+    f.render_widget(Clear, area);
+
+    let title = format!(" Факты чата «{}» ", picker.chat_title);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan))
+        .title(title);
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    if let Some(editor) = &picker.editor {
+        let rows = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(1), Constraint::Length(1), Constraint::Min(0), Constraint::Length(1)])
+            .split(inner);
+        let key_style = if editor.editing_key {
+            Style::default().fg(Color::Black).bg(Color::Cyan)
+        } else {
+            Style::default().fg(Color::White)
+        };
+        let value_style = if editor.editing_key {
+            Style::default().fg(Color::White)
+        } else {
+            Style::default().fg(Color::Black).bg(Color::Cyan)
+        };
+        f.render_widget(Paragraph::new(Line::from(vec![
+            Span::raw(" Ключ: "),
+            Span::styled(editor.key.clone(), key_style),
+        ])), rows[0]);
+        f.render_widget(Paragraph::new(Line::from(vec![
+            Span::raw(" Значение: "),
+            Span::styled(editor.value.clone(), value_style),
+        ])), rows[1]);
+        f.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                " Tab — переключить поле · Enter — сохранить · Esc — отмена",
+                Style::default().fg(Color::DarkGray),
+            ))),
+            rows[3],
+        );
+        return;
+    }
+
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(0), Constraint::Length(1)])
+        .split(inner);
+
+    let lines: Vec<Line> = if picker.loading {
+        vec![Line::from(Span::styled(" Загрузка...", Style::default().fg(Color::DarkGray)))]
+    } else if let Some(error) = &picker.error {
+        vec![Line::from(Span::styled(format!(" Ошибка: {error}"), Style::default().fg(Color::Red)))]
+    } else if picker.facts.is_empty() {
+        vec![Line::from(Span::styled(
+            " Фактов пока нет — n добавит первый",
+            Style::default().fg(Color::DarkGray),
+        ))]
+    } else {
+        picker
+            .facts
+            .iter()
+            .enumerate()
+            .map(|(index, fact)| {
+                let style = if index == picker.cursor {
+                    Style::default().fg(Color::Black).bg(Color::Cyan).add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(Color::White)
+                };
+                Line::from(Span::styled(format!(" {}: {}", fact.key, fact.value), style))
+            })
+            .collect()
+    };
+    f.render_widget(Paragraph::new(Text::from(lines)).wrap(Wrap { trim: false }), rows[0]);
+    f.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            " ↑/↓ — выбор · Enter — править · n — новый факт · d — удалить · Esc — закрыть",
+            Style::default().fg(Color::DarkGray),
+        ))),
+        rows[1],
+    );
+}
+
+/// Экран веток чата: список с активной веткой, либо выбор точки ветвления
+/// и имени новой ветки, если он открыт (specs/chat-branching, «Управление
+/// ветками из клиента»).
+fn render_branches_popup(f: &mut Frame, picker: &BranchesPicker) {
+    let area = centered_rect(72, 20, f.area());
+    f.render_widget(Clear, area);
+
+    let title = format!(" Ветки чата «{}» ", picker.chat_title);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan))
+        .title(title);
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    if let Some(creation) = &picker.creating {
+        let rows = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Min(0), Constraint::Length(1)])
+            .split(inner);
+
+        if let Some(name) = &creation.name {
+            f.render_widget(
+                Paragraph::new(Line::from(vec![
+                    Span::raw(" Имя новой ветки: "),
+                    Span::styled(name.clone(), Style::default().fg(Color::Black).bg(Color::Cyan)),
+                ])),
+                rows[0],
+            );
+            f.render_widget(
+                Paragraph::new(Line::from(Span::styled(
+                    " Enter — создать · Esc — отмена",
+                    Style::default().fg(Color::DarkGray),
+                ))),
+                rows[1],
+            );
+            return;
+        }
+
+        let lines: Vec<Line> = if creation.loading {
+            vec![Line::from(Span::styled(" Загрузка сообщений...", Style::default().fg(Color::DarkGray)))]
+        } else if creation.messages.is_empty() {
+            vec![Line::from(Span::styled(" В чате нет сообщений для точки ветвления", Style::default().fg(Color::DarkGray)))]
+        } else {
+            creation
+                .messages
+                .iter()
+                .enumerate()
+                .map(|(index, message)| {
+                    let style = if index == creation.message_cursor {
+                        Style::default().fg(Color::Black).bg(Color::Cyan).add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default().fg(Color::White)
+                    };
+                    let preview: String = message.message.content.chars().take(60).collect();
+                    Line::from(Span::styled(format!(" #{} {}", message.seq, preview), style))
+                })
+                .collect()
+        };
+        f.render_widget(Paragraph::new(Text::from(lines)).wrap(Wrap { trim: false }), rows[0]);
+        f.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                " ↑/↓ — выбор сообщения · Enter — ветвить отсюда · Esc — отмена",
+                Style::default().fg(Color::DarkGray),
+            ))),
+            rows[1],
+        );
+        return;
+    }
+
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(0), Constraint::Length(1)])
+        .split(inner);
+
+    let lines: Vec<Line> = if picker.loading {
+        vec![Line::from(Span::styled(" Загрузка...", Style::default().fg(Color::DarkGray)))]
+    } else if let Some(error) = &picker.error {
+        vec![Line::from(Span::styled(format!(" Ошибка: {error}"), Style::default().fg(Color::Red)))]
+    } else {
+        picker
+            .branches
+            .iter()
+            .enumerate()
+            .map(|(index, branch)| {
+                let style = if index == picker.branch_cursor {
+                    Style::default().fg(Color::Black).bg(Color::Cyan).add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(Color::White)
+                };
+                let mark = if branch.active { "●" } else { " " };
+                Line::from(Span::styled(
+                    format!(" {mark} {} ({} сообщ.)", branch.name, branch.message_count),
+                    style,
+                ))
+            })
+            .collect()
+    };
+    f.render_widget(Paragraph::new(Text::from(lines)).wrap(Wrap { trim: false }), rows[0]);
+    f.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            " ↑/↓ — выбор · Enter — переключить · n — новая ветка · Esc — закрыть",
+            Style::default().fg(Color::DarkGray),
+        ))),
+        rows[1],
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3403,6 +4220,8 @@ mod tests {
             settings: None,
             import: None,
             delete_confirm: None,
+            facts: None,
+            branches: None,
             notice: None,
             show_reasoning: true,
             ollama_models: Vec::new(),
@@ -3872,5 +4691,152 @@ mod tests {
 
         assert!(footer.starts_with("Обмен: "), "footer: {footer}");
         assert!(footer.contains("Чат: "), "footer: {footer}");
+    }
+
+    // --- 8.2 Строка стратегии контекста ---
+
+    #[test]
+    fn context_status_line_omits_fields_of_other_strategies() {
+        use agentcore::config::{ContextObservability, ContextStrategy};
+
+        let context = ContextObservability {
+            strategy: Some(ContextStrategy::SlidingWindow),
+            sent_messages: Some(6),
+            dropped_messages: Some(14),
+            ..ContextObservability::default()
+        };
+
+        let line = context_status_line(&context);
+
+        assert!(line.contains("отправлено 6"));
+        assert!(line.contains("отброшено 14"));
+        assert!(!line.contains("факт"), "поля стратегии facts не должны выводиться: {line}");
+        assert!(!line.contains("ветка"), "поле стратегии branching не должно выводиться: {line}");
+    }
+
+    // --- 8.3 Экран фактов ---
+
+    fn fact(key: &str, value: &str) -> Fact {
+        Fact {
+            key: key.to_string(),
+            value: value.to_string(),
+            through_seq: 1,
+            updated_at: 0,
+        }
+    }
+
+    #[test]
+    fn facts_loaded_populates_picker() {
+        let mut state = test_state();
+        state.facts = Some(FactsPicker::new("chat-1", "Чат"));
+
+        handle_facts_loaded(
+            "chat-1".to_string(),
+            Ok(vec![fact("budget", "200000"), fact("deadline", "март")]),
+            &mut state,
+        );
+
+        let picker = state.facts.expect("экран фактов открыт");
+        assert!(!picker.loading);
+        assert_eq!(picker.facts.len(), 2);
+        assert!(picker.error.is_none());
+    }
+
+    #[test]
+    fn facts_load_failure_is_reported_without_closing_picker() {
+        let mut state = test_state();
+        state.facts = Some(FactsPicker::new("chat-1", "Чат"));
+
+        handle_facts_loaded("chat-1".to_string(), Err("сервис недоступен".to_string()), &mut state);
+
+        let picker = state.facts.expect("экран фактов остаётся открытым");
+        assert_eq!(picker.error.as_deref(), Some("сервис недоступен"));
+    }
+
+    #[test]
+    fn fact_set_updates_existing_key_in_place() {
+        let mut state = test_state();
+        let mut picker = FactsPicker::new("chat-1", "Чат");
+        picker.facts = vec![fact("budget", "200000")];
+        picker.editor = Some(FactEditor { key: "budget".to_string(), value: "300000".to_string(), editing_key: false });
+        state.facts = Some(picker);
+
+        handle_fact_set("chat-1".to_string(), Ok(fact("budget", "300000")), &mut state);
+
+        let picker = state.facts.expect("экран фактов");
+        assert_eq!(picker.facts.len(), 1, "правка не создаёт вторую запись");
+        assert_eq!(picker.facts[0].value, "300000");
+        assert!(picker.editor.is_none(), "редактор закрывается после сохранения");
+    }
+
+    #[test]
+    fn fact_deleted_removes_key_from_list() {
+        let mut state = test_state();
+        let mut picker = FactsPicker::new("chat-1", "Чат");
+        picker.facts = vec![fact("budget", "200000"), fact("deadline", "март")];
+        state.facts = Some(picker);
+
+        handle_fact_deleted("chat-1".to_string(), Ok("budget".to_string()), &mut state);
+
+        let picker = state.facts.expect("экран фактов");
+        assert_eq!(picker.facts.len(), 1);
+        assert_eq!(picker.facts[0].key, "deadline");
+    }
+
+    // --- 8.4 Экран веток ---
+
+    fn branch(id: &str, name: &str, active: bool) -> Branch {
+        Branch {
+            id: id.to_string(),
+            name: name.to_string(),
+            parent_id: None,
+            fork_seq: None,
+            message_count: 2,
+            active,
+        }
+    }
+
+    #[test]
+    fn branches_loaded_populates_picker_with_active_marker() {
+        let mut state = test_state();
+        state.branches = Some(BranchesPicker::new("chat-1", "Чат"));
+
+        handle_branches_loaded(
+            "chat-1".to_string(),
+            Ok(vec![branch("root", "root", true), branch("b2", "альтернатива", false)]),
+            &mut state,
+        );
+
+        let picker = state.branches.expect("экран веток");
+        assert!(!picker.loading);
+        assert_eq!(picker.branches.len(), 2);
+        assert!(picker.branches[0].active);
+    }
+
+    #[tokio::test]
+    async fn branch_activated_marks_chat_history_for_reload() {
+        let mut state = test_state();
+        handle_chats_loaded(Ok(vec![summary("chat-1", "Чат", 4)]), &mut state, &channel());
+        handle_history_loaded(
+            "chat-1".to_string(),
+            Ok(ChatHistory {
+                chat: summary("chat-1", "Чат", 4),
+                branch_id: None,
+                messages: vec![agentclient::StoredMessage {
+                    seq: 1,
+                    created_at: 1001,
+                    message: Message::user("вопрос"),
+                }],
+            }),
+            &mut state,
+        );
+        assert!(state.chats[0].history_loaded);
+
+        handle_branch_activated("chat-1".to_string(), Ok("b2".to_string()), &mut state, &channel());
+
+        assert!(
+            !state.chats[0].history_loaded,
+            "переключение ветки должно потребовать повторной загрузки истории"
+        );
     }
 }
