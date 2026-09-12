@@ -246,6 +246,21 @@ pub struct ChatSettings {
     /// операторский лимит сервиса по умолчанию.
     #[serde(default)]
     pub max_context_tokens: Option<u32>,
+    /// Включает или выключает компактизацию истории на сервисе `agentd` для
+    /// этого чата. `None` — операторское умолчание сервиса
+    /// (`AGENTD_SUMMARY_ENABLED`).
+    #[serde(default)]
+    pub summary_enabled: Option<bool>,
+    /// Сколько последних сообщений чата уходят провайдеру дословно при
+    /// компактизации. `None` — операторское умолчание сервиса
+    /// (`AGENTD_SUMMARY_KEEP_MESSAGES`).
+    #[serde(default)]
+    pub summary_keep_messages: Option<u32>,
+    /// Шаг, с которым сервис перестраивает пересказ (в вытесненных
+    /// сообщениях). `None` — операторское умолчание сервиса
+    /// (`AGENTD_SUMMARY_STEP_MESSAGES`).
+    #[serde(default)]
+    pub summary_step_messages: Option<u32>,
 }
 
 impl ChatSettings {
@@ -306,6 +321,12 @@ pub struct Config {
     /// (`default_chat_settings`). Изменение этого поля не влияет на уже
     /// созданные чаты — как и `Config.model`.
     pub max_context_tokens: Option<u32>,
+    /// Умолчания компактизации для НОВЫХ чатов, по тому же правилу, что и
+    /// `max_context_tokens`: копируются в `ChatSettings.summary_*` при
+    /// создании чата и не влияют на уже созданные чаты.
+    pub summary_enabled: Option<bool>,
+    pub summary_keep_messages: Option<u32>,
+    pub summary_step_messages: Option<u32>,
 }
 
 impl Config {
@@ -368,6 +389,9 @@ impl Config {
             thinking: self.thinking,
             experts: self.experts.clone(),
             max_context_tokens: self.max_context_tokens,
+            summary_enabled: self.summary_enabled,
+            summary_keep_messages: self.summary_keep_messages,
+            summary_step_messages: self.summary_step_messages,
         }
     }
 
@@ -491,6 +515,14 @@ client_token = "t"
     }
 
     #[test]
+    fn old_chat_settings_without_summary_fields_parse_as_none() {
+        let settings: ChatSettings = serde_json::from_str("{}").expect("настройки чата");
+        assert_eq!(settings.summary_enabled, None);
+        assert_eq!(settings.summary_keep_messages, None);
+        assert_eq!(settings.summary_step_messages, None);
+    }
+
+    #[test]
     fn new_chat_inherits_default_context_limit_from_config() {
         let config = Config {
             max_context_tokens: Some(4000),
@@ -509,6 +541,31 @@ client_token = "t"
         let chat = config.default_chat_settings();
         config.max_context_tokens = Some(8000);
         assert_eq!(chat.max_context_tokens, Some(4000));
+    }
+
+    #[test]
+    fn new_chat_inherits_summary_defaults_from_config() {
+        let config = Config {
+            summary_enabled: Some(true),
+            summary_keep_messages: Some(20),
+            summary_step_messages: Some(10),
+            ..Config::default()
+        };
+        let chat = config.default_chat_settings();
+        assert_eq!(chat.summary_enabled, Some(true));
+        assert_eq!(chat.summary_keep_messages, Some(20));
+        assert_eq!(chat.summary_step_messages, Some(10));
+    }
+
+    #[test]
+    fn changing_config_summary_defaults_does_not_affect_already_built_chat_settings() {
+        let mut config = Config {
+            summary_keep_messages: Some(20),
+            ..Config::default()
+        };
+        let chat = config.default_chat_settings();
+        config.summary_keep_messages = Some(40);
+        assert_eq!(chat.summary_keep_messages, Some(20));
     }
 
     #[test]

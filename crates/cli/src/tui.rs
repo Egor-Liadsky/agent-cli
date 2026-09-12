@@ -88,6 +88,9 @@ enum FormatField {
     ClientToken,
     OllamaUrl,
     ContextLimit,
+    SummaryEnabled,
+    SummaryKeepMessages,
+    SummaryStepMessages,
     Mode,
     Reasoning,
     Thinking,
@@ -138,6 +141,9 @@ impl SettingsSection {
                 FormatField::ClientToken,
                 FormatField::OllamaUrl,
                 FormatField::ContextLimit,
+                FormatField::SummaryEnabled,
+                FormatField::SummaryKeepMessages,
+                FormatField::SummaryStepMessages,
             ],
             SettingsSection::Format => &[
                 FormatField::Mode,
@@ -239,6 +245,9 @@ impl FormatField {
             FormatField::ClientToken => "Токен сервиса (общий для всех чатов)",
             FormatField::OllamaUrl => "Адрес Ollama (общий для всех чатов)",
             FormatField::ContextLimit => "Лимит контекста (токены, только для этого чата)",
+            FormatField::SummaryEnabled => "Компактизация истории (◀/▶ или Space — переключить)",
+            FormatField::SummaryKeepMessages => "Дословный хвост компактизации (сообщений)",
+            FormatField::SummaryStepMessages => "Шаг пересказа (сообщений)",
             FormatField::Mode => "Режим",
             FormatField::Reasoning => "Стратегия рассуждения",
             FormatField::Thinking => "Режим thinking у модели",
@@ -268,6 +277,7 @@ impl FormatField {
                 | FormatField::Reasoning
                 | FormatField::Thinking
                 | FormatField::Provider
+                | FormatField::SummaryEnabled
         )
     }
 
@@ -281,6 +291,9 @@ impl FormatField {
                 | FormatField::ClientToken
                 | FormatField::OllamaUrl
                 | FormatField::ContextLimit
+                | FormatField::SummaryEnabled
+                | FormatField::SummaryKeepMessages
+                | FormatField::SummaryStepMessages
         )
     }
 
@@ -315,6 +328,16 @@ struct SettingsEditor {
     /// Клиентский лимит контекста в токенах — настройка этого чата. Пусто —
     /// лимит не задан.
     context_limit: String,
+    /// Компактизация истории этого чата: "" — операторское умолчание
+    /// сервиса, "on"/"off" — явное включение/выключение
+    /// (specs/context-summary, «Настройки компактизации на уровне чата»).
+    summary_enabled: String,
+    /// Дословный хвост компактизации — настройка этого чата. Пусто —
+    /// операторское умолчание сервиса.
+    summary_keep_messages: String,
+    /// Шаг пересказа — настройка этого чата. Пусто — операторское умолчание
+    /// сервиса.
+    summary_step_messages: String,
     /// Облачные модели для переключения стрелками в поле «Модель».
     model_choices: Vec<String>,
     /// Локально скачанные модели Ollama, полученные с `/api/tags`.
@@ -371,6 +394,19 @@ impl SettingsEditor {
                 .max_context_tokens
                 .map(|v| v.to_string())
                 .unwrap_or_default(),
+            summary_enabled: match settings.summary_enabled {
+                None => String::new(),
+                Some(true) => "on".to_string(),
+                Some(false) => "off".to_string(),
+            },
+            summary_keep_messages: settings
+                .summary_keep_messages
+                .map(|v| v.to_string())
+                .unwrap_or_default(),
+            summary_step_messages: settings
+                .summary_step_messages
+                .map(|v| v.to_string())
+                .unwrap_or_default(),
             // приходит из AppState.model_choices: список сервиса, если фоновый
             // запрос уже ответил, иначе — встроенный/конфигурный список
             model_choices: model_choices.to_vec(),
@@ -419,9 +455,12 @@ impl SettingsEditor {
                 // состав экспертов имеет смысл только для своей стратегии
                 FormatField::Experts => self.reasoning == ReasoningMode::ExpertPanel,
                 // адрес и ключ облака не нужны локальным моделям, и наоборот
-                FormatField::ServerUrl | FormatField::ClientToken | FormatField::ContextLimit => {
-                    self.provider == Provider::Cloud
-                }
+                FormatField::ServerUrl
+                | FormatField::ClientToken
+                | FormatField::ContextLimit
+                | FormatField::SummaryEnabled
+                | FormatField::SummaryKeepMessages
+                | FormatField::SummaryStepMessages => self.provider == Provider::Cloud,
                 FormatField::OllamaUrl => self.provider == Provider::Ollama,
                 _ => true,
             })
@@ -520,6 +559,18 @@ impl SettingsEditor {
         self.thinking = modes[(current + delta).rem_euclid(len) as usize];
     }
 
+    /// Перебор трёх состояний компактизации: не задано → включена →
+    /// выключена → снова не задано.
+    fn cycle_summary_enabled(&mut self, delta: i32) {
+        const STATES: [&str; 3] = ["", "on", "off"];
+        let current = STATES
+            .iter()
+            .position(|s| *s == self.summary_enabled)
+            .unwrap_or(0) as i32;
+        let len = STATES.len() as i32;
+        self.summary_enabled = STATES[(current + delta).rem_euclid(len) as usize].to_string();
+    }
+
     /// Перебор известных моделей стрелками. Если в поле введено что-то своё,
     /// перебор начинается с первой модели списка.
     fn cycle_model(&mut self, delta: i32) {
@@ -543,6 +594,7 @@ impl SettingsEditor {
             Some(FormatField::Provider) => self.provider = Provider::default(),
             Some(FormatField::Reasoning) => self.reasoning = ReasoningMode::default(),
             Some(FormatField::Thinking) => self.thinking = ThinkingMode::default(),
+            Some(FormatField::SummaryEnabled) => self.summary_enabled.clear(),
             _ => {
                 if let Some(value) = self.field_value_mut() {
                     value.clear();
@@ -556,12 +608,15 @@ impl SettingsEditor {
             FormatField::Mode
             | FormatField::Reasoning
             | FormatField::Thinking
-            | FormatField::Provider => None,
+            | FormatField::Provider
+            | FormatField::SummaryEnabled => None,
             FormatField::Model => Some(&mut self.model),
             FormatField::ServerUrl => Some(&mut self.server_url),
             FormatField::ClientToken => Some(&mut self.client_token),
             FormatField::OllamaUrl => Some(&mut self.ollama_url),
             FormatField::ContextLimit => Some(&mut self.context_limit),
+            FormatField::SummaryKeepMessages => Some(&mut self.summary_keep_messages),
+            FormatField::SummaryStepMessages => Some(&mut self.summary_step_messages),
             FormatField::Experts => Some(&mut self.experts),
             FormatField::Description => Some(&mut self.description),
             FormatField::MaxLength => Some(&mut self.max_length),
@@ -669,6 +724,38 @@ impl SettingsEditor {
             return Err("Лимит контекста должен быть больше нуля".to_string());
         }
         Ok(Some(parsed))
+    }
+
+    fn build_summary_enabled(&self) -> Option<bool> {
+        match self.summary_enabled.as_str() {
+            "on" => Some(true),
+            "off" => Some(false),
+            _ => None,
+        }
+    }
+
+    /// Разобрать число сообщений компактизации: пусто — `None`, иначе
+    /// положительное целое (общее правило для хвоста и шага пересказа).
+    fn build_summary_count(value: &str, label: &str) -> Result<Option<u32>, String> {
+        if value.trim().is_empty() {
+            return Ok(None);
+        }
+        let parsed = value
+            .trim()
+            .parse::<u32>()
+            .map_err(|_| format!("{label} должен быть целым числом"))?;
+        if parsed == 0 {
+            return Err(format!("{label} должен быть больше нуля"));
+        }
+        Ok(Some(parsed))
+    }
+
+    fn build_summary_keep_messages(&self) -> Result<Option<u32>, String> {
+        Self::build_summary_count(&self.summary_keep_messages, "Дословный хвост компактизации")
+    }
+
+    fn build_summary_step_messages(&self) -> Result<Option<u32>, String> {
+        Self::build_summary_count(&self.summary_step_messages, "Шаг пересказа")
     }
 }
 
@@ -1180,8 +1267,33 @@ fn handle_settings_key(
                         .build_context_limit()
                         .map(|context_limit| (format, sampling, context_limit))
                 })
+                .and_then(|(format, sampling, context_limit)| {
+                    editor
+                        .build_summary_keep_messages()
+                        .map(|summary_keep_messages| {
+                            (format, sampling, context_limit, summary_keep_messages)
+                        })
+                })
+                .and_then(|(format, sampling, context_limit, summary_keep_messages)| {
+                    editor.build_summary_step_messages().map(|summary_step_messages| {
+                        (
+                            format,
+                            sampling,
+                            context_limit,
+                            summary_keep_messages,
+                            summary_step_messages,
+                        )
+                    })
+                })
             {
-                Ok((format, sampling, context_limit)) => {
+                Ok((
+                    format,
+                    sampling,
+                    context_limit,
+                    summary_keep_messages,
+                    summary_step_messages,
+                )) => {
+                    let summary_enabled = editor.build_summary_enabled();
                     let reasoning = editor.reasoning;
                     let thinking = editor.thinking;
                     // состав сохраняем всегда: при возврате к «Группе экспертов»
@@ -1206,6 +1318,9 @@ fn handle_settings_key(
                             thinking,
                             experts,
                             max_context_tokens: context_limit,
+                            summary_enabled,
+                            summary_keep_messages,
+                            summary_step_messages,
                         };
                         // Настройки чата хранит сервис: локально они
                         // применяются ответом на PATCH, а не сразу.
@@ -1300,6 +1415,18 @@ fn handle_settings_key(
                 && editor.current_field() == Some(FormatField::Mode) =>
         {
             editor.custom_mode = !editor.custom_mode;
+        }
+        KeyCode::Left
+            if editor.pane == SettingsPane::Fields
+                && editor.current_field() == Some(FormatField::SummaryEnabled) =>
+        {
+            editor.cycle_summary_enabled(-1);
+        }
+        KeyCode::Right | KeyCode::Char(' ')
+            if editor.pane == SettingsPane::Fields
+                && editor.current_field() == Some(FormatField::SummaryEnabled) =>
+        {
+            editor.cycle_summary_enabled(1);
         }
         KeyCode::Left => {
             // из полей — обратно к списку разделов
@@ -2837,6 +2964,9 @@ fn empty_field_hint(field: FormatField, editor: &SettingsEditor) -> String {
         FormatField::ContextLimit => {
             "не задан — действует операторский лимит сервиса".to_string()
         }
+        FormatField::SummaryKeepMessages | FormatField::SummaryStepMessages => {
+            "не задано — действует операторское умолчание сервиса".to_string()
+        }
         _ => "не задано — используется значение модели".to_string(),
     }
 }
@@ -2881,6 +3011,13 @@ fn render_settings_fields(f: &mut Frame, editor: &SettingsEditor, area: Rect) {
             FormatField::ClientToken => mask_secret(&editor.client_token),
             FormatField::OllamaUrl => editor.ollama_url.clone(),
             FormatField::ContextLimit => editor.context_limit.clone(),
+            FormatField::SummaryEnabled => match editor.summary_enabled.as_str() {
+                "on" => "Включена (◀/▶ или Space — переключить)".to_string(),
+                "off" => "Выключена (◀/▶ или Space — переключить)".to_string(),
+                _ => "Умолчание сервиса (◀/▶ или Space — переключить)".to_string(),
+            },
+            FormatField::SummaryKeepMessages => editor.summary_keep_messages.clone(),
+            FormatField::SummaryStepMessages => editor.summary_step_messages.clone(),
             FormatField::Mode => {
                 if editor.custom_mode {
                     "Кастомный (◀/▶ или Space — переключить)".to_string()
@@ -3087,6 +3224,31 @@ mod tests {
         assert!(state.panes.is_empty());
         assert!(state.active_chat_id().is_none());
         assert!(state.blocked_reason().is_none());
+    }
+
+    // --- 3.3 Обратный разбор лимита контекста в экран настроек ---
+
+    #[test]
+    fn settings_editor_shows_context_limit_from_chat_settings() {
+        // Ответ о чате с settings.max_context_tokens разбирается ChatSession
+        // напрямую (agentcore::config::ChatSettings::deserialize), а экран
+        // настроек чата показывает это значение в поле лимита
+        // (specs/chat-context-limit, «Лимит показывается в настройках
+        // чата»).
+        let settings = ChatSettings {
+            max_context_tokens: Some(4000),
+            ..ChatSettings::default()
+        };
+        let session = ChatSession {
+            id: "chat-1".to_string(),
+            title: "Чат".to_string(),
+            messages: Vec::new(),
+            updated_at: 0,
+            settings,
+            history_loaded: true,
+        };
+        let editor = SettingsEditor::from_chat(&session, &Config::default(), &[], &[]);
+        assert_eq!(editor.context_limit, "4000");
     }
 
     // --- 4.2 Отказ загрузки виден и объясним ---

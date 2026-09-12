@@ -145,8 +145,23 @@ struct ChatSettingsPayload {
     frequency_penalty: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     presence_penalty: Option<f32>,
+    /// Разовое переопределение поверх сохранённого лимита чата: незаданное
+    /// поле опускается намеренно, чтобы не снимать лимит, сохранённый на
+    /// сервисе. Асимметрия с `ChatSettingsUpdate` в `chats.rs`, где то же
+    /// поле отправляется всегда, включая `null`, — часть контракта, а не
+    /// случайность (specs/chat-context-limit, «Отправка лимита клиентом»).
     #[serde(skip_serializing_if = "Option::is_none")]
     max_context_tokens: Option<u32>,
+    /// Разовое переопределение поверх сохранённых настроек компактизации
+    /// чата, той же семантикой присутствия поля, что и у
+    /// `max_context_tokens` (specs/context-summary, «Настройки компактизации
+    /// на уровне чата»).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    summary_enabled: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    summary_keep_messages: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    summary_step_messages: Option<u32>,
 }
 
 #[derive(Serialize)]
@@ -325,6 +340,9 @@ impl ServerAgent {
                 frequency_penalty: sampling.frequency_penalty,
                 presence_penalty: sampling.presence_penalty,
                 max_context_tokens: settings.max_context_tokens,
+                summary_enabled: settings.summary_enabled,
+                summary_keep_messages: settings.summary_keep_messages,
+                summary_step_messages: settings.summary_step_messages,
             },
         }
     }

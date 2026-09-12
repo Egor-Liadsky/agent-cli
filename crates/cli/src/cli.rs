@@ -99,6 +99,12 @@ pub enum ConfigAction {
         #[command(subcommand)]
         action: ContextLimitAction,
     },
+    /// Умолчания компактизации истории (agentd) для НОВЫХ чатов; настройки
+    /// уже созданного чата меняются в TUI (Ctrl+P)
+    Summary {
+        #[command(subcommand)]
+        action: SummaryAction,
+    },
 }
 
 #[derive(Subcommand)]
@@ -111,6 +117,26 @@ pub enum ContextLimitAction {
     /// Снять умолчание: новые чаты создаются без лимита
     Clear,
     /// Показать текущее умолчание для новых чатов
+    Show,
+}
+
+#[derive(Subcommand)]
+pub enum SummaryAction {
+    /// Включить или выключить компактизацию по умолчанию для новых чатов
+    Set {
+        /// true/false, on/off, yes/no
+        enabled: Option<String>,
+        /// Дословный хвост компактизации (сообщений)
+        #[arg(long = "keep-messages")]
+        keep_messages: Option<u32>,
+        /// Шаг пересказа (сообщений)
+        #[arg(long = "step-messages")]
+        step_messages: Option<u32>,
+    },
+    /// Снять все умолчания компактизации: новые чаты используют
+    /// операторские значения сервиса
+    Clear,
+    /// Показать текущие умолчания для новых чатов
     Show,
 }
 

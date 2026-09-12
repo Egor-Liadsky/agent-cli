@@ -272,6 +272,11 @@ async fn request_body_has_no_api_key_and_carries_history() {
     assert_eq!(body["settings"]["temperature"], 0.4);
     assert_eq!(body["settings"]["response_format"]["max_length"], 500);
     assert_eq!(body["settings"]["reasoning"], "step-by-step");
+    // Асимметрия с ChatSettingsUpdate (chats.rs) намеренная: POST /v1/chat
+    // опускает незаданный лимит, чтобы не снять сохранённый на сервисе,
+    // а POST /v1/chats и PATCH /v1/chats/{id} шлют его всегда, включая null
+    // (specs/chat-context-limit, «Отправка лимита клиентом»;
+    // chats/tests.rs::update_sends_max_context_tokens_as_null_when_absent_and_number_when_set).
     assert!(
         body["settings"].get("max_context_tokens").is_none(),
         "лимит не задан — поле не отправляется: {body}"
@@ -306,6 +311,39 @@ async fn max_context_tokens_is_sent_in_ask_in_chat_when_configured() {
     let requests = server.received_requests().await.expect("запросы");
     let body: serde_json::Value = serde_json::from_slice(&requests[0].body).expect("тело запроса");
     assert_eq!(body["settings"]["max_context_tokens"], 4000);
+}
+
+#[tokio::test]
+async fn summary_settings_are_omitted_when_not_configured_and_sent_when_set() {
+    let server = MockServer::start().await;
+    mount_chat(&server, 200, success_body()).await;
+
+    agent(&server, "token")
+        .ask(&history(), &cloud_settings())
+        .await
+        .expect("ответ сервиса");
+    let requests = server.received_requests().await.expect("запросы");
+    let body: serde_json::Value = serde_json::from_slice(&requests[0].body).expect("тело запроса");
+    assert!(body["settings"].get("summary_enabled").is_none());
+    assert!(body["settings"].get("summary_keep_messages").is_none());
+    assert!(body["settings"].get("summary_step_messages").is_none());
+
+    let settings = ChatSettings {
+        summary_enabled: Some(true),
+        summary_keep_messages: Some(20),
+        summary_step_messages: Some(10),
+        ..cloud_settings()
+    };
+    agent(&server, "token")
+        .ask(&history(), &settings)
+        .await
+        .expect("ответ сервиса");
+    let requests = server.received_requests().await.expect("запросы");
+    let body: serde_json::Value =
+        serde_json::from_slice(&requests[1].body).expect("тело запроса");
+    assert_eq!(body["settings"]["summary_enabled"], true);
+    assert_eq!(body["settings"]["summary_keep_messages"], 20);
+    assert_eq!(body["settings"]["summary_step_messages"], 10);
 }
 
 #[tokio::test]

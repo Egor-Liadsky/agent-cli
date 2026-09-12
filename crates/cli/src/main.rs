@@ -10,7 +10,10 @@ use agent::CliAgent;
 use agentcore::agent::{Agent, AgentReply, Message, MessageMeta};
 use anyhow::Context;
 use clap::Parser;
-use cli::{Cli, Commands, ConfigAction, ContextLimitAction, FormatAction, OllamaAction, SamplingAction};
+use cli::{
+    Cli, Commands, ConfigAction, ContextLimitAction, FormatAction, OllamaAction, SamplingAction,
+    SummaryAction,
+};
 use agentcore::config::{Config, Provider, ReasoningMode, ThinkingMode};
 use console::style;
 use indicatif::{ProgressBar, ProgressStyle};
@@ -124,6 +127,7 @@ fn run_config(action: ConfigAction) -> anyhow::Result<()> {
             thinking,
         } => run_reasoning_action(mode, experts, thinking)?,
         ConfigAction::ContextLimit { action } => run_context_limit_action(action)?,
+        ConfigAction::Summary { action } => run_summary_action(action)?,
     }
     Ok(())
 }
@@ -174,6 +178,100 @@ fn print_context_limit(config: &Config) {
             .max_context_tokens
             .map(|v| v.to_string())
             .unwrap_or_else(|| "<не задан>".to_string())
+    );
+}
+
+fn run_summary_action(action: SummaryAction) -> anyhow::Result<()> {
+    match action {
+        SummaryAction::Set {
+            enabled,
+            keep_messages,
+            step_messages,
+        } => {
+            if enabled.is_none() && keep_messages.is_none() && step_messages.is_none() {
+                anyhow::bail!(
+                    "укажите хотя бы одно значение: enabled, --keep-messages или --step-messages"
+                );
+            }
+            if keep_messages == Some(0) {
+                anyhow::bail!("--keep-messages должен быть больше нуля");
+            }
+            if step_messages == Some(0) {
+                anyhow::bail!("--step-messages должен быть больше нуля");
+            }
+            let mut config = load_config()?;
+            if let Some(enabled) = enabled {
+                config.summary_enabled = Some(parse_bool_flag(&enabled)?);
+            }
+            if keep_messages.is_some() {
+                config.summary_keep_messages = keep_messages;
+            }
+            if step_messages.is_some() {
+                config.summary_step_messages = step_messages;
+            }
+            config.save()?;
+            println!(
+                "{}",
+                style("Умолчания компактизации для новых чатов сохранены.")
+                    .green()
+                    .bold()
+            );
+            print_summary(&config);
+        }
+        SummaryAction::Clear => {
+            let mut config = load_config()?;
+            config.summary_enabled = None;
+            config.summary_keep_messages = None;
+            config.summary_step_messages = None;
+            config.save()?;
+            println!(
+                "{}",
+                style("Умолчания компактизации для новых чатов сняты.")
+                    .green()
+                    .bold()
+            );
+        }
+        SummaryAction::Show => {
+            let config = load_config()?;
+            print_summary(&config);
+        }
+    }
+    Ok(())
+}
+
+fn parse_bool_flag(value: &str) -> anyhow::Result<bool> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Ok(true),
+        "0" | "false" | "no" | "off" => Ok(false),
+        other => anyhow::bail!("enabled должен быть true/false (или on/off, yes/no), задано: {other}"),
+    }
+}
+
+fn print_summary(config: &Config) {
+    println!(
+        "{} {}",
+        style("компактизация истории для новых чатов:").cyan().bold(),
+        match config.summary_enabled {
+            None => "<умолчание сервиса>".to_string(),
+            Some(true) => "включена".to_string(),
+            Some(false) => "выключена".to_string(),
+        }
+    );
+    println!(
+        "{} {}",
+        style("дословный хвост компактизации (сообщений):").cyan().bold(),
+        config
+            .summary_keep_messages
+            .map(|v| v.to_string())
+            .unwrap_or_else(|| "<умолчание сервиса>".to_string())
+    );
+    println!(
+        "{} {}",
+        style("шаг пересказа (сообщений):").cyan().bold(),
+        config
+            .summary_step_messages
+            .map(|v| v.to_string())
+            .unwrap_or_else(|| "<умолчание сервиса>".to_string())
     );
 }
 
@@ -295,6 +393,7 @@ fn show_config() -> anyhow::Result<()> {
     print_response_format(&config.response_format);
     print_sampling_params(&config.sampling);
     print_context_limit(&config);
+    print_summary(&config);
     Ok(())
 }
 

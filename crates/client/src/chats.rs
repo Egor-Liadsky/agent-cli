@@ -293,10 +293,20 @@ fn settings_payload(settings: &ChatSettings) -> serde_json::Value {
         frequency_penalty: sampling.frequency_penalty,
         presence_penalty: sampling.presence_penalty,
         max_context_tokens: settings.max_context_tokens,
+        summary_enabled: settings.summary_enabled,
+        summary_keep_messages: settings.summary_keep_messages,
+        summary_step_messages: settings.summary_step_messages,
     };
     serde_json::to_value(payload).unwrap_or(serde_json::Value::Null)
 }
 
+/// Тело `POST /v1/chats` и `PATCH /v1/chats/{id}`: экран настроек чата
+/// присылает своё состояние целиком, поэтому поля без `skip_serializing_if`
+/// (кроме `model` и `response_format`, у которых есть собственное правило
+/// «не задано») отправляются всегда, включая `null` — в отличие от разового
+/// вызова `POST /v1/chat` (`ChatPayload` выше), где отсутствие поля обязано
+/// оставлять сохранённый лимит и настройки компактизации чата нетронутыми
+/// (specs/chat-context-limit, «Отправка лимита клиентом»).
 #[derive(Serialize)]
 struct ChatSettingsUpdate {
     provider: &'static str,
@@ -314,6 +324,9 @@ struct ChatSettingsUpdate {
     frequency_penalty: Option<f32>,
     presence_penalty: Option<f32>,
     max_context_tokens: Option<u32>,
+    summary_enabled: Option<bool>,
+    summary_keep_messages: Option<u32>,
+    summary_step_messages: Option<u32>,
 }
 
 #[derive(Serialize)]

@@ -195,6 +195,9 @@ fn settings_with(provider: Provider, model: &str) -> ChatSettings {
             ..SamplingParams::default()
         },
         max_context_tokens: None,
+        summary_enabled: None,
+        summary_keep_messages: None,
+        summary_step_messages: None,
     }
 }
 
@@ -311,6 +314,45 @@ async fn update_sends_max_context_tokens_as_null_when_absent_and_number_when_set
         bodies[0]
     );
     assert_eq!(bodies[1]["settings"]["max_context_tokens"], 4000);
+}
+
+#[tokio::test]
+async fn update_sends_summary_settings_as_null_when_absent_and_values_when_set() {
+    // Та же семантика присутствия поля, что и у max_context_tokens
+    // (specs/context-summary, «Настройки компактизации на уровне чата»).
+    let server = MockServer::start().await;
+    Mock::given(method("PATCH"))
+        .and(path("/v1/chats/chat-1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(chat_body("chat-1", "Чат")))
+        .mount(&server)
+        .await;
+
+    let client = chats(&server, "token-a");
+    client
+        .update("chat-1", None, Some(&ChatSettings::default()))
+        .await
+        .expect("сброс настроек компактизации");
+    client
+        .update(
+            "chat-1",
+            None,
+            Some(&ChatSettings {
+                summary_enabled: Some(true),
+                summary_keep_messages: Some(20),
+                summary_step_messages: Some(10),
+                ..ChatSettings::default()
+            }),
+        )
+        .await
+        .expect("установка настроек компактизации");
+
+    let bodies = received_bodies(&server).await;
+    assert!(bodies[0]["settings"]["summary_enabled"].is_null());
+    assert!(bodies[0]["settings"]["summary_keep_messages"].is_null());
+    assert!(bodies[0]["settings"]["summary_step_messages"].is_null());
+    assert_eq!(bodies[1]["settings"]["summary_enabled"], true);
+    assert_eq!(bodies[1]["settings"]["summary_keep_messages"], 20);
+    assert_eq!(bodies[1]["settings"]["summary_step_messages"], 10);
 }
 
 #[tokio::test]
