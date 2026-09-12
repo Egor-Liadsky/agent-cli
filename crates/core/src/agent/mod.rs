@@ -100,6 +100,10 @@ pub struct AgentReply {
     pub model: Option<String>,
     /// Результаты стадий конвейера, если ответ пришёл через сервис.
     pub policy: Option<crate::pipeline::PolicyLog>,
+    /// Что стратегия контекста сделала при сборке истории, если ответ пришёл
+    /// через сервис с чатом (`chat_id`). `None` — разовый вызов без чата или
+    /// ответ от локальной модели, которую стратегии контекста не касаются.
+    pub context: Option<crate::config::ContextObservability>,
 }
 
 pub fn now_secs() -> i64 {

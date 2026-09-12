@@ -7,7 +7,7 @@
 use agentcore::agent::{
     transport_error, Agent, AgentError, AgentReply, Message, MessageMeta, Role,
 };
-use agentcore::config::{ChatSettings, ReasoningMode, ThinkingMode};
+use agentcore::config::{ChatSettings, ContextStrategy, ReasoningMode, ThinkingMode};
 use agentcore::pipeline::PolicyLog;
 use agentcore::logging::{
     request_id, unix_timestamp, ExchangeLog, RequestLogEntry, ResponseLogEntry,
@@ -162,6 +162,14 @@ struct ChatSettingsPayload {
     summary_keep_messages: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     summary_step_messages: Option<u32>,
+    /// Разовое переопределение стратегии контекста для этого запроса:
+    /// незаданное поле опускается, и действует стратегия, сохранённая в
+    /// чате (specs/context-strategies, «Разовое переопределение стратегии в
+    /// запросе»).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    context_strategy: Option<ContextStrategy>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    context_window_messages: Option<u32>,
 }
 
 #[derive(Serialize)]
@@ -192,6 +200,45 @@ struct ChatResponse {
     /// Результаты стадий конвейера сервиса.
     #[serde(default)]
     policy: Option<PolicyLog>,
+    /// Что сделала стратегия контекста при сборке истории. `null` — запрос
+    /// без чата, компактизации/стратегии не подлежит.
+    #[serde(default)]
+    context: Option<ContextPayload>,
+}
+
+/// Блок наблюдаемости `context` ответа `POST /v1/chat`. Поля, не имеющие
+/// смысла для действующей стратегии, сервис не отправляет — здесь это
+/// выражено через `Option`, а не через ноль/`false`.
+#[derive(Deserialize, Default)]
+struct ContextPayload {
+    #[serde(default)]
+    strategy: Option<ContextStrategy>,
+    #[serde(default)]
+    sent_messages: Option<u32>,
+    #[serde(default)]
+    dropped_messages: Option<u32>,
+    #[serde(default)]
+    summary_built: Option<bool>,
+    #[serde(default)]
+    facts_applied: Option<u32>,
+    #[serde(default)]
+    facts_updated: Option<bool>,
+    #[serde(default)]
+    branch_id: Option<String>,
+}
+
+impl From<ContextPayload> for agentcore::config::ContextObservability {
+    fn from(payload: ContextPayload) -> Self {
+        Self {
+            strategy: payload.strategy,
+            sent_messages: payload.sent_messages,
+            dropped_messages: payload.dropped_messages,
+            summary_built: payload.summary_built,
+            facts_applied: payload.facts_applied,
+            facts_updated: payload.facts_updated,
+            branch_id: payload.branch_id,
+        }
+    }
 }
 
 #[derive(Deserialize, Default)]
@@ -343,6 +390,8 @@ impl ServerAgent {
                 summary_enabled: settings.summary_enabled,
                 summary_keep_messages: settings.summary_keep_messages,
                 summary_step_messages: settings.summary_step_messages,
+                context_strategy: settings.context_strategy,
+                context_window_messages: settings.context_window_messages,
             },
         }
     }
@@ -455,6 +504,7 @@ impl ServerAgent {
             meta,
             model: parsed.model.filter(|m| !m.trim().is_empty()),
             policy: parsed.policy,
+            context: parsed.context.map(Into::into),
         })
     }
 }

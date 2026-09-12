@@ -324,6 +324,7 @@ fn extract_answer(body: &str, mut meta: MessageMeta) -> Result<AgentReply> {
         meta,
         model,
         policy: None,
+        context: None,
     })
 }
 

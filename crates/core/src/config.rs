@@ -213,6 +213,89 @@ impl ReasoningMode {
     }
 }
 
+/// Стратегия управления контекстом чата на сервисе `agentd`: какой набор
+/// сообщений уходит провайдеру при каждом запросе.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ContextStrategy {
+    /// Компактизация пересказом (существующее поведение).
+    Summary,
+    /// Только последние N сообщений, без пересказа отброшенного.
+    SlidingWindow,
+    /// Устойчивые факты «ключ-значение» плюс хвост истории.
+    Facts,
+    /// Ветвление диалога: история собирается по цепочке активной ветки.
+    Branching,
+}
+
+impl ContextStrategy {
+    pub const ALL: [ContextStrategy; 4] = [
+        ContextStrategy::Summary,
+        ContextStrategy::SlidingWindow,
+        ContextStrategy::Facts,
+        ContextStrategy::Branching,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            ContextStrategy::Summary => "Пересказ (summary)",
+            ContextStrategy::SlidingWindow => "Окно последних сообщений",
+            ContextStrategy::Facts => "Устойчивые факты",
+            ContextStrategy::Branching => "Ветвление диалога",
+        }
+    }
+
+    /// Имя, которое сервис `agentd` принимает в JSON (`snake_case`).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ContextStrategy::Summary => "summary",
+            ContextStrategy::SlidingWindow => "sliding_window",
+            ContextStrategy::Facts => "facts",
+            ContextStrategy::Branching => "branching",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<ContextStrategy> {
+        match value.trim().to_ascii_lowercase().replace('-', "_").as_str() {
+            "summary" => Some(ContextStrategy::Summary),
+            "sliding_window" => Some(ContextStrategy::SlidingWindow),
+            "facts" => Some(ContextStrategy::Facts),
+            "branching" => Some(ContextStrategy::Branching),
+            _ => None,
+        }
+    }
+}
+
+/// Что действующая стратегия контекста сделала при сборке истории для этого
+/// запроса. Поля, не имеющие смысла для стратегии, отсутствуют — а не несут
+/// ноль или `false`.
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq)]
+pub struct ContextObservability {
+    /// Стратегия, действовавшая на этом запросе. Отсутствует у ответов
+    /// сервисов без выбора стратегии (совместимость со старым контрактом).
+    #[serde(default)]
+    pub strategy: Option<ContextStrategy>,
+    /// Сколько сообщений отправлено провайдеру.
+    #[serde(default)]
+    pub sent_messages: Option<u32>,
+    /// Сколько сохранённых сообщений отброшено стратегией (`sliding_window`,
+    /// `facts`).
+    #[serde(default)]
+    pub dropped_messages: Option<u32>,
+    /// Строился ли новый пересказ на этом запросе (стратегия `summary`).
+    #[serde(default)]
+    pub summary_built: Option<bool>,
+    /// Сколько фактов подставлено в запрос (стратегия `facts`).
+    #[serde(default)]
+    pub facts_applied: Option<u32>,
+    /// Обновились ли факты после ответа (стратегия `facts`).
+    #[serde(default)]
+    pub facts_updated: Option<bool>,
+    /// Ветка, из которой собрана история (стратегия `branching`).
+    #[serde(default)]
+    pub branch_id: Option<String>,
+}
+
 /// Параметры агента, привязанные к конкретному чату.
 #[derive(Serialize, Deserialize, Default, Debug, Clone)]
 pub struct ChatSettings {
@@ -261,6 +344,15 @@ pub struct ChatSettings {
     /// (`AGENTD_SUMMARY_STEP_MESSAGES`).
     #[serde(default)]
     pub summary_step_messages: Option<u32>,
+    /// Стратегия управления контекстом этого чата. `None` — операторское
+    /// умолчание сервиса (`AGENTD_CONTEXT_STRATEGY`).
+    #[serde(default)]
+    pub context_strategy: Option<ContextStrategy>,
+    /// Размер окна последних сообщений для стратегий `sliding_window` и
+    /// `facts`. `None` — операторское умолчание сервиса
+    /// (`AGENTD_CONTEXT_WINDOW_MESSAGES`).
+    #[serde(default)]
+    pub context_window_messages: Option<u32>,
 }
 
 impl ChatSettings {
@@ -327,6 +419,12 @@ pub struct Config {
     pub summary_enabled: Option<bool>,
     pub summary_keep_messages: Option<u32>,
     pub summary_step_messages: Option<u32>,
+    /// Умолчание стратегии контекста для НОВЫХ чатов, по тому же правилу,
+    /// что и `max_context_tokens`.
+    #[serde(default)]
+    pub context_strategy: Option<ContextStrategy>,
+    #[serde(default)]
+    pub context_window_messages: Option<u32>,
 }
 
 impl Config {
@@ -392,6 +490,8 @@ impl Config {
             summary_enabled: self.summary_enabled,
             summary_keep_messages: self.summary_keep_messages,
             summary_step_messages: self.summary_step_messages,
+            context_strategy: self.context_strategy,
+            context_window_messages: self.context_window_messages,
         }
     }
 
@@ -566,6 +666,58 @@ client_token = "t"
         let chat = config.default_chat_settings();
         config.summary_keep_messages = Some(40);
         assert_eq!(chat.summary_keep_messages, Some(20));
+    }
+
+    #[test]
+    fn old_chat_settings_without_context_strategy_fields_parse_as_none() {
+        let settings: ChatSettings = serde_json::from_str("{}").expect("настройки чата");
+        assert_eq!(settings.context_strategy, None);
+        assert_eq!(settings.context_window_messages, None);
+    }
+
+    #[test]
+    fn old_config_without_context_strategy_fields_parses_as_none() {
+        let content = r#"
+server_url = "http://127.0.0.1:9000"
+"#;
+        let (config, _legacy) = Config::parse_with_legacy_fields(content).expect("конфиг");
+        assert_eq!(config.context_strategy, None);
+        assert_eq!(config.context_window_messages, None);
+    }
+
+    #[test]
+    fn context_strategy_round_trips_snake_case_json() {
+        let settings = ChatSettings {
+            context_strategy: Some(ContextStrategy::SlidingWindow),
+            ..ChatSettings::default()
+        };
+        let json = serde_json::to_string(&settings).expect("сериализация");
+        assert!(json.contains("\"sliding_window\""));
+        let parsed: ChatSettings = serde_json::from_str(&json).expect("разбор");
+        assert_eq!(parsed.context_strategy, Some(ContextStrategy::SlidingWindow));
+    }
+
+    #[test]
+    fn new_chat_inherits_context_strategy_defaults_from_config() {
+        let config = Config {
+            context_strategy: Some(ContextStrategy::Facts),
+            context_window_messages: Some(8),
+            ..Config::default()
+        };
+        let chat = config.default_chat_settings();
+        assert_eq!(chat.context_strategy, Some(ContextStrategy::Facts));
+        assert_eq!(chat.context_window_messages, Some(8));
+    }
+
+    #[test]
+    fn changing_config_context_strategy_default_does_not_affect_already_built_chat_settings() {
+        let mut config = Config {
+            context_strategy: Some(ContextStrategy::Facts),
+            ..Config::default()
+        };
+        let chat = config.default_chat_settings();
+        config.context_strategy = Some(ContextStrategy::Branching);
+        assert_eq!(chat.context_strategy, Some(ContextStrategy::Facts));
     }
 
     #[test]

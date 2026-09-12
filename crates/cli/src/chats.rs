@@ -174,6 +174,7 @@ mod tests {
 
         chat.apply_history(ChatHistory {
             chat: summary("Заголовок сервиса", 2),
+            branch_id: None,
             messages: vec![
                 StoredMessage {
                     seq: 1,

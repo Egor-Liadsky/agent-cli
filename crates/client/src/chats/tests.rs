@@ -198,6 +198,8 @@ fn settings_with(provider: Provider, model: &str) -> ChatSettings {
         summary_enabled: None,
         summary_keep_messages: None,
         summary_step_messages: None,
+        context_strategy: None,
+        context_window_messages: None,
     }
 }
 
@@ -353,6 +355,155 @@ async fn update_sends_summary_settings_as_null_when_absent_and_values_when_set()
     assert_eq!(bodies[1]["settings"]["summary_enabled"], true);
     assert_eq!(bodies[1]["settings"]["summary_keep_messages"], 20);
     assert_eq!(bodies[1]["settings"]["summary_step_messages"], 10);
+}
+
+#[tokio::test]
+async fn update_sends_context_strategy_as_null_when_absent_and_value_when_set() {
+    use agentcore::config::ContextStrategy;
+
+    let server = MockServer::start().await;
+    Mock::given(method("PATCH"))
+        .and(path("/v1/chats/chat-1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(chat_body("chat-1", "Чат")))
+        .mount(&server)
+        .await;
+
+    let client = chats(&server, "token-a");
+    client
+        .update("chat-1", None, Some(&ChatSettings::default()))
+        .await
+        .expect("сброс стратегии контекста");
+    client
+        .update(
+            "chat-1",
+            None,
+            Some(&ChatSettings {
+                context_strategy: Some(ContextStrategy::SlidingWindow),
+                context_window_messages: Some(6),
+                ..ChatSettings::default()
+            }),
+        )
+        .await
+        .expect("установка стратегии контекста");
+
+    let bodies = received_bodies(&server).await;
+    assert!(bodies[0]["settings"]["context_strategy"].is_null());
+    assert!(bodies[0]["settings"]["context_window_messages"].is_null());
+    assert_eq!(bodies[1]["settings"]["context_strategy"], "sliding_window");
+    assert_eq!(bodies[1]["settings"]["context_window_messages"], 6);
+}
+
+#[tokio::test]
+async fn facts_are_listed_set_and_deleted() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v1/chats/chat-1/facts"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "facts": [
+                { "key": "budget", "value": "200000", "updated_at": 1000, "through_seq": 3 }
+            ]
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("PUT"))
+        .and(path("/v1/chats/chat-1/facts/budget"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "key": "budget", "value": "300000", "updated_at": 2000, "through_seq": 3
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("DELETE"))
+        .and(path("/v1/chats/chat-1/facts/budget"))
+        .respond_with(ResponseTemplate::new(204))
+        .mount(&server)
+        .await;
+
+    let client = chats(&server, "token-a");
+    let facts = client.facts("chat-1").await.expect("список фактов");
+    assert_eq!(facts.len(), 1);
+    assert_eq!(facts[0].key, "budget");
+    assert_eq!(facts[0].value, "200000");
+
+    let updated = client
+        .set_fact("chat-1", "budget", "300000")
+        .await
+        .expect("правка факта");
+    assert_eq!(updated.value, "300000");
+
+    client
+        .delete_fact("chat-1", "budget")
+        .await
+        .expect("удаление факта");
+}
+
+#[tokio::test]
+async fn branches_are_listed_created_and_activated() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v1/chats/chat-1/branches"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "branches": [
+                {
+                    "id": "root", "name": "root", "parent_id": null,
+                    "fork_seq": null, "message_count": 5, "active": true
+                }
+            ]
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chats/chat-1/branches"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": "branch-2", "name": "альтернатива", "parent_id": "root",
+            "fork_seq": 3, "message_count": 0, "active": false
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chats/chat-1/branches/branch-2/activate"))
+        .respond_with(ResponseTemplate::new(204))
+        .mount(&server)
+        .await;
+
+    let client = chats(&server, "token-a");
+    let branches = client.branches("chat-1").await.expect("список веток");
+    assert_eq!(branches.len(), 1);
+    assert!(branches[0].active);
+
+    let created = client
+        .create_branch("chat-1", 3, "альтернатива")
+        .await
+        .expect("создание ветки");
+    assert_eq!(created.parent_id.as_deref(), Some("root"));
+    assert_eq!(created.fork_seq, Some(3));
+
+    client
+        .activate_branch("chat-1", "branch-2")
+        .await
+        .expect("активация ветки");
+}
+
+#[tokio::test]
+async fn load_branch_reports_which_branch_history_belongs_to() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v1/chats/chat-1"))
+        .and(query_param("branch", "branch-2"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": "chat-1", "title": "Чат",
+            "settings": { "provider": "cloud", "model": "model-a" },
+            "created_at": 1000, "updated_at": 2000, "message_count": 0,
+            "messages": [], "next_after": null, "branch_id": "branch-2"
+        })))
+        .mount(&server)
+        .await;
+
+    let client = chats(&server, "token-a");
+    let history = client
+        .load_branch("chat-1", Some("branch-2"))
+        .await
+        .expect("история неактивной ветки");
+    assert_eq!(history.branch_id.as_deref(), Some("branch-2"));
 }
 
 #[tokio::test]

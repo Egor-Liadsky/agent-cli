@@ -8,7 +8,7 @@
 
 use crate::{header_request_id, parse_service_error, ResponseFormatPayload};
 use agentcore::agent::{transport_error, AgentError, Message, MessageMeta, Role};
-use agentcore::config::{ChatSettings, Provider, ReasoningMode, ThinkingMode};
+use agentcore::config::{ChatSettings, ContextStrategy, Provider, ReasoningMode, ThinkingMode};
 use agentcore::logging::{request_id, unix_timestamp, ExchangeLog, RequestLogEntry, ResponseLogEntry};
 use anyhow::Result;
 use serde::de::DeserializeOwned;
@@ -46,6 +46,31 @@ pub struct StoredMessage {
 pub struct ChatHistory {
     pub chat: ChatSummary,
     pub messages: Vec<StoredMessage>,
+    /// Ветка, чья история возвращена. `None` — сервис без веток
+    /// (совместимость со старым контрактом).
+    pub branch_id: Option<String>,
+}
+
+/// Факт чата — пара «ключ-значение» стратегии `facts`.
+#[derive(Debug, Clone)]
+pub struct Fact {
+    pub key: String,
+    pub value: String,
+    pub updated_at: i64,
+    pub through_seq: i64,
+}
+
+/// Ветка чата стратегии `branching`.
+#[derive(Debug, Clone)]
+pub struct Branch {
+    pub id: String,
+    pub name: String,
+    pub parent_id: Option<String>,
+    /// Точка отделения — порядковый номер сообщения родителя. `None` — ветка
+    /// корневая.
+    pub fork_seq: Option<i64>,
+    pub message_count: i64,
+    pub active: bool,
 }
 
 pub struct ChatsClient {
@@ -183,17 +208,29 @@ impl ChatsClient {
     /// Чат вместе с историей целиком: сообщения дочитываются по `next_after`,
     /// потому что отправка реплики с неполной историей испортила бы контекст.
     pub async fn load(&self, id: &str) -> Result<ChatHistory> {
+        self.load_branch(id, None).await
+    }
+
+    /// История чата, необязательно с явным указанием ветки. `None` —
+    /// возвращается история активной ветки (specs/chat-branching, «Чтение
+    /// истории учитывает ветку»).
+    pub async fn load_branch(&self, id: &str, branch_id: Option<&str>) -> Result<ChatHistory> {
         let mut messages = Vec::new();
         let mut after: i64 = 0;
         let mut chat: Option<ChatSummary> = None;
+        let mut branch: Option<String>;
         loop {
+            let branch_query = branch_id
+                .map(|b| format!("&branch={b}"))
+                .unwrap_or_default();
             let url = self.url(&format!(
-                "/chats/{id}?limit={MESSAGES_PAGE_LIMIT}&after={after}"
+                "/chats/{id}?limit={MESSAGES_PAGE_LIMIT}&after={after}{branch_query}"
             ));
             let page: ChatHistoryPayload = self.send(reqwest::Method::GET, url, None).await?;
             // Поля чата одинаковы на всех страницах его сообщений, поэтому
             // берутся с первой.
-            chat.get_or_insert_with(|| ChatSummary::from(page.chat));
+            chat.get_or_insert_with(|| ChatSummary::from(page.chat.clone()));
+            branch = page.branch_id.clone();
             messages.extend(page.messages.into_iter().map(StoredMessage::from));
             match page.next_after {
                 Some(next) => after = next,
@@ -203,7 +240,78 @@ impl ChatsClient {
         Ok(ChatHistory {
             chat: chat.expect("страница чата разобрана хотя бы один раз"),
             messages,
+            branch_id: branch,
         })
+    }
+
+    /// Факты чата стратегии `facts` (specs/context-facts, «Факты читаются и
+    /// правятся вручную»).
+    pub async fn facts(&self, chat_id: &str) -> Result<Vec<Fact>> {
+        let payload: FactsPayload = self
+            .send(
+                reqwest::Method::GET,
+                self.url(&format!("/chats/{chat_id}/facts")),
+                None,
+            )
+            .await?;
+        Ok(payload.facts.into_iter().map(Fact::from).collect())
+    }
+
+    /// Установка значения факта по ключу: существующий ключ перезаписывается.
+    pub async fn set_fact(&self, chat_id: &str, key: &str, value: &str) -> Result<Fact> {
+        let payload: FactPayload = self
+            .send(
+                reqwest::Method::PUT,
+                self.url(&format!("/chats/{chat_id}/facts/{key}")),
+                Some(serde_json::json!({ "value": value })),
+            )
+            .await?;
+        Ok(Fact::from(payload))
+    }
+
+    pub async fn delete_fact(&self, chat_id: &str, key: &str) -> Result<()> {
+        self.send_raw(
+            reqwest::Method::DELETE,
+            self.url(&format!("/chats/{chat_id}/facts/{key}")),
+            None,
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// Ветки чата стратегии `branching` (specs/chat-branching, «Ветки
+    /// перечисляются и переключаются»).
+    pub async fn branches(&self, chat_id: &str) -> Result<Vec<Branch>> {
+        let payload: BranchesPayload = self
+            .send(
+                reqwest::Method::GET,
+                self.url(&format!("/chats/{chat_id}/branches")),
+                None,
+            )
+            .await?;
+        Ok(payload.branches.into_iter().map(Branch::from).collect())
+    }
+
+    /// Ветка от указанного сообщения — точки ветвления.
+    pub async fn create_branch(&self, chat_id: &str, from_seq: i64, name: &str) -> Result<Branch> {
+        let payload: BranchPayload = self
+            .send(
+                reqwest::Method::POST,
+                self.url(&format!("/chats/{chat_id}/branches")),
+                Some(serde_json::json!({ "from_seq": from_seq, "name": name })),
+            )
+            .await?;
+        Ok(Branch::from(payload))
+    }
+
+    pub async fn activate_branch(&self, chat_id: &str, branch_id: &str) -> Result<()> {
+        self.send_raw(
+            reqwest::Method::POST,
+            self.url(&format!("/chats/{chat_id}/branches/{branch_id}/activate")),
+            None,
+        )
+        .await?;
+        Ok(())
     }
 
     pub async fn create(&self, title: Option<&str>, settings: &ChatSettings) -> Result<ChatSummary> {
@@ -296,6 +404,8 @@ fn settings_payload(settings: &ChatSettings) -> serde_json::Value {
         summary_enabled: settings.summary_enabled,
         summary_keep_messages: settings.summary_keep_messages,
         summary_step_messages: settings.summary_step_messages,
+        context_strategy: settings.context_strategy,
+        context_window_messages: settings.context_window_messages,
     };
     serde_json::to_value(payload).unwrap_or(serde_json::Value::Null)
 }
@@ -327,6 +437,8 @@ struct ChatSettingsUpdate {
     summary_enabled: Option<bool>,
     summary_keep_messages: Option<u32>,
     summary_step_messages: Option<u32>,
+    context_strategy: Option<ContextStrategy>,
+    context_window_messages: Option<u32>,
 }
 
 #[derive(Serialize)]
@@ -419,7 +531,7 @@ struct TimingPayload {
     received_at: Option<i64>,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Clone)]
 struct ChatPayload {
     id: String,
     #[serde(default)]
@@ -465,6 +577,71 @@ struct ChatHistoryPayload {
     messages: Vec<MessagePayload>,
     #[serde(default)]
     next_after: Option<i64>,
+    /// Ветка, чья история отдана. `None` — сервис без веток.
+    #[serde(default)]
+    branch_id: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct FactsPayload {
+    #[serde(default)]
+    facts: Vec<FactPayload>,
+}
+
+#[derive(Deserialize)]
+struct FactPayload {
+    key: String,
+    #[serde(default)]
+    value: String,
+    #[serde(default)]
+    updated_at: i64,
+    #[serde(default)]
+    through_seq: i64,
+}
+
+impl From<FactPayload> for Fact {
+    fn from(payload: FactPayload) -> Self {
+        Self {
+            key: payload.key,
+            value: payload.value,
+            updated_at: payload.updated_at,
+            through_seq: payload.through_seq,
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct BranchesPayload {
+    #[serde(default)]
+    branches: Vec<BranchPayload>,
+}
+
+#[derive(Deserialize)]
+struct BranchPayload {
+    id: String,
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    parent_id: Option<String>,
+    #[serde(default)]
+    fork_seq: Option<i64>,
+    #[serde(default)]
+    message_count: i64,
+    #[serde(default)]
+    active: bool,
+}
+
+impl From<BranchPayload> for Branch {
+    fn from(payload: BranchPayload) -> Self {
+        Self {
+            id: payload.id,
+            name: payload.name,
+            parent_id: payload.parent_id,
+            fork_seq: payload.fork_seq,
+            message_count: payload.message_count,
+            active: payload.active,
+        }
+    }
 }
 
 #[derive(Deserialize)]

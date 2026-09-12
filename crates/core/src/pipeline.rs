@@ -433,6 +433,7 @@ mod tests {
                 meta: MessageMeta::default(),
                 model: None,
                 policy: None,
+                context: None,
             })
         }
     }

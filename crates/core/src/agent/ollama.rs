@@ -297,5 +297,6 @@ pub async fn chat(
         meta,
         model: Some(model.to_string()),
         policy: None,
+        context: None,
     })
 }

@@ -1,7 +1,7 @@
 //! Тесты `ServerAgent` против замоканного сервиса.
 
 use super::*;
-use agentcore::config::{Provider, ResponseFormat, SamplingParams};
+use agentcore::config::{ContextStrategy, Provider, ResponseFormat, SamplingParams};
 use serde_json::json;
 use wiremock::matchers::{body_json_schema, header, header_exists, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -102,6 +102,63 @@ async fn success_is_parsed_with_usage_and_timing() {
     assert_eq!(reply.meta.sent_at, Some(1000));
     assert_eq!(reply.meta.received_at, Some(1002));
     assert!(reply.policy.is_some(), "блок policy должен разбираться");
+}
+
+#[tokio::test]
+async fn context_block_is_parsed_with_only_meaningful_fields() {
+    let server = MockServer::start().await;
+    let mut body = success_body();
+    body["context"] = json!({
+        "strategy": "sliding_window",
+        "sent_messages": 6,
+        "dropped_messages": 14
+    });
+    mount_chat(&server, 200, body).await;
+
+    let reply = agent(&server, "token")
+        .ask(&history(), &cloud_settings())
+        .await
+        .expect("ответ сервиса");
+
+    let context = reply.context.expect("блок наблюдаемости стратегии");
+    assert_eq!(context.strategy, Some(ContextStrategy::SlidingWindow));
+    assert_eq!(context.sent_messages, Some(6));
+    assert_eq!(context.dropped_messages, Some(14));
+    // Поля чужой стратегии не заявлены сервисом и разбираются как None.
+    assert_eq!(context.facts_applied, None);
+    assert_eq!(context.branch_id, None);
+}
+
+#[tokio::test]
+async fn context_strategy_override_is_sent_only_when_set() {
+    let server = MockServer::start().await;
+    mount_chat(&server, 200, success_body()).await;
+
+    agent(&server, "token")
+        .ask(&history(), &cloud_settings())
+        .await
+        .expect("ответ сервиса без переопределения стратегии");
+    agent(&server, "token")
+        .ask(
+            &history(),
+            &ChatSettings {
+                context_strategy: Some(ContextStrategy::Facts),
+                context_window_messages: Some(6),
+                ..cloud_settings()
+            },
+        )
+        .await
+        .expect("ответ сервиса с переопределением стратегии");
+
+    let requests = server.received_requests().await.expect("запросы");
+    let bodies: Vec<serde_json::Value> = requests
+        .iter()
+        .map(|r| serde_json::from_slice(&r.body).unwrap_or(serde_json::Value::Null))
+        .collect();
+    assert!(bodies[0]["settings"]["context_strategy"].is_null());
+    assert!(bodies[0]["settings"]["context_window_messages"].is_null());
+    assert_eq!(bodies[1]["settings"]["context_strategy"], "facts");
+    assert_eq!(bodies[1]["settings"]["context_window_messages"], 6);
 }
 
 #[tokio::test]

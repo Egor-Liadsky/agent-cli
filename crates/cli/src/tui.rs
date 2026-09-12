@@ -3,7 +3,8 @@ use agentcore::agent::{AgentReply, Message, MessageMeta, Role};
 use crate::chats::{self, ChatSession};
 use agentclient::{ChatHistory, ChatSummary, ChatsClient};
 use agentcore::config::{
-    ChatSettings, Config, Provider, ReasoningMode, ResponseFormat, SamplingParams, ThinkingMode,
+    ChatSettings, Config, ContextStrategy, Provider, ReasoningMode, ResponseFormat, SamplingParams,
+    ThinkingMode,
 };
 use crate::markdown::agent_skin;
 use ansi_to_tui::IntoText;
@@ -91,6 +92,8 @@ enum FormatField {
     SummaryEnabled,
     SummaryKeepMessages,
     SummaryStepMessages,
+    ContextStrategy,
+    ContextWindowMessages,
     Mode,
     Reasoning,
     Thinking,
@@ -166,6 +169,8 @@ impl SettingsSection {
             ],
             SettingsSection::Context => &[
                 FormatField::ContextLimit,
+                FormatField::ContextStrategy,
+                FormatField::ContextWindowMessages,
                 FormatField::SummaryEnabled,
                 FormatField::SummaryKeepMessages,
                 FormatField::SummaryStepMessages,
@@ -273,6 +278,8 @@ impl FormatField {
             FormatField::SummaryEnabled => "Компактизация истории",
             FormatField::SummaryKeepMessages => "Дословный хвост (сообщений)",
             FormatField::SummaryStepMessages => "Шаг пересказа (сообщений)",
+            FormatField::ContextStrategy => "Стратегия контекста",
+            FormatField::ContextWindowMessages => "Окно последних сообщений",
             FormatField::Mode => "Режим",
             FormatField::Reasoning => "Стратегия рассуждения",
             FormatField::Thinking => "Режим thinking у модели",
@@ -331,6 +338,17 @@ impl FormatField {
 пересчитывается; больший шаг — реже пересчитывается, экономя токены и время на генерацию суммари. Пусто — действует \
 операторское умолчание сервиса."
             }
+            FormatField::ContextStrategy => {
+                "◀/▶ или Space — переключить. Стратегия управления контекстом чата: «Умолчание сервиса», «Пересказ» \
+(summary — текущее поведение), «Окно последних сообщений» (sliding_window — старые сообщения отбрасываются без \
+замены), «Устойчивые факты» (facts — ключевые данные диалога хранятся отдельно и уходят вместе с хвостом истории) \
+или «Ветвление диалога» (branching — история собирается по цепочке активной ветки). «Умолчание сервиса» — стратегию \
+определяет переменная AGENTD_CONTEXT_STRATEGY."
+            }
+            FormatField::ContextWindowMessages => {
+                "Сколько последних сообщений чата уходят провайдеру при стратегиях «Окно последних сообщений» и \
+«Устойчивые факты». Пусто — действует операторское умолчание сервиса."
+            }
             FormatField::Mode => {
                 "◀/▶ или Space — переключить. Кастомный режим задаёт свой формат ответа вместо формата по умолчанию."
             }
@@ -371,6 +389,7 @@ impl FormatField {
                 | FormatField::Thinking
                 | FormatField::Provider
                 | FormatField::SummaryEnabled
+                | FormatField::ContextStrategy
         )
     }
 
@@ -387,6 +406,8 @@ impl FormatField {
                 | FormatField::SummaryEnabled
                 | FormatField::SummaryKeepMessages
                 | FormatField::SummaryStepMessages
+                | FormatField::ContextStrategy
+                | FormatField::ContextWindowMessages
         )
     }
 
@@ -431,6 +452,12 @@ struct SettingsEditor {
     /// Шаг пересказа — настройка этого чата. Пусто — операторское умолчание
     /// сервиса.
     summary_step_messages: String,
+    /// Стратегия управления контекстом этого чата: "" — умолчание сервиса,
+    /// иначе имя стратегии в snake_case (`ContextStrategy::as_str`).
+    context_strategy: String,
+    /// Размер окна последних сообщений для стратегий `sliding_window` и
+    /// `facts` — настройка этого чата. Пусто — операторское умолчание сервиса.
+    context_window_messages: String,
     /// Облачные модели для переключения стрелками в поле «Модель».
     model_choices: Vec<String>,
     /// Локально скачанные модели Ollama, полученные с `/api/tags`.
@@ -498,6 +525,14 @@ impl SettingsEditor {
                 .unwrap_or_default(),
             summary_step_messages: settings
                 .summary_step_messages
+                .map(|v| v.to_string())
+                .unwrap_or_default(),
+            context_strategy: settings
+                .context_strategy
+                .map(|s| s.as_str().to_string())
+                .unwrap_or_default(),
+            context_window_messages: settings
+                .context_window_messages
                 .map(|v| v.to_string())
                 .unwrap_or_default(),
             // приходит из AppState.model_choices: список сервиса, если фоновый
@@ -664,6 +699,18 @@ impl SettingsEditor {
         self.summary_enabled = STATES[(current + delta).rem_euclid(len) as usize].to_string();
     }
 
+    /// Перебор стратегий контекста: не задано → summary → sliding_window →
+    /// facts → branching → снова не задано.
+    fn cycle_context_strategy(&mut self, delta: i32) {
+        const STATES: [&str; 5] = ["", "summary", "sliding_window", "facts", "branching"];
+        let current = STATES
+            .iter()
+            .position(|s| *s == self.context_strategy)
+            .unwrap_or(0) as i32;
+        let len = STATES.len() as i32;
+        self.context_strategy = STATES[(current + delta).rem_euclid(len) as usize].to_string();
+    }
+
     /// Перебор известных моделей стрелками. Если в поле введено что-то своё,
     /// перебор начинается с первой модели списка.
     fn cycle_model(&mut self, delta: i32) {
@@ -688,6 +735,7 @@ impl SettingsEditor {
             Some(FormatField::Reasoning) => self.reasoning = ReasoningMode::default(),
             Some(FormatField::Thinking) => self.thinking = ThinkingMode::default(),
             Some(FormatField::SummaryEnabled) => self.summary_enabled.clear(),
+            Some(FormatField::ContextStrategy) => self.context_strategy.clear(),
             _ => {
                 if let Some(value) = self.field_value_mut() {
                     value.clear();
@@ -702,7 +750,8 @@ impl SettingsEditor {
             | FormatField::Reasoning
             | FormatField::Thinking
             | FormatField::Provider
-            | FormatField::SummaryEnabled => None,
+            | FormatField::SummaryEnabled
+            | FormatField::ContextStrategy => None,
             FormatField::Model => Some(&mut self.model),
             FormatField::ServerUrl => Some(&mut self.server_url),
             FormatField::ClientToken => Some(&mut self.client_token),
@@ -710,6 +759,7 @@ impl SettingsEditor {
             FormatField::ContextLimit => Some(&mut self.context_limit),
             FormatField::SummaryKeepMessages => Some(&mut self.summary_keep_messages),
             FormatField::SummaryStepMessages => Some(&mut self.summary_step_messages),
+            FormatField::ContextWindowMessages => Some(&mut self.context_window_messages),
             FormatField::Experts => Some(&mut self.experts),
             FormatField::Description => Some(&mut self.description),
             FormatField::MaxLength => Some(&mut self.max_length),
@@ -849,6 +899,17 @@ impl SettingsEditor {
 
     fn build_summary_step_messages(&self) -> Result<Option<u32>, String> {
         Self::build_summary_count(&self.summary_step_messages, "Шаг пересказа")
+    }
+
+    /// Разобрать стратегию контекста: пусто — `None` (умолчание сервиса).
+    /// Значение всегда взято из `cycle_context_strategy`, поэтому неизвестных
+    /// имён здесь не бывает.
+    fn build_context_strategy(&self) -> Option<ContextStrategy> {
+        ContextStrategy::parse(&self.context_strategy)
+    }
+
+    fn build_context_window_messages(&self) -> Result<Option<u32>, String> {
+        Self::build_summary_count(&self.context_window_messages, "Окно последних сообщений")
     }
 }
 
@@ -1377,6 +1438,20 @@ fn handle_settings_key(
                         )
                     })
                 })
+                .and_then(
+                    |(format, sampling, context_limit, summary_keep_messages, summary_step_messages)| {
+                        editor.build_context_window_messages().map(|context_window_messages| {
+                            (
+                                format,
+                                sampling,
+                                context_limit,
+                                summary_keep_messages,
+                                summary_step_messages,
+                                context_window_messages,
+                            )
+                        })
+                    },
+                )
             {
                 Ok((
                     format,
@@ -1384,8 +1459,10 @@ fn handle_settings_key(
                     context_limit,
                     summary_keep_messages,
                     summary_step_messages,
+                    context_window_messages,
                 )) => {
                     let summary_enabled = editor.build_summary_enabled();
+                    let context_strategy = editor.build_context_strategy();
                     let reasoning = editor.reasoning;
                     let thinking = editor.thinking;
                     // состав сохраняем всегда: при возврате к «Группе экспертов»
@@ -1413,6 +1490,8 @@ fn handle_settings_key(
                             summary_enabled,
                             summary_keep_messages,
                             summary_step_messages,
+                            context_strategy,
+                            context_window_messages,
                         };
                         // Настройки чата хранит сервис: локально они
                         // применяются ответом на PATCH, а не сразу.
@@ -1519,6 +1598,18 @@ fn handle_settings_key(
                 && editor.current_field() == Some(FormatField::SummaryEnabled) =>
         {
             editor.cycle_summary_enabled(1);
+        }
+        KeyCode::Left
+            if editor.pane == SettingsPane::Fields
+                && editor.current_field() == Some(FormatField::ContextStrategy) =>
+        {
+            editor.cycle_context_strategy(-1);
+        }
+        KeyCode::Right | KeyCode::Char(' ')
+            if editor.pane == SettingsPane::Fields
+                && editor.current_field() == Some(FormatField::ContextStrategy) =>
+        {
+            editor.cycle_context_strategy(1);
         }
         KeyCode::Left => {
             // из полей — обратно к списку разделов
@@ -3094,7 +3185,9 @@ fn empty_field_hint(field: FormatField, editor: &SettingsEditor) -> String {
         FormatField::ContextLimit => {
             "не задан — действует операторский лимит сервиса".to_string()
         }
-        FormatField::SummaryKeepMessages | FormatField::SummaryStepMessages => {
+        FormatField::SummaryKeepMessages
+        | FormatField::SummaryStepMessages
+        | FormatField::ContextWindowMessages => {
             "не задано — действует операторское умолчание сервиса".to_string()
         }
         _ => "не задано — используется значение модели".to_string(),
@@ -3145,6 +3238,11 @@ fn render_settings_fields(f: &mut Frame, editor: &SettingsEditor, area: Rect) {
             },
             FormatField::SummaryKeepMessages => editor.summary_keep_messages.clone(),
             FormatField::SummaryStepMessages => editor.summary_step_messages.clone(),
+            FormatField::ContextStrategy => match ContextStrategy::parse(&editor.context_strategy) {
+                Some(strategy) => strategy.label().to_string(),
+                None => "Умолчание сервиса".to_string(),
+            },
+            FormatField::ContextWindowMessages => editor.context_window_messages.clone(),
             FormatField::Mode => {
                 if editor.custom_mode {
                     "Кастомный".to_string()
@@ -3376,6 +3474,27 @@ mod tests {
         assert_eq!(editor.context_limit, "4000");
     }
 
+    #[test]
+    fn settings_editor_cycles_context_strategy_and_saves_it() {
+        let settings = ChatSettings::default();
+        let session = ChatSession {
+            id: "chat-1".to_string(),
+            title: "Чат".to_string(),
+            messages: Vec::new(),
+            updated_at: 0,
+            settings,
+            history_loaded: true,
+        };
+        let mut editor = SettingsEditor::from_chat(&session, &Config::default(), &[], &[]);
+        assert_eq!(editor.build_context_strategy(), None);
+        editor.cycle_context_strategy(1);
+        assert_eq!(editor.build_context_strategy(), Some(ContextStrategy::Summary));
+        editor.cycle_context_strategy(1);
+        assert_eq!(editor.build_context_strategy(), Some(ContextStrategy::SlidingWindow));
+        editor.cycle_context_strategy(-1);
+        assert_eq!(editor.build_context_strategy(), Some(ContextStrategy::Summary));
+    }
+
     // --- 4.2 Отказ загрузки виден и объясним ---
 
     #[test]
@@ -3426,6 +3545,7 @@ mod tests {
             "chat-1".to_string(),
             Ok(ChatHistory {
                 chat: summary("chat-1", "Заголовок сервиса", 2),
+                branch_id: None,
                 messages: vec![
                     agentclient::StoredMessage {
                         seq: 1,
@@ -3594,6 +3714,7 @@ mod tests {
             "source".to_string(),
             Ok(ChatHistory {
                 chat: summary("source", "Источник", 1),
+                branch_id: None,
                 messages: vec![agentclient::StoredMessage {
                     seq: 1,
                     created_at: 1001,
@@ -3648,6 +3769,7 @@ mod tests {
             "chat-1".to_string(),
             Ok(ChatHistory {
                 chat: summary("chat-1", "Первый", 1),
+                branch_id: None,
                 messages: vec![agentclient::StoredMessage {
                     seq: 1,
                     created_at: 1001,
