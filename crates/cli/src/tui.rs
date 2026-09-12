@@ -1197,12 +1197,11 @@ fn handle_key(
         if state.focus == Focus::Import {
             state.import = None;
             state.focus = Focus::Input;
-        } else if !matches!(state.focus, Focus::Settings | Focus::Confirm) {
-            if let Some(chat_index) = state.active_chat_index() {
+        } else if !matches!(state.focus, Focus::Settings | Focus::Confirm)
+            && let Some(chat_index) = state.active_chat_index() {
                 state.import = Some(ImportPicker::new(&state.chats[chat_index], &state.chats));
                 state.focus = Focus::Import;
             }
-        }
         return LoopControl::Continue;
     }
     if key.code == KeyCode::Char('p') && key.modifiers.contains(KeyModifiers::CONTROL) {
@@ -2031,12 +2030,11 @@ fn handle_chats_loaded(
                 let mut chat = ChatSession::from_summary(summary);
                 // Уже загруженную историю не выбрасываем: список её не
                 // содержит, а повторный запрос ни к чему.
-                if let Some(existing) = state.chats.iter().find(|c| c.id == id) {
-                    if existing.history_loaded {
+                if let Some(existing) = state.chats.iter().find(|c| c.id == id)
+                    && existing.history_loaded {
                         chat.messages = existing.messages.clone();
                         chat.history_loaded = true;
                     }
-                }
                 chats.push(chat);
             }
             let known: Vec<String> = chats.iter().map(|chat| chat.id.clone()).collect();
@@ -2047,11 +2045,10 @@ fn handle_chats_loaded(
                 state.chat_ui.entry(id.clone()).or_default();
             }
             state.panes.retain(|id| known.contains(id));
-            if state.panes.is_empty() {
-                if let Some(first) = known.first() {
+            if state.panes.is_empty()
+                && let Some(first) = known.first() {
                     state.panes.push(first.clone());
                 }
-            }
             if state.active_pane >= state.panes.len() {
                 state.active_pane = state.panes.len().saturating_sub(1);
             }
@@ -2140,11 +2137,10 @@ fn handle_exchange_saved(chat_id: String, result: Result<(), String>, state: &mu
             state.notify(format!(
                 "Обмен не сохранён в сервисе: {reason}. Ctrl+U — повторить"
             ));
-            if let Some(ui) = state.chat_ui.get_mut(&chat_id) {
-                if let Some(unsaved) = ui.unsaved.as_mut() {
+            if let Some(ui) = state.chat_ui.get_mut(&chat_id)
+                && let Some(unsaved) = ui.unsaved.as_mut() {
                     unsaved.reason = reason;
                 }
-            }
         }
     }
 }

@@ -16,11 +16,10 @@ pub const UNAUTHORIZED_HINT: &str = "Задайте токен в настрой
     (Ctrl+P → «Подключение») или выполните: agentcli config set-token <TOKEN>";
 
 pub fn log_dir() -> Option<PathBuf> {
-    if let Ok(value) = std::env::var(LOG_DIR_ENV) {
-        if !value.trim().is_empty() {
+    if let Ok(value) = std::env::var(LOG_DIR_ENV)
+        && !value.trim().is_empty() {
             return Some(PathBuf::from(value));
         }
-    }
     dirs::data_dir().map(|dir| dir.join("agentcli").join("logs"))
 }
 

@@ -130,15 +130,17 @@ impl RequestContext {
 pub enum PolicyPayload {
     /// Изменённая история сообщений (исход входной политики).
     History(Vec<Message>),
-    /// Изменённый ответ модели (исход выходной политики).
-    Reply(AgentReply),
+    /// Изменённый ответ модели (исход выходной политики). В `Box`, чтобы не
+    /// раздувать размер `PolicyOutcome` до размера самого большого варианта
+    /// на каждый вызов, включая частый `Pass`.
+    Reply(Box<AgentReply>),
 }
 
 /// Один из трёх исходов политики.
 #[derive(Debug, Clone)]
 pub enum PolicyOutcome {
     Pass,
-    Rewrite(PolicyPayload),
+    Rewrite(Box<PolicyPayload>),
     Reject { code: String, reason: String },
 }
 
@@ -156,7 +158,10 @@ impl PolicyOutcome {
 #[derive(Debug, Clone)]
 pub enum PipelineOutcome {
     Completed {
-        reply: AgentReply,
+        /// В `Box` по той же причине, что и `PolicyPayload::Reply`: не
+        /// раздувать размер варианта `Rejected`, которого этот вариант не
+        /// разделяет.
+        reply: Box<AgentReply>,
         policy: PolicyLog,
     },
     Rejected {
@@ -301,20 +306,22 @@ impl Pipeline {
             let outcome = policy.check(&context).await?;
             match outcome {
                 PolicyOutcome::Pass => context.policy.input.push(PolicyRecord::pass(policy.name())),
-                PolicyOutcome::Rewrite(PolicyPayload::History(history)) => {
-                    context.history = history;
-                    Self::normalize(&mut context.history);
-                    context
-                        .policy
-                        .input
-                        .push(PolicyRecord::rewrite(policy.name()));
-                }
-                PolicyOutcome::Rewrite(PolicyPayload::Reply(_)) => {
-                    anyhow::bail!(
-                        "входная политика {} вернула изменённый ответ вместо истории",
-                        policy.name()
-                    );
-                }
+                PolicyOutcome::Rewrite(payload) => match *payload {
+                    PolicyPayload::History(history) => {
+                        context.history = history;
+                        Self::normalize(&mut context.history);
+                        context
+                            .policy
+                            .input
+                            .push(PolicyRecord::rewrite(policy.name()));
+                    }
+                    PolicyPayload::Reply(_) => {
+                        anyhow::bail!(
+                            "входная политика {} вернула изменённый ответ вместо истории",
+                            policy.name()
+                        );
+                    }
+                },
                 PolicyOutcome::Reject { code, reason } => {
                     context
                         .policy
@@ -342,19 +349,21 @@ impl Pipeline {
                     .policy
                     .output
                     .push(PolicyRecord::pass(policy.name())),
-                PolicyOutcome::Rewrite(PolicyPayload::Reply(rewritten)) => {
-                    reply = rewritten;
-                    context
-                        .policy
-                        .output
-                        .push(PolicyRecord::rewrite(policy.name()));
-                }
-                PolicyOutcome::Rewrite(PolicyPayload::History(_)) => {
-                    anyhow::bail!(
-                        "выходная политика {} вернула изменённую историю вместо ответа",
-                        policy.name()
-                    );
-                }
+                PolicyOutcome::Rewrite(payload) => match *payload {
+                    PolicyPayload::Reply(rewritten) => {
+                        reply = *rewritten;
+                        context
+                            .policy
+                            .output
+                            .push(PolicyRecord::rewrite(policy.name()));
+                    }
+                    PolicyPayload::History(_) => {
+                        anyhow::bail!(
+                            "выходная политика {} вернула изменённую историю вместо ответа",
+                            policy.name()
+                        );
+                    }
+                },
                 PolicyOutcome::Reject { code, reason } => {
                     context
                         .policy
@@ -376,7 +385,7 @@ impl Pipeline {
         }
 
         Ok(PipelineOutcome::Completed {
-            reply,
+            reply: Box::new(reply),
             policy: context.policy,
         })
     }
@@ -438,7 +447,7 @@ mod tests {
 
     fn completed(outcome: PipelineOutcome) -> (AgentReply, PolicyLog) {
         match outcome {
-            PipelineOutcome::Completed { reply, policy } => (reply, policy),
+            PipelineOutcome::Completed { reply, policy } => (*reply, policy),
             PipelineOutcome::Rejected { stage, code, .. } => {
                 panic!("ожидался Completed, получен отказ {stage}/{code}")
             }
@@ -454,9 +463,9 @@ mod tests {
         }
 
         async fn check(&self, _context: &RequestContext) -> Result<PolicyOutcome> {
-            Ok(PolicyOutcome::Rewrite(PolicyPayload::History(vec![
+            Ok(PolicyOutcome::Rewrite(Box::new(PolicyPayload::History(vec![
                 Message::user("изменённый вопрос"),
-            ])))
+            ]))))
         }
     }
 
@@ -503,7 +512,7 @@ mod tests {
             );
             let mut masked = reply.clone();
             masked.content = "***".to_string();
-            Ok(PolicyOutcome::Rewrite(PolicyPayload::Reply(masked)))
+            Ok(PolicyOutcome::Rewrite(Box::new(PolicyPayload::Reply(Box::new(masked)))))
         }
     }
 

@@ -348,8 +348,8 @@ impl Config {
         }
         let content = std::fs::read_to_string(&path)
             .with_context(|| format!("не удалось прочитать конфиг {}", path.display()))?;
-        Ok(Self::parse_with_legacy_fields(&content)
-            .with_context(|| format!("не удалось разобрать конфиг {}", path.display()))?)
+        Self::parse_with_legacy_fields(&content)
+            .with_context(|| format!("не удалось разобрать конфиг {}", path.display()))
     }
 
     /// Разбор конфига: неизвестные поля игнорируются, поэтому файл прежней
