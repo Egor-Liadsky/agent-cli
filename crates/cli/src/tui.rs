@@ -110,14 +110,16 @@ enum FormatField {
 #[derive(Clone, Copy, PartialEq)]
 enum SettingsSection {
     Connection,
+    Context,
     Format,
     Reasoning,
     Sampling,
 }
 
 impl SettingsSection {
-    const ALL: [SettingsSection; 4] = [
+    const ALL: [SettingsSection; 5] = [
         SettingsSection::Connection,
+        SettingsSection::Context,
         SettingsSection::Format,
         SettingsSection::Reasoning,
         SettingsSection::Sampling,
@@ -126,9 +128,30 @@ impl SettingsSection {
     fn label(self) -> &'static str {
         match self {
             SettingsSection::Connection => "Подключение",
+            SettingsSection::Context => "Контекст",
             SettingsSection::Format => "Формат ответа",
             SettingsSection::Reasoning => "Рассуждение",
             SettingsSection::Sampling => "Сэмплинг",
+        }
+    }
+
+    /// Пояснение раздела — показывается в нижней панели, пока фокус
+    /// стоит на списке разделов (курсор ещё не зашёл в поля).
+    fn description(self) -> &'static str {
+        match self {
+            SettingsSection::Connection => {
+                "Провайдер, модель и адрес/токен сервиса — общие параметры доступа для этого чата."
+            }
+            SettingsSection::Context => {
+                "Лимит контекстного окна и компактизация истории — настройки конкретно этого чата."
+            }
+            SettingsSection::Format => "Формат ответа: кастомный режим, длина, стоп-условия.",
+            SettingsSection::Reasoning => {
+                "Как агент подходит к задаче: стратегия рассуждения и режим thinking модели."
+            }
+            SettingsSection::Sampling => {
+                "Параметры сэмплирования, передаются модели при генерации ответа."
+            }
         }
     }
 
@@ -140,6 +163,8 @@ impl SettingsSection {
                 FormatField::ServerUrl,
                 FormatField::ClientToken,
                 FormatField::OllamaUrl,
+            ],
+            SettingsSection::Context => &[
                 FormatField::ContextLimit,
                 FormatField::SummaryEnabled,
                 FormatField::SummaryKeepMessages,
@@ -239,28 +264,96 @@ impl ImportPicker {
 impl FormatField {
     fn label(self) -> &'static str {
         match self {
-            FormatField::Provider => "Провайдер (◀/▶ или Space — переключить)",
-            FormatField::Model => "Модель (◀/▶ — из списка, ввод — любое имя)",
-            FormatField::ServerUrl => "Адрес сервиса agentd (общий для всех чатов)",
-            FormatField::ClientToken => "Токен сервиса (общий для всех чатов)",
-            FormatField::OllamaUrl => "Адрес Ollama (общий для всех чатов)",
-            FormatField::ContextLimit => "Лимит контекста (токены, только для этого чата)",
-            FormatField::SummaryEnabled => "Компактизация истории (◀/▶ или Space — переключить)",
-            FormatField::SummaryKeepMessages => "Дословный хвост компактизации (сообщений)",
+            FormatField::Provider => "Провайдер",
+            FormatField::Model => "Модель",
+            FormatField::ServerUrl => "Адрес сервиса agentd",
+            FormatField::ClientToken => "Токен сервиса",
+            FormatField::OllamaUrl => "Адрес Ollama",
+            FormatField::ContextLimit => "Лимит контекста (токены)",
+            FormatField::SummaryEnabled => "Компактизация истории",
+            FormatField::SummaryKeepMessages => "Дословный хвост (сообщений)",
             FormatField::SummaryStepMessages => "Шаг пересказа (сообщений)",
             FormatField::Mode => "Режим",
             FormatField::Reasoning => "Стратегия рассуждения",
             FormatField::Thinking => "Режим thinking у модели",
-            FormatField::Experts => "Эксперты (через запятую, пусто — состав по умолчанию)",
+            FormatField::Experts => "Эксперты",
             FormatField::Description => "Описание формата",
             FormatField::MaxLength => "Макс. длина ответа (токены)",
-            FormatField::Stop => "Stop-последовательности (через запятую)",
+            FormatField::Stop => "Stop-последовательности",
             FormatField::StopInstruction => "Инструкция завершения ответа",
             FormatField::Temperature => "Temperature",
             FormatField::TopP => "Top-p",
             FormatField::TopK => "Top-k",
             FormatField::FrequencyPenalty => "Frequency penalty",
             FormatField::PresencePenalty => "Presence penalty",
+        }
+    }
+
+    /// Развёрнутое пояснение поля — показывается в нижней панели попапа,
+    /// когда поле выделено.
+    fn description(self) -> &'static str {
+        match self {
+            FormatField::Provider => {
+                "◀/▶ или Space — переключить между облачным API и локальной Ollama. Меняет остальные поля этого раздела."
+            }
+            FormatField::Model => {
+                "Модель именно этого чата. ◀/▶ — выбрать из списка сервиса/Ollama, ввод — задать любое имя, Ctrl+D — сбросить на умолчание."
+            }
+            FormatField::ServerUrl => "Адрес сервиса agentd — общий для всех чатов.",
+            FormatField::ClientToken => {
+                "Клиентский токен сервиса, общий для всех чатов. На экране видны только последние 4 символа."
+            }
+            FormatField::OllamaUrl => "Адрес локального сервера Ollama — общий для всех чатов.",
+            FormatField::ContextLimit => {
+                "Максимальный размер контекстного окна в токенах, который сервис использует для этого конкретного чата. \
+Значение задаётся клиентом и может только сужать операторский лимит сервиса, но не превышать его — если здесь указано \
+больше операторского лимита, действует всё равно операторский. Когда история чата превышает этот лимит, старые \
+сообщения вытесняются (или сжимаются пересказом, если включена суммаризация ниже). Пусто — лимит клиентом не задан, \
+действует только операторский лимит сервиса."
+            }
+            FormatField::SummaryEnabled => {
+                "◀/▶ или Space — переключить. Когда включено, часть истории, вытесненная за пределы контекстного окна, \
+не отбрасывается, а заменяется коротким пересказом (суммари), который сервис генерирует автоматически и передаёт \
+модели вместо исходных сообщений. Это позволяет модели помнить о более ранней части разговора при ограниченном \
+контексте, ценой точности деталей вытесненных сообщений. «Умолчание сервиса» — поведение определяет сервис, если \
+клиент явно не включил и не выключил суммаризацию для этого чата."
+            }
+            FormatField::SummaryKeepMessages => {
+                "Сколько последних сообщений чата всегда отправляются провайдеру дословно, без пересказа, независимо \
+от того, насколько заполнено контекстное окно. Защищает самую свежую часть диалога от огрубления пересказом — чем \
+больше значение, тем точнее модель видит недавний контекст, но тем меньше места остаётся под саму суммаризацию \
+старой истории. Пусто — действует операторское умолчание сервиса."
+            }
+            FormatField::SummaryStepMessages => {
+                "Шаг в сообщениях, с которым уже составленный пересказ вытесненной истории перестраивается заново \
+(а не пересобирается на каждом новом сообщении). Например, шаг 10 значит: пересказ обновляется раз в 10 новых \
+сообщений, а между обновлениями используется прежняя версия. Меньший шаг — пересказ точнее и актуальнее, но чаще \
+пересчитывается; больший шаг — реже пересчитывается, экономя токены и время на генерацию суммари. Пусто — действует \
+операторское умолчание сервиса."
+            }
+            FormatField::Mode => {
+                "◀/▶ или Space — переключить. Кастомный режим задаёт свой формат ответа вместо формата по умолчанию."
+            }
+            FormatField::Reasoning => {
+                "◀/▶ или Space — переключить. Стратегия, которой агент следует при обдумывании ответа."
+            }
+            FormatField::Thinking => {
+                "◀/▶ или Space — переключить. Режим встроенного размышления модели, если провайдер его поддерживает."
+            }
+            FormatField::Experts => {
+                "Состав экспертной группы для стратегии «Группа экспертов», через запятую. Пусто — состав по умолчанию."
+            }
+            FormatField::Description => "Свободное описание формата ответа для кастомного режима.",
+            FormatField::MaxLength => "Ограничение длины ответа в токенах.",
+            FormatField::Stop => {
+                "Стоп-последовательности, при которых генерация останавливается, через запятую."
+            }
+            FormatField::StopInstruction => "Инструкция модели о том, как завершать ответ.",
+            FormatField::Temperature => "Температура сэмплирования: выше — разнообразнее и менее предсказуемо.",
+            FormatField::TopP => "Nucleus sampling: доля вероятностной массы токенов-кандидатов.",
+            FormatField::TopK => "Ограничивает выбор модели K самыми вероятными токенами.",
+            FormatField::FrequencyPenalty => "Штраф за повтор уже встречавшихся токенов.",
+            FormatField::PresencePenalty => "Штраф за повтор уже упомянутых тем/токенов независимо от частоты.",
         }
     }
 
@@ -2863,7 +2956,7 @@ fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {
 }
 
 fn render_settings_popup(f: &mut Frame, editor: &SettingsEditor) {
-    let area = centered_rect(88, 24, f.area());
+    let area = centered_rect(104, 34, f.area());
     f.render_widget(Clear, area);
 
     let block = Block::default()
@@ -2876,17 +2969,30 @@ fn render_settings_popup(f: &mut Frame, editor: &SettingsEditor) {
     let inner = block.inner(area);
     f.render_widget(block, area);
 
+    // Высота панели пояснения зависит от длины текста: короткие описания разделов
+    // не должны отъедать место у списка полей, а длинные — не должны обрезаться.
+    let description_text = settings_description_text(editor);
+    let description_width = inner.width.saturating_sub(2).max(1);
+    let description_lines = wrapped_line_count(description_text.into(), description_width);
+    let description_height =
+        (clamp_u16(description_lines) + 2).clamp(4, inner.height.saturating_sub(6).max(4));
+
     let rows = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Min(0), Constraint::Length(1)])
+        .constraints([
+            Constraint::Min(0),
+            Constraint::Length(description_height),
+            Constraint::Length(1),
+        ])
         .split(inner);
     let columns = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Length(24), Constraint::Min(0)])
+        .constraints([Constraint::Length(26), Constraint::Min(0)])
         .split(rows[0]);
 
     render_settings_sections(f, editor, columns[0]);
     render_settings_fields(f, editor, columns[1]);
+    render_settings_description(f, rows[1], description_text);
 
     f.render_widget(
         Paragraph::new(Line::from(Span::styled(
@@ -2894,7 +3000,35 @@ fn render_settings_popup(f: &mut Frame, editor: &SettingsEditor) {
 Ctrl+S — сохранить · Esc — отмена",
             Style::default().fg(Color::DarkGray),
         ))),
-        rows[1],
+        rows[2],
+    );
+}
+
+/// Текст нижней панели пояснения: для выделенного поля либо для раздела,
+/// пока курсор ещё в списке слева.
+fn settings_description_text(editor: &SettingsEditor) -> &'static str {
+    match editor.pane {
+        SettingsPane::Fields => editor
+            .current_field()
+            .map(|field| field.description())
+            .unwrap_or("В этом разделе нет полей для текущего провайдера."),
+        SettingsPane::Sections => editor.current_section().description(),
+    }
+}
+
+/// Нижняя панель попапа: развёрнутое пояснение к выделенному полю
+/// (или к разделу, пока курсор ещё в списке слева).
+fn render_settings_description(f: &mut Frame, area: Rect, text: &str) {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::DarkGray))
+        .title(" Пояснение ");
+    f.render_widget(
+        Paragraph::new(text)
+            .style(Style::default().fg(Color::Gray))
+            .wrap(Wrap { trim: false })
+            .block(block),
+        area,
     );
 }
 
@@ -2998,37 +3132,28 @@ fn render_settings_fields(f: &mut Frame, editor: &SettingsEditor, area: Rect) {
         };
 
         let raw = match field {
-            FormatField::Provider => format!(
-                "{} (◀/▶ или Space — переключить)",
-                editor.provider.label()
-            ),
+            FormatField::Provider => editor.provider.label().to_string(),
             FormatField::Model => editor.model.clone(),
             FormatField::ServerUrl => editor.server_url.clone(),
             FormatField::ClientToken => mask_secret(&editor.client_token),
             FormatField::OllamaUrl => editor.ollama_url.clone(),
             FormatField::ContextLimit => editor.context_limit.clone(),
             FormatField::SummaryEnabled => match editor.summary_enabled.as_str() {
-                "on" => "Включена (◀/▶ или Space — переключить)".to_string(),
-                "off" => "Выключена (◀/▶ или Space — переключить)".to_string(),
-                _ => "Умолчание сервиса (◀/▶ или Space — переключить)".to_string(),
+                "on" => "Включена".to_string(),
+                "off" => "Выключена".to_string(),
+                _ => "Умолчание сервиса".to_string(),
             },
             FormatField::SummaryKeepMessages => editor.summary_keep_messages.clone(),
             FormatField::SummaryStepMessages => editor.summary_step_messages.clone(),
             FormatField::Mode => {
                 if editor.custom_mode {
-                    "Кастомный (◀/▶ или Space — переключить)".to_string()
+                    "Кастомный".to_string()
                 } else {
-                    "Дефолтный (◀/▶ или Space — переключить)".to_string()
+                    "Дефолтный".to_string()
                 }
             }
-            FormatField::Reasoning => format!(
-                "{} (◀/▶ или Space — переключить)",
-                editor.reasoning.label()
-            ),
-            FormatField::Thinking => format!(
-                "{} (◀/▶ или Space — переключить)",
-                editor.thinking.label()
-            ),
+            FormatField::Reasoning => editor.reasoning.label().to_string(),
+            FormatField::Thinking => editor.thinking.label().to_string(),
             FormatField::Experts => editor.experts.clone(),
             FormatField::Description => editor.description.clone(),
             FormatField::MaxLength => editor.max_length.clone(),
@@ -3062,6 +3187,10 @@ fn render_settings_fields(f: &mut Frame, editor: &SettingsEditor, area: Rect) {
         lines.push(Line::from(Span::styled(
             format!("   {value}{cursor}"),
             Style::default().fg(value_color),
+        )));
+        lines.push(Line::from(Span::styled(
+            "─".repeat(area.width as usize),
+            Style::default().fg(Color::DarkGray),
         )));
     }
 
