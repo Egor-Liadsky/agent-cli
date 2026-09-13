@@ -3509,6 +3509,7 @@ fn render_history(
         let (label, color) = match entry.role {
             Role::User => ("Вы", Color::Green),
             Role::Assistant => ("Агент", Color::Cyan),
+            Role::System => ("Система", Color::Yellow),
         };
         let mut header = vec![Span::styled(
             format!("● {label}"),

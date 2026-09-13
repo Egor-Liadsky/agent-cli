@@ -191,17 +191,30 @@ fn parse_api_error(status: reqwest::StatusCode, body: &str) -> AgentError {
 
 impl UpstreamAgent {
     fn build_messages(&self, history: &[Message], settings: &ChatSettings) -> Vec<ChatMessage> {
+        let (history_system, history) = match history.split_first() {
+            Some((first, rest)) if matches!(first.role, Role::System) => {
+                (Some(first.content.clone()), rest)
+            }
+            _ => (None, history),
+        };
+        let combined_system = match (system_prompt(settings), history_system) {
+            (Some(settings), Some(history)) => Some(format!("{settings}\n\n{history}")),
+            (Some(settings), None) => Some(settings),
+            (None, Some(history)) => Some(history),
+            (None, None) => None,
+        };
         let mut messages = Vec::with_capacity(history.len() + 1);
-        if let Some(system_content) = system_prompt(settings) {
+        if let Some(content) = combined_system {
             messages.push(ChatMessage {
                 role: "system",
-                content: system_content,
+                content,
             });
         }
         messages.extend(history.iter().map(|m| ChatMessage {
             role: match m.role {
                 Role::User => "user",
                 Role::Assistant => "assistant",
+                Role::System => "system",
             },
             content: m.content.clone(),
         }));
@@ -389,6 +402,26 @@ mod tests {
         )
         .with_request_timeout(Duration::from_millis(300))
         .expect("таймаут")
+    }
+
+    #[test]
+    fn build_messages_splices_settings_prompt_with_history_system_message() {
+        let agent = agent("http://127.0.0.1:0".to_string());
+        let history = [Message::system("факты чата: ..."), Message::user("привет")];
+        let messages = agent.build_messages(&history, &ChatSettings::default());
+        let roles: Vec<&str> = messages.iter().map(|m| m.role).collect();
+        assert_eq!(roles, vec!["system", "user"]);
+    }
+
+    #[test]
+    fn build_messages_keeps_single_system_message_without_settings_prompt() {
+        let agent = agent("http://127.0.0.1:0".to_string());
+        let history = [Message::system("базовый текст"), Message::user("привет")];
+        let messages = agent.build_messages(&history, &ChatSettings::default());
+        let roles: Vec<&str> = messages.iter().map(|m| m.role).collect();
+        assert_eq!(roles.iter().filter(|r| **r == "system").count(), 1);
+        assert_eq!(roles[0], "system");
+        assert_eq!(messages[0].content, "базовый текст");
     }
 
     #[tokio::test]

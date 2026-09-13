@@ -166,8 +166,20 @@ pub async fn list_models(base_url: &str) -> Result<Vec<String>> {
 }
 
 fn build_messages(system: Option<String>, history: &[Message]) -> Vec<ChatMessage> {
+    let (history_system, history) = match history.split_first() {
+        Some((first, rest)) if matches!(first.role, Role::System) => {
+            (Some(first.content.clone()), rest)
+        }
+        _ => (None, history),
+    };
+    let combined_system = match (system, history_system) {
+        (Some(settings), Some(history)) => Some(format!("{settings}\n\n{history}")),
+        (Some(settings), None) => Some(settings),
+        (None, Some(history)) => Some(history),
+        (None, None) => None,
+    };
     let mut messages = Vec::with_capacity(history.len() + 1);
-    if let Some(content) = system {
+    if let Some(content) = combined_system {
         messages.push(ChatMessage {
             role: "system",
             content,
@@ -177,6 +189,7 @@ fn build_messages(system: Option<String>, history: &[Message]) -> Vec<ChatMessag
         role: match m.role {
             Role::User => "user",
             Role::Assistant => "assistant",
+            Role::System => "system",
         },
         content: m.content.clone(),
     }));
@@ -299,4 +312,40 @@ pub async fn chat(
         policy: None,
         context: None,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn roles(messages: &[ChatMessage]) -> Vec<&'static str> {
+        messages.iter().map(|m| m.role).collect()
+    }
+
+    #[test]
+    fn splices_settings_prompt_with_history_system_message() {
+        let history = vec![
+            Message::system("факты чата: ..."),
+            Message::user("привет"),
+        ];
+        let messages = build_messages(Some("формат ответа: markdown".to_string()), &history);
+        assert_eq!(roles(&messages), vec!["system", "user"]);
+        assert_eq!(messages[0].content, "формат ответа: markdown\n\nфакты чата: ...");
+    }
+
+    #[test]
+    fn single_leading_system_message_without_settings_prompt() {
+        let history = vec![Message::system("базовый текст"), Message::user("привет")];
+        let messages = build_messages(None, &history);
+        assert_eq!(roles(&messages), vec!["system", "user"]);
+        assert_eq!(messages[0].content, "базовый текст");
+    }
+
+    #[test]
+    fn no_history_system_message_falls_back_to_settings_prompt() {
+        let history = vec![Message::user("привет")];
+        let messages = build_messages(Some("формат ответа: markdown".to_string()), &history);
+        assert_eq!(roles(&messages), vec!["system", "user"]);
+        assert_eq!(messages[0].content, "формат ответа: markdown");
+    }
 }

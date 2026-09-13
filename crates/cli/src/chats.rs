@@ -85,6 +85,7 @@ pub fn context_block(chat: &ChatSession) -> String {
         let label = match message.role {
             Role::User => "Вы",
             Role::Assistant => "Агент",
+            Role::System => "Система",
         };
         block.push_str(&format!("{label}: {}\n", message.content));
     }

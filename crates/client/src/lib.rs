@@ -352,6 +352,7 @@ impl ServerAgent {
             role: match m.role {
                 Role::User => "user",
                 Role::Assistant => "assistant",
+                Role::System => "system",
             },
             content: m.content.clone(),
         }));

@@ -484,6 +484,7 @@ impl From<&Message> for NewMessagePayload {
             role: match message.role {
                 Role::User => "user",
                 Role::Assistant => "assistant",
+                Role::System => "system",
             },
             content: message.content.clone(),
             reasoning: message.reasoning.clone(),

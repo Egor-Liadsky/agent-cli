@@ -46,6 +46,15 @@ impl Message {
             meta: None,
         }
     }
+
+    pub fn system(content: impl Into<String>) -> Self {
+        Self {
+            role: Role::System,
+            content: content.into(),
+            reasoning: None,
+            meta: None,
+        }
+    }
 }
 
 /// Измеримые характеристики одного обмена с API.
@@ -119,6 +128,7 @@ pub fn now_secs() -> i64 {
 pub enum Role {
     User,
     Assistant,
+    System,
 }
 
 /// `Send + Sync` нужны, чтобы агента можно было держать в `Arc<dyn Agent>`
