@@ -200,8 +200,8 @@ fn settings_with(provider: Provider, model: &str) -> ChatSettings {
         summary_step_messages: None,
         context_strategy: None,
         context_window_messages: None,
+        memory_layers_enabled: None,
         memory_router_enabled: None,
-        memory_short_term_tail: None,
         memory_working_max_entries: None,
         memory_long_term_max_entries: None,
     }

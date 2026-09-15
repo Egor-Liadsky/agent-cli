@@ -226,18 +226,14 @@ pub enum ContextStrategy {
     Facts,
     /// Ветвление диалога: история собирается по цепочке активной ветки.
     Branching,
-    /// Три слоя памяти (краткосрочная, рабочая, долговременная) с
-    /// маршрутизацией записей и раздельной областью видимости и жизни.
-    MemoryLayers,
 }
 
 impl ContextStrategy {
-    pub const ALL: [ContextStrategy; 5] = [
+    pub const ALL: [ContextStrategy; 4] = [
         ContextStrategy::Summary,
         ContextStrategy::SlidingWindow,
         ContextStrategy::Facts,
         ContextStrategy::Branching,
-        ContextStrategy::MemoryLayers,
     ];
 
     pub fn label(self) -> &'static str {
@@ -246,7 +242,6 @@ impl ContextStrategy {
             ContextStrategy::SlidingWindow => "Окно последних сообщений",
             ContextStrategy::Facts => "Устойчивые факты",
             ContextStrategy::Branching => "Ветвление диалога",
-            ContextStrategy::MemoryLayers => "Слои памяти",
         }
     }
 
@@ -257,7 +252,6 @@ impl ContextStrategy {
             ContextStrategy::SlidingWindow => "sliding_window",
             ContextStrategy::Facts => "facts",
             ContextStrategy::Branching => "branching",
-            ContextStrategy::MemoryLayers => "memory_layers",
         }
     }
 
@@ -267,7 +261,6 @@ impl ContextStrategy {
             "sliding_window" => Some(ContextStrategy::SlidingWindow),
             "facts" => Some(ContextStrategy::Facts),
             "branching" => Some(ContextStrategy::Branching),
-            "memory_layers" => Some(ContextStrategy::MemoryLayers),
             _ => None,
         }
     }
@@ -305,36 +298,37 @@ pub struct ContextObservability {
     /// Ветка, из которой собрана история (стратегия `branching`).
     #[serde(default)]
     pub branch_id: Option<String>,
-    /// Число записей долговременной памяти в контексте (стратегия `memory_layers`).
+    /// Число записей долговременной памяти в контексте (слоистая память включена).
     #[serde(default)]
     pub memory_long_term_entries: Option<u32>,
-    /// Объём долговременной памяти в контексте, в символах (`memory_layers`).
+    /// Объём долговременной памяти в контексте, в символах (слоистая память включена).
     #[serde(default)]
     pub memory_long_term_chars: Option<u32>,
-    /// Число записей рабочей памяти в контексте (`memory_layers`).
+    /// Число записей рабочей памяти в контексте (слоистая память включена).
     #[serde(default)]
     pub memory_working_entries: Option<u32>,
-    /// Объём рабочей памяти в контексте, в символах (`memory_layers`).
+    /// Объём рабочей памяти в контексте, в символах (слоистая память включена).
     #[serde(default)]
     pub memory_working_chars: Option<u32>,
-    /// Число сообщений хвоста краткосрочной памяти (`memory_layers`).
+    /// Число сообщений краткосрочной истории, фактически собранной действующей
+    /// стратегией контекста (слоистая память включена).
     #[serde(default)]
     pub memory_short_term_messages: Option<u32>,
-    /// Объём хвоста краткосрочной памяти, в символах (`memory_layers`).
+    /// Объём этой краткосрочной истории, в символах (слоистая память включена).
     #[serde(default)]
     pub memory_short_term_chars: Option<u32>,
     /// Сколько операций `set` маршрутизатора памяти применено — новые
     /// ключи, счётчики относятся к маршрутизации ПРЕДЫДУЩЕГО сообщения
-    /// (`memory_layers`).
+    /// (слоистая память включена).
     #[serde(default)]
     pub memory_router_applied_set: Option<u32>,
-    /// Сколько операций маршрутизатора обновили существующий ключ (`memory_layers`).
+    /// Сколько операций маршрутизатора обновили существующий ключ (слоистая память включена).
     #[serde(default)]
     pub memory_router_applied_update: Option<u32>,
-    /// Сколько операций `delete` маршрутизатора применено (`memory_layers`).
+    /// Сколько операций `delete` маршрутизатора применено (слоистая память включена).
     #[serde(default)]
     pub memory_router_applied_delete: Option<u32>,
-    /// Сколько операций маршрутизатора отброшено валидацией (`memory_layers`).
+    /// Сколько операций маршрутизатора отброшено валидацией (слоистая память включена).
     #[serde(default)]
     pub memory_router_rejected: Option<u32>,
 }
@@ -396,16 +390,17 @@ pub struct ChatSettings {
     /// (`AGENTD_CONTEXT_WINDOW_MESSAGES`).
     #[serde(default)]
     pub context_window_messages: Option<u32>,
-    /// Включает или выключает автоматический маршрутизатор записей памяти
-    /// для стратегии `memory_layers`. `None` — операторское умолчание
+    /// Включает или выключает слоистую память (рабочий и долговременный
+    /// слои) поверх действующей стратегии контекста. `None` — операторское
+    /// умолчание сервиса (`AGENTD_MEMORY_LAYERS_ENABLED`, выключено по
+    /// умолчанию).
+    #[serde(default)]
+    pub memory_layers_enabled: Option<bool>,
+    /// Включает или выключает автоматический маршрутизатор записей памяти,
+    /// когда слоистая память включена. `None` — операторское умолчание
     /// сервиса (`AGENTD_MEMORY_ROUTER_ENABLED`).
     #[serde(default)]
     pub memory_router_enabled: Option<bool>,
-    /// Размер хвоста краткосрочной памяти (дословных сообщений) для
-    /// стратегии `memory_layers`. `None` — операторское умолчание сервиса
-    /// (`AGENTD_MEMORY_SHORT_TERM_TAIL_MESSAGES`).
-    #[serde(default)]
-    pub memory_short_term_tail: Option<u32>,
     /// Лимит числа записей рабочей памяти, подставляемых в контекст.
     /// `None` — операторское умолчание сервиса
     /// (`AGENTD_MEMORY_WORKING_MAX_ENTRIES`).
@@ -555,8 +550,8 @@ impl Config {
             summary_step_messages: self.summary_step_messages,
             context_strategy: self.context_strategy,
             context_window_messages: self.context_window_messages,
+            memory_layers_enabled: None,
             memory_router_enabled: None,
-            memory_short_term_tail: None,
             memory_working_max_entries: None,
             memory_long_term_max_entries: None,
         }
@@ -788,30 +783,36 @@ server_url = "http://127.0.0.1:9000"
     }
 
     #[test]
-    fn memory_layers_strategy_round_trips_snake_case_json() {
+    fn memory_layers_enabled_round_trips_snake_case_json() {
         let settings = ChatSettings {
-            context_strategy: Some(ContextStrategy::MemoryLayers),
+            memory_layers_enabled: Some(true),
             ..ChatSettings::default()
         };
         let json = serde_json::to_string(&settings).expect("сериализация");
-        assert!(json.contains("\"memory_layers\""));
+        assert!(json.contains("\"memory_layers_enabled\":true"));
         let parsed: ChatSettings = serde_json::from_str(&json).expect("разбор");
-        assert_eq!(parsed.context_strategy, Some(ContextStrategy::MemoryLayers));
+        assert_eq!(parsed.memory_layers_enabled, Some(true));
     }
 
     #[test]
-    fn memory_layers_strategy_parses_from_str() {
-        assert_eq!(ContextStrategy::parse("memory_layers"), Some(ContextStrategy::MemoryLayers));
-        assert_eq!(ContextStrategy::MemoryLayers.as_str(), "memory_layers");
+    fn memory_layers_is_not_a_context_strategy_value() {
+        assert_eq!(ContextStrategy::parse("memory_layers"), None);
     }
 
     #[test]
     fn old_chat_settings_without_memory_fields_parse_as_none() {
         let settings: ChatSettings = serde_json::from_str("{}").expect("настройки чата");
+        assert_eq!(settings.memory_layers_enabled, None);
         assert_eq!(settings.memory_router_enabled, None);
-        assert_eq!(settings.memory_short_term_tail, None);
         assert_eq!(settings.memory_working_max_entries, None);
         assert_eq!(settings.memory_long_term_max_entries, None);
+    }
+
+    #[test]
+    fn chat_settings_with_legacy_short_term_tail_field_parses_without_error() {
+        let settings: ChatSettings =
+            serde_json::from_str(r#"{"memory_short_term_tail": 12}"#).expect("настройки чата");
+        assert_eq!(settings.memory_layers_enabled, None);
     }
 
     #[test]
