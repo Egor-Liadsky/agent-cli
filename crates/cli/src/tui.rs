@@ -209,6 +209,10 @@ enum FormatField {
     SummaryStepMessages,
     ContextStrategy,
     ContextWindowMessages,
+    MemoryRouterEnabled,
+    MemoryShortTermTail,
+    MemoryWorkingMaxEntries,
+    MemoryLongTermMaxEntries,
     Mode,
     Reasoning,
     Thinking,
@@ -289,6 +293,10 @@ impl SettingsSection {
                 FormatField::SummaryEnabled,
                 FormatField::SummaryKeepMessages,
                 FormatField::SummaryStepMessages,
+                FormatField::MemoryRouterEnabled,
+                FormatField::MemoryShortTermTail,
+                FormatField::MemoryWorkingMaxEntries,
+                FormatField::MemoryLongTermMaxEntries,
             ],
             SettingsSection::Format => &[
                 FormatField::Mode,
@@ -395,6 +403,10 @@ impl FormatField {
             FormatField::SummaryStepMessages => "Шаг пересказа (сообщений)",
             FormatField::ContextStrategy => "Стратегия контекста",
             FormatField::ContextWindowMessages => "Окно последних сообщений",
+            FormatField::MemoryRouterEnabled => "Автомаршрутизатор памяти",
+            FormatField::MemoryShortTermTail => "Хвост краткосрочной памяти",
+            FormatField::MemoryWorkingMaxEntries => "Лимит записей рабочей памяти",
+            FormatField::MemoryLongTermMaxEntries => "Лимит записей долговременной памяти",
             FormatField::Mode => "Режим",
             FormatField::Reasoning => "Стратегия рассуждения",
             FormatField::Thinking => "Режим thinking у модели",
@@ -457,12 +469,30 @@ impl FormatField {
                 "◀/▶ или Space — переключить. Стратегия управления контекстом чата: «Умолчание сервиса», «Пересказ» \
 (summary — текущее поведение), «Окно последних сообщений» (sliding_window — старые сообщения отбрасываются без \
 замены), «Устойчивые факты» (facts — ключевые данные диалога хранятся отдельно и уходят вместе с хвостом истории) \
-или «Ветвление диалога» (branching — история собирается по цепочке активной ветки). «Умолчание сервиса» — стратегию \
-определяет переменная AGENTD_CONTEXT_STRATEGY."
+или «Ветвление диалога» (branching — история собирается по цепочке активной ветки), или «Слои памяти» \
+(memory_layers — три слоя: краткосрочная, рабочая, долговременная, с автоматической маршрутизацией записей). \
+«Умолчание сервиса» — стратегию определяет переменная AGENTD_CONTEXT_STRATEGY."
             }
             FormatField::ContextWindowMessages => {
                 "Сколько последних сообщений чата уходят провайдеру при стратегиях «Окно последних сообщений» и \
 «Устойчивые факты». Пусто — действует операторское умолчание сервиса."
+            }
+            FormatField::MemoryRouterEnabled => {
+                "◀/▶ или Space — переключить. Включает или выключает для этого чата автоматический маршрутизатор, \
+который после каждого сообщения решает, что записать в рабочую и долговременную память. «Умолчание сервиса» — \
+решает AGENTD_MEMORY_ROUTER_ENABLED. Имеет смысл только для стратегии «Слои памяти»."
+            }
+            FormatField::MemoryShortTermTail => {
+                "Сколько последних сообщений чата уходят провайдеру дословно как краткосрочная память при стратегии \
+«Слои памяти». Пусто — действует операторское умолчание сервиса."
+            }
+            FormatField::MemoryWorkingMaxEntries => {
+                "Сколько записей рабочей памяти текущей задачи подставляется в контекст при стратегии «Слои памяти». \
+Пусто — действует операторское умолчание сервиса."
+            }
+            FormatField::MemoryLongTermMaxEntries => {
+                "Сколько записей долговременной памяти владельца подставляется в контекст при стратегии «Слои \
+памяти». Пусто — действует операторское умолчание сервиса."
             }
             FormatField::Mode => {
                 "◀/▶ или Space — переключить. Кастомный режим задаёт свой формат ответа вместо формата по умолчанию."
@@ -505,6 +535,7 @@ impl FormatField {
                 | FormatField::Provider
                 | FormatField::SummaryEnabled
                 | FormatField::ContextStrategy
+                | FormatField::MemoryRouterEnabled
         )
     }
 
@@ -523,6 +554,10 @@ impl FormatField {
                 | FormatField::SummaryStepMessages
                 | FormatField::ContextStrategy
                 | FormatField::ContextWindowMessages
+                | FormatField::MemoryRouterEnabled
+                | FormatField::MemoryShortTermTail
+                | FormatField::MemoryWorkingMaxEntries
+                | FormatField::MemoryLongTermMaxEntries
         )
     }
 
@@ -573,6 +608,18 @@ struct SettingsEditor {
     /// Размер окна последних сообщений для стратегий `sliding_window` и
     /// `facts` — настройка этого чата. Пусто — операторское умолчание сервиса.
     context_window_messages: String,
+    /// Автомаршрутизатор памяти этого чата (стратегия `memory_layers`): "" —
+    /// операторское умолчание сервиса, "on"/"off" — явное включение/выключение.
+    memory_router_enabled: String,
+    /// Хвост краткосрочной памяти — настройка этого чата. Пусто —
+    /// операторское умолчание сервиса.
+    memory_short_term_tail: String,
+    /// Лимит записей рабочей памяти — настройка этого чата. Пусто —
+    /// операторское умолчание сервиса.
+    memory_working_max_entries: String,
+    /// Лимит записей долговременной памяти — настройка этого чата. Пусто —
+    /// операторское умолчание сервиса.
+    memory_long_term_max_entries: String,
     /// Облачные модели для переключения стрелками в поле «Модель».
     model_choices: Vec<String>,
     /// Локально скачанные модели Ollama, полученные с `/api/tags`.
@@ -650,6 +697,23 @@ impl SettingsEditor {
                 .context_window_messages
                 .map(|v| v.to_string())
                 .unwrap_or_default(),
+            memory_router_enabled: match settings.memory_router_enabled {
+                None => String::new(),
+                Some(true) => "on".to_string(),
+                Some(false) => "off".to_string(),
+            },
+            memory_short_term_tail: settings
+                .memory_short_term_tail
+                .map(|v| v.to_string())
+                .unwrap_or_default(),
+            memory_working_max_entries: settings
+                .memory_working_max_entries
+                .map(|v| v.to_string())
+                .unwrap_or_default(),
+            memory_long_term_max_entries: settings
+                .memory_long_term_max_entries
+                .map(|v| v.to_string())
+                .unwrap_or_default(),
             // приходит из AppState.model_choices: список сервиса, если фоновый
             // запрос уже ответил, иначе — встроенный/конфигурный список
             model_choices: model_choices.to_vec(),
@@ -705,6 +769,13 @@ impl SettingsEditor {
                 | FormatField::SummaryKeepMessages
                 | FormatField::SummaryStepMessages => self.provider == Provider::Cloud,
                 FormatField::OllamaUrl => self.provider == Provider::Ollama,
+                // параметры слоёв памяти имеют смысл только для своей стратегии
+                FormatField::MemoryRouterEnabled
+                | FormatField::MemoryShortTermTail
+                | FormatField::MemoryWorkingMaxEntries
+                | FormatField::MemoryLongTermMaxEntries => {
+                    self.context_strategy == ContextStrategy::MemoryLayers.as_str()
+                }
                 _ => true,
             })
             .collect()
@@ -817,13 +888,30 @@ impl SettingsEditor {
     /// Перебор стратегий контекста: не задано → summary → sliding_window →
     /// facts → branching → снова не задано.
     fn cycle_context_strategy(&mut self, delta: i32) {
-        const STATES: [&str; 5] = ["", "summary", "sliding_window", "facts", "branching"];
+        const STATES: [&str; 6] =
+            ["", "summary", "sliding_window", "facts", "branching", "memory_layers"];
         let current = STATES
             .iter()
             .position(|s| *s == self.context_strategy)
             .unwrap_or(0) as i32;
         let len = STATES.len() as i32;
         self.context_strategy = STATES[(current + delta).rem_euclid(len) as usize].to_string();
+        // поля памяти появляются и исчезают вместе со стратегией — не даём
+        // курсору уехать за пределы списка полей
+        let len = self.visible_fields().len();
+        self.field = self.field.min(len.saturating_sub(1));
+    }
+
+    /// Перебор трёх состояний автомаршрутизатора памяти: не задано →
+    /// включён → выключен → снова не задано.
+    fn cycle_memory_router_enabled(&mut self, delta: i32) {
+        const STATES: [&str; 3] = ["", "on", "off"];
+        let current = STATES
+            .iter()
+            .position(|s| *s == self.memory_router_enabled)
+            .unwrap_or(0) as i32;
+        let len = STATES.len() as i32;
+        self.memory_router_enabled = STATES[(current + delta).rem_euclid(len) as usize].to_string();
     }
 
     /// Перебор известных моделей стрелками. Если в поле введено что-то своё,
@@ -851,6 +939,7 @@ impl SettingsEditor {
             Some(FormatField::Thinking) => self.thinking = ThinkingMode::default(),
             Some(FormatField::SummaryEnabled) => self.summary_enabled.clear(),
             Some(FormatField::ContextStrategy) => self.context_strategy.clear(),
+            Some(FormatField::MemoryRouterEnabled) => self.memory_router_enabled.clear(),
             _ => {
                 if let Some(value) = self.field_value_mut() {
                     value.clear();
@@ -866,7 +955,8 @@ impl SettingsEditor {
             | FormatField::Thinking
             | FormatField::Provider
             | FormatField::SummaryEnabled
-            | FormatField::ContextStrategy => None,
+            | FormatField::ContextStrategy
+            | FormatField::MemoryRouterEnabled => None,
             FormatField::Model => Some(&mut self.model),
             FormatField::ServerUrl => Some(&mut self.server_url),
             FormatField::ClientToken => Some(&mut self.client_token),
@@ -875,6 +965,9 @@ impl SettingsEditor {
             FormatField::SummaryKeepMessages => Some(&mut self.summary_keep_messages),
             FormatField::SummaryStepMessages => Some(&mut self.summary_step_messages),
             FormatField::ContextWindowMessages => Some(&mut self.context_window_messages),
+            FormatField::MemoryShortTermTail => Some(&mut self.memory_short_term_tail),
+            FormatField::MemoryWorkingMaxEntries => Some(&mut self.memory_working_max_entries),
+            FormatField::MemoryLongTermMaxEntries => Some(&mut self.memory_long_term_max_entries),
             FormatField::Experts => Some(&mut self.experts),
             FormatField::Description => Some(&mut self.description),
             FormatField::MaxLength => Some(&mut self.max_length),
@@ -1025,6 +1118,32 @@ impl SettingsEditor {
 
     fn build_context_window_messages(&self) -> Result<Option<u32>, String> {
         Self::build_summary_count(&self.context_window_messages, "Окно последних сообщений")
+    }
+
+    fn build_memory_router_enabled(&self) -> Option<bool> {
+        match self.memory_router_enabled.as_str() {
+            "on" => Some(true),
+            "off" => Some(false),
+            _ => None,
+        }
+    }
+
+    fn build_memory_short_term_tail(&self) -> Result<Option<u32>, String> {
+        Self::build_summary_count(&self.memory_short_term_tail, "Хвост краткосрочной памяти")
+    }
+
+    fn build_memory_working_max_entries(&self) -> Result<Option<u32>, String> {
+        Self::build_summary_count(
+            &self.memory_working_max_entries,
+            "Лимит записей рабочей памяти",
+        )
+    }
+
+    fn build_memory_long_term_max_entries(&self) -> Result<Option<u32>, String> {
+        Self::build_summary_count(
+            &self.memory_long_term_max_entries,
+            "Лимит записей долговременной памяти",
+        )
     }
 }
 
@@ -1617,6 +1736,80 @@ fn handle_settings_key(
                         })
                     },
                 )
+                .and_then(
+                    |(
+                        format,
+                        sampling,
+                        context_limit,
+                        summary_keep_messages,
+                        summary_step_messages,
+                        context_window_messages,
+                    )| {
+                        editor.build_memory_short_term_tail().map(|memory_short_term_tail| {
+                            (
+                                format,
+                                sampling,
+                                context_limit,
+                                summary_keep_messages,
+                                summary_step_messages,
+                                context_window_messages,
+                                memory_short_term_tail,
+                            )
+                        })
+                    },
+                )
+                .and_then(
+                    |(
+                        format,
+                        sampling,
+                        context_limit,
+                        summary_keep_messages,
+                        summary_step_messages,
+                        context_window_messages,
+                        memory_short_term_tail,
+                    )| {
+                        editor.build_memory_working_max_entries().map(|memory_working_max_entries| {
+                            (
+                                format,
+                                sampling,
+                                context_limit,
+                                summary_keep_messages,
+                                summary_step_messages,
+                                context_window_messages,
+                                memory_short_term_tail,
+                                memory_working_max_entries,
+                            )
+                        })
+                    },
+                )
+                .and_then(
+                    |(
+                        format,
+                        sampling,
+                        context_limit,
+                        summary_keep_messages,
+                        summary_step_messages,
+                        context_window_messages,
+                        memory_short_term_tail,
+                        memory_working_max_entries,
+                    )| {
+                        editor.build_memory_long_term_max_entries().map(
+                            |memory_long_term_max_entries| {
+                                (
+                                    format,
+                                    sampling,
+                                    context_limit,
+                                    summary_keep_messages,
+                                    summary_step_messages,
+                                    context_window_messages,
+                                    memory_short_term_tail,
+                                    memory_working_max_entries,
+                                    memory_long_term_max_entries,
+                                )
+                            },
+                        )
+                    },
+                )
             {
                 Ok((
                     format,
@@ -1625,9 +1818,13 @@ fn handle_settings_key(
                     summary_keep_messages,
                     summary_step_messages,
                     context_window_messages,
+                    memory_short_term_tail,
+                    memory_working_max_entries,
+                    memory_long_term_max_entries,
                 )) => {
                     let summary_enabled = editor.build_summary_enabled();
                     let context_strategy = editor.build_context_strategy();
+                    let memory_router_enabled = editor.build_memory_router_enabled();
                     let reasoning = editor.reasoning;
                     let thinking = editor.thinking;
                     // состав сохраняем всегда: при возврате к «Группе экспертов»
@@ -1657,6 +1854,10 @@ fn handle_settings_key(
                             summary_step_messages,
                             context_strategy,
                             context_window_messages,
+                            memory_router_enabled,
+                            memory_short_term_tail,
+                            memory_working_max_entries,
+                            memory_long_term_max_entries,
                         };
                         // Настройки чата хранит сервис: локально они
                         // применяются ответом на PATCH, а не сразу.
@@ -1775,6 +1976,18 @@ fn handle_settings_key(
                 && editor.current_field() == Some(FormatField::ContextStrategy) =>
         {
             editor.cycle_context_strategy(1);
+        }
+        KeyCode::Left
+            if editor.pane == SettingsPane::Fields
+                && editor.current_field() == Some(FormatField::MemoryRouterEnabled) =>
+        {
+            editor.cycle_memory_router_enabled(-1);
+        }
+        KeyCode::Right | KeyCode::Char(' ')
+            if editor.pane == SettingsPane::Fields
+                && editor.current_field() == Some(FormatField::MemoryRouterEnabled) =>
+        {
+            editor.cycle_memory_router_enabled(1);
         }
         KeyCode::Left => {
             // из полей — обратно к списку разделов
@@ -3813,7 +4026,10 @@ fn empty_field_hint(field: FormatField, editor: &SettingsEditor) -> String {
         }
         FormatField::SummaryKeepMessages
         | FormatField::SummaryStepMessages
-        | FormatField::ContextWindowMessages => {
+        | FormatField::ContextWindowMessages
+        | FormatField::MemoryShortTermTail
+        | FormatField::MemoryWorkingMaxEntries
+        | FormatField::MemoryLongTermMaxEntries => {
             "не задано — действует операторское умолчание сервиса".to_string()
         }
         _ => "не задано — используется значение модели".to_string(),
@@ -3869,6 +4085,14 @@ fn render_settings_fields(f: &mut Frame, editor: &SettingsEditor, area: Rect) {
                 None => "Умолчание сервиса".to_string(),
             },
             FormatField::ContextWindowMessages => editor.context_window_messages.clone(),
+            FormatField::MemoryRouterEnabled => match editor.memory_router_enabled.as_str() {
+                "on" => "Включён".to_string(),
+                "off" => "Выключен".to_string(),
+                _ => "Умолчание сервиса".to_string(),
+            },
+            FormatField::MemoryShortTermTail => editor.memory_short_term_tail.clone(),
+            FormatField::MemoryWorkingMaxEntries => editor.memory_working_max_entries.clone(),
+            FormatField::MemoryLongTermMaxEntries => editor.memory_long_term_max_entries.clone(),
             FormatField::Mode => {
                 if editor.custom_mode {
                     "Кастомный".to_string()
@@ -4316,6 +4540,52 @@ mod tests {
         assert_eq!(editor.build_context_strategy(), Some(ContextStrategy::SlidingWindow));
         editor.cycle_context_strategy(-1);
         assert_eq!(editor.build_context_strategy(), Some(ContextStrategy::Summary));
+    }
+
+    #[test]
+    fn memory_layers_fields_appear_only_for_memory_layers_strategy() {
+        let settings = ChatSettings::default();
+        let session = ChatSession {
+            id: "chat-1".to_string(),
+            title: "Чат".to_string(),
+            messages: Vec::new(),
+            updated_at: 0,
+            settings,
+            history_loaded: true,
+        };
+        let mut editor = SettingsEditor::from_chat(&session, &Config::default(), &[], &[]);
+        editor.section = SettingsSection::ALL
+            .iter()
+            .position(|s| *s == SettingsSection::Context)
+            .expect("раздел «Контекст» существует");
+        assert!(!editor.visible_fields().contains(&FormatField::MemoryRouterEnabled));
+        editor.context_strategy = ContextStrategy::MemoryLayers.as_str().to_string();
+        let fields = editor.visible_fields();
+        assert!(fields.contains(&FormatField::MemoryRouterEnabled));
+        assert!(fields.contains(&FormatField::MemoryShortTermTail));
+        assert!(fields.contains(&FormatField::MemoryWorkingMaxEntries));
+        assert!(fields.contains(&FormatField::MemoryLongTermMaxEntries));
+    }
+
+    #[test]
+    fn memory_router_enabled_cycles_three_states_and_saves_it() {
+        let settings = ChatSettings::default();
+        let session = ChatSession {
+            id: "chat-1".to_string(),
+            title: "Чат".to_string(),
+            messages: Vec::new(),
+            updated_at: 0,
+            settings,
+            history_loaded: true,
+        };
+        let mut editor = SettingsEditor::from_chat(&session, &Config::default(), &[], &[]);
+        assert_eq!(editor.build_memory_router_enabled(), None);
+        editor.cycle_memory_router_enabled(1);
+        assert_eq!(editor.build_memory_router_enabled(), Some(true));
+        editor.cycle_memory_router_enabled(1);
+        assert_eq!(editor.build_memory_router_enabled(), Some(false));
+        editor.cycle_memory_router_enabled(1);
+        assert_eq!(editor.build_memory_router_enabled(), None);
     }
 
     // --- 4.2 Отказ загрузки виден и объясним ---

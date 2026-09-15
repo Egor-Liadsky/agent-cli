@@ -226,14 +226,18 @@ pub enum ContextStrategy {
     Facts,
     /// Ветвление диалога: история собирается по цепочке активной ветки.
     Branching,
+    /// Три слоя памяти (краткосрочная, рабочая, долговременная) с
+    /// маршрутизацией записей и раздельной областью видимости и жизни.
+    MemoryLayers,
 }
 
 impl ContextStrategy {
-    pub const ALL: [ContextStrategy; 4] = [
+    pub const ALL: [ContextStrategy; 5] = [
         ContextStrategy::Summary,
         ContextStrategy::SlidingWindow,
         ContextStrategy::Facts,
         ContextStrategy::Branching,
+        ContextStrategy::MemoryLayers,
     ];
 
     pub fn label(self) -> &'static str {
@@ -242,6 +246,7 @@ impl ContextStrategy {
             ContextStrategy::SlidingWindow => "Окно последних сообщений",
             ContextStrategy::Facts => "Устойчивые факты",
             ContextStrategy::Branching => "Ветвление диалога",
+            ContextStrategy::MemoryLayers => "Слои памяти",
         }
     }
 
@@ -252,6 +257,7 @@ impl ContextStrategy {
             ContextStrategy::SlidingWindow => "sliding_window",
             ContextStrategy::Facts => "facts",
             ContextStrategy::Branching => "branching",
+            ContextStrategy::MemoryLayers => "memory_layers",
         }
     }
 
@@ -261,6 +267,7 @@ impl ContextStrategy {
             "sliding_window" => Some(ContextStrategy::SlidingWindow),
             "facts" => Some(ContextStrategy::Facts),
             "branching" => Some(ContextStrategy::Branching),
+            "memory_layers" => Some(ContextStrategy::MemoryLayers),
             _ => None,
         }
     }
@@ -357,6 +364,26 @@ pub struct ChatSettings {
     /// (`AGENTD_CONTEXT_WINDOW_MESSAGES`).
     #[serde(default)]
     pub context_window_messages: Option<u32>,
+    /// Включает или выключает автоматический маршрутизатор записей памяти
+    /// для стратегии `memory_layers`. `None` — операторское умолчание
+    /// сервиса (`AGENTD_MEMORY_ROUTER_ENABLED`).
+    #[serde(default)]
+    pub memory_router_enabled: Option<bool>,
+    /// Размер хвоста краткосрочной памяти (дословных сообщений) для
+    /// стратегии `memory_layers`. `None` — операторское умолчание сервиса
+    /// (`AGENTD_MEMORY_SHORT_TERM_TAIL_MESSAGES`).
+    #[serde(default)]
+    pub memory_short_term_tail: Option<u32>,
+    /// Лимит числа записей рабочей памяти, подставляемых в контекст.
+    /// `None` — операторское умолчание сервиса
+    /// (`AGENTD_MEMORY_WORKING_MAX_ENTRIES`).
+    #[serde(default)]
+    pub memory_working_max_entries: Option<u32>,
+    /// Лимит числа записей долговременной памяти, подставляемых в контекст.
+    /// `None` — операторское умолчание сервиса
+    /// (`AGENTD_MEMORY_LONG_TERM_MAX_ENTRIES`).
+    #[serde(default)]
+    pub memory_long_term_max_entries: Option<u32>,
 }
 
 impl ChatSettings {
@@ -496,6 +523,10 @@ impl Config {
             summary_step_messages: self.summary_step_messages,
             context_strategy: self.context_strategy,
             context_window_messages: self.context_window_messages,
+            memory_router_enabled: None,
+            memory_short_term_tail: None,
+            memory_working_max_entries: None,
+            memory_long_term_max_entries: None,
         }
     }
 
@@ -722,6 +753,33 @@ server_url = "http://127.0.0.1:9000"
         let chat = config.default_chat_settings();
         config.context_strategy = Some(ContextStrategy::Branching);
         assert_eq!(chat.context_strategy, Some(ContextStrategy::Facts));
+    }
+
+    #[test]
+    fn memory_layers_strategy_round_trips_snake_case_json() {
+        let settings = ChatSettings {
+            context_strategy: Some(ContextStrategy::MemoryLayers),
+            ..ChatSettings::default()
+        };
+        let json = serde_json::to_string(&settings).expect("сериализация");
+        assert!(json.contains("\"memory_layers\""));
+        let parsed: ChatSettings = serde_json::from_str(&json).expect("разбор");
+        assert_eq!(parsed.context_strategy, Some(ContextStrategy::MemoryLayers));
+    }
+
+    #[test]
+    fn memory_layers_strategy_parses_from_str() {
+        assert_eq!(ContextStrategy::parse("memory_layers"), Some(ContextStrategy::MemoryLayers));
+        assert_eq!(ContextStrategy::MemoryLayers.as_str(), "memory_layers");
+    }
+
+    #[test]
+    fn old_chat_settings_without_memory_fields_parse_as_none() {
+        let settings: ChatSettings = serde_json::from_str("{}").expect("настройки чата");
+        assert_eq!(settings.memory_router_enabled, None);
+        assert_eq!(settings.memory_short_term_tail, None);
+        assert_eq!(settings.memory_working_max_entries, None);
+        assert_eq!(settings.memory_long_term_max_entries, None);
     }
 
     #[test]
