@@ -1051,6 +1051,9 @@ pub async fn run(agent: CliAgent, config: Config) -> anyhow::Result<()> {
 
     enable_raw_mode()?;
     let mut stdout = io::stdout();
+    // Mouse capture намеренно не включаем: он перехватывает колесо мыши для
+    // прокрутки, но заодно отключает нативное выделение текста терминалом.
+    // Прокрутка и так доступна с клавиатуры (стрелки, PageUp/PageDown).
     execute!(stdout, EnterAlternateScreen, EnableBracketedPaste)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
