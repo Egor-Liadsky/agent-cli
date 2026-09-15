@@ -1778,7 +1778,9 @@ fn handle_key(
         }
         return LoopControl::Continue;
     }
-    if key.code == KeyCode::Char('m') && key.modifiers.contains(KeyModifiers::CONTROL) {
+    // Ctrl+K, не Ctrl+M: в raw-режиме терминала Ctrl+M неотличим от Enter
+    // (оба шлют \r), поэтому такая привязка никогда бы не сработала.
+    if key.code == KeyCode::Char('k') && key.modifiers.contains(KeyModifiers::CONTROL) {
         if state.focus == Focus::Memory {
             state.memory = None;
             state.focus = Focus::Input;
