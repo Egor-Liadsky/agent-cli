@@ -441,6 +441,103 @@ async fn facts_are_listed_set_and_deleted() {
 }
 
 #[tokio::test]
+async fn working_memory_is_listed_set_and_deleted() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v1/chats/chat-1/memory/working"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "entries": [
+                { "key": "target", "value": "iOS 17+", "source": "manual", "updated_at": 1000 }
+            ]
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chats/chat-1/memory/working"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "key": "budget", "value": "200000", "source": "manual", "updated_at": 2000
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("DELETE"))
+        .and(path("/v1/chats/chat-1/memory/working"))
+        .respond_with(ResponseTemplate::new(204))
+        .mount(&server)
+        .await;
+
+    let client = chats(&server, "token-a");
+    let entries = client.working_memory("chat-1").await.expect("список рабочей памяти");
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].key, "target");
+
+    let set = client.set_working_memory("chat-1", "budget", "200000").await.expect("запись рабочей памяти");
+    assert_eq!(set.value, "200000");
+
+    client.delete_working_memory("chat-1", "budget").await.expect("удаление записи рабочей памяти");
+}
+
+#[tokio::test]
+async fn finish_task_transfers_carried_entries() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chats/chat-1/memory/working/finish-task"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "entries": [
+                { "id": "id-1", "entry_type": "knowledge", "key": "carried", "value": "значение", "source": "router", "updated_at": 3000 }
+            ]
+        })))
+        .mount(&server)
+        .await;
+
+    let client = chats(&server, "token-a");
+    let transferred = client
+        .finish_task("chat-1", &["carried".to_string()])
+        .await
+        .expect("завершение задачи");
+    assert_eq!(transferred.len(), 1);
+    assert_eq!(transferred[0].value, "значение");
+}
+
+#[tokio::test]
+async fn long_term_memory_is_listed_set_and_deleted() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v1/memory/long-term"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "entries": [
+                { "id": "id-1", "entry_type": "decision", "key": "auth", "value": "Clerk", "source": "manual", "updated_at": 1000 }
+            ]
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1/memory/long-term"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": "id-2", "entry_type": "profile", "key": "name", "value": "Егор", "source": "manual", "updated_at": 2000
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("DELETE"))
+        .and(path("/v1/memory/long-term"))
+        .respond_with(ResponseTemplate::new(204))
+        .mount(&server)
+        .await;
+
+    let client = chats(&server, "token-a");
+    let entries = client.long_term_memory().await.expect("список долговременной памяти");
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].entry_type, "decision");
+
+    let set = client
+        .set_long_term_memory("profile", Some("name"), "Егор")
+        .await
+        .expect("запись долговременной памяти");
+    assert_eq!(set.value, "Егор");
+
+    client.delete_long_term_memory("id-2").await.expect("удаление записи долговременной памяти");
+}
+
+#[tokio::test]
 async fn branches_are_listed_created_and_activated() {
     let server = MockServer::start().await;
     Mock::given(method("GET"))

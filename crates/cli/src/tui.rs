@@ -1,7 +1,7 @@
 use crate::agent::CliAgent;
 use agentcore::agent::{AgentReply, Message, MessageMeta, Role};
 use crate::chats::{self, ChatSession};
-use agentclient::{Branch, ChatHistory, ChatSummary, ChatsClient, Fact, StoredMessage};
+use agentclient::{Branch, ChatHistory, ChatSummary, ChatsClient, Fact, LongTermMemoryEntry, StoredMessage, WorkingMemoryEntry};
 use agentcore::config::{
     ChatSettings, Config, ContextStrategy, Provider, ReasoningMode, ResponseFormat, SamplingParams,
     ThinkingMode,
@@ -79,6 +79,20 @@ enum ChatEvent {
     /// Подтверждённое переключение активной ветки
     /// (`POST /v1/chats/{id}/branches/{branch_id}/activate`).
     BranchActivated(String, Result<String, String>),
+    /// Рабочая память чата (`GET /v1/chats/{id}/memory/working`).
+    WorkingMemoryLoaded(String, Result<Vec<WorkingMemoryEntry>, String>),
+    /// Установка записи рабочей памяти (`POST /v1/chats/{id}/memory/working`).
+    WorkingMemorySet(String, Result<WorkingMemoryEntry, String>),
+    /// Удаление записи рабочей памяти (`DELETE /v1/chats/{id}/memory/working`).
+    WorkingMemoryDeleted(String, Result<String, String>),
+    /// Завершение задачи (`POST /v1/chats/{id}/memory/working/finish-task`).
+    TaskFinished(String, Result<Vec<LongTermMemoryEntry>, String>),
+    /// Долговременная память владельца (`GET /v1/memory/long-term`).
+    LongTermMemoryLoaded(String, Result<Vec<LongTermMemoryEntry>, String>),
+    /// Установка записи долговременной памяти (`POST /v1/memory/long-term`).
+    LongTermMemorySet(String, Result<LongTermMemoryEntry, String>),
+    /// Удаление записи долговременной памяти (`DELETE /v1/memory/long-term`).
+    LongTermMemoryDeleted(String, Result<String, String>),
 }
 
 #[derive(PartialEq)]
@@ -90,6 +104,7 @@ enum Focus {
     Confirm,
     Facts,
     Branches,
+    Memory,
 }
 
 /// Запрос подтверждения на удаление чата.
@@ -193,6 +208,113 @@ impl BranchesPicker {
 
     fn selected_branch_id(&self) -> Option<&str> {
         self.branches.get(self.branch_cursor).map(|b| b.id.as_str())
+    }
+}
+
+/// Разделы экрана памяти стратегии `memory_layers` (specs/memory-layers).
+#[derive(Clone, Copy, PartialEq)]
+enum MemorySection {
+    /// Только просмотр хвоста сообщений — редактирования нет: краткосрочная
+    /// память это сама история чата, а не отдельное хранилище.
+    ShortTerm,
+    Working,
+    LongTerm,
+}
+
+impl MemorySection {
+    const ALL: [MemorySection; 3] = [MemorySection::ShortTerm, MemorySection::Working, MemorySection::LongTerm];
+
+    fn label(self) -> &'static str {
+        match self {
+            MemorySection::ShortTerm => "Краткосрочная",
+            MemorySection::Working => "Рабочая",
+            MemorySection::LongTerm => "Долговременная",
+        }
+    }
+}
+
+/// Экран памяти чата на стратегии `memory_layers`: три раздела —
+/// краткосрочная (только просмотр хвоста сообщений), рабочая и
+/// долговременная (просмотр, добавление, правка, удаление записей)
+/// (specs/memory-layers, «Ручное управление памятью через HTTP»).
+struct MemoryPicker {
+    chat_id: String,
+    chat_title: String,
+    section: usize,
+    working: Vec<WorkingMemoryEntry>,
+    working_cursor: usize,
+    working_loading: bool,
+    working_error: Option<String>,
+    long_term: Vec<LongTermMemoryEntry>,
+    long_term_cursor: usize,
+    long_term_loading: bool,
+    long_term_error: Option<String>,
+    /// Открытый редактор записи рабочей или долговременной памяти.
+    editor: Option<MemoryEditor>,
+}
+
+struct MemoryEditor {
+    for_long_term: bool,
+    key: String,
+    value: String,
+    /// Только для долговременной памяти: `profile`/`decision`/`knowledge`.
+    entry_type: String,
+    /// Поле, принимающее ввод: 0 — ключ, 1 — значение, 2 — тип записи
+    /// (только долговременная).
+    field: usize,
+}
+
+impl MemoryPicker {
+    fn new(chat_id: &str, chat_title: &str) -> Self {
+        Self {
+            chat_id: chat_id.to_string(),
+            chat_title: chat_title.to_string(),
+            section: 0,
+            working: Vec::new(),
+            working_cursor: 0,
+            working_loading: true,
+            working_error: None,
+            long_term: Vec::new(),
+            long_term_cursor: 0,
+            long_term_loading: true,
+            long_term_error: None,
+            editor: None,
+        }
+    }
+
+    fn current_section(&self) -> MemorySection {
+        MemorySection::ALL[self.section.min(MemorySection::ALL.len() - 1)]
+    }
+
+    fn cycle_section(&mut self, delta: i32) {
+        let len = MemorySection::ALL.len() as i32;
+        self.section = (self.section as i32 + delta).rem_euclid(len) as usize;
+    }
+
+    fn move_cursor(&mut self, delta: i32) {
+        match self.current_section() {
+            MemorySection::ShortTerm => {}
+            MemorySection::Working => {
+                let len = self.working.len() as i32;
+                if len > 0 {
+                    self.working_cursor = (self.working_cursor as i32 + delta).rem_euclid(len) as usize;
+                }
+            }
+            MemorySection::LongTerm => {
+                let len = self.long_term.len() as i32;
+                if len > 0 {
+                    self.long_term_cursor = (self.long_term_cursor as i32 + delta).rem_euclid(len) as usize;
+                }
+            }
+        }
+    }
+
+    fn selected_working_key(&self) -> Option<&str> {
+        self.working.get(self.working_cursor).map(|e| e.key.as_str())
+    }
+
+    fn selected_long_term_id(&self) -> Option<&str> {
+        self.long_term.get(self.long_term_cursor).map(|e| e.id.as_str())
     }
 }
 
@@ -1272,6 +1394,8 @@ struct AppState {
     facts: Option<FactsPicker>,
     /// Экран веток чата, если он открыт.
     branches: Option<BranchesPicker>,
+    /// Экран памяти чата (стратегия `memory_layers`), если он открыт.
+    memory: Option<MemoryPicker>,
     /// Короткое уведомление внизу экрана (например, «скопировано»).
     notice: Option<(String, Instant)>,
     /// Показывать ли цепочку рассуждений модели в истории.
@@ -1368,7 +1492,7 @@ impl AppState {
             }
             return;
         }
-        if matches!(self.focus, Focus::Import | Focus::Confirm | Focus::Facts | Focus::Branches) {
+        if matches!(self.focus, Focus::Import | Focus::Confirm | Focus::Facts | Focus::Branches | Focus::Memory) {
             return;
         }
         let Some(chat_id) = self.active_chat_id() else {
@@ -1413,6 +1537,7 @@ async fn run_app(
         delete_confirm: None,
         facts: None,
         branches: None,
+        memory: None,
         notice: None,
         show_reasoning: true,
         ollama_models: Vec::new(),
@@ -1494,7 +1619,7 @@ fn handle_global_key(
         return Some(LoopControl::Break);
     }
     if key.code == KeyCode::Char('n') && key.modifiers.contains(KeyModifiers::CONTROL) {
-        if matches!(state.focus, Focus::Settings | Focus::Import | Focus::Confirm | Focus::Facts | Focus::Branches)
+        if matches!(state.focus, Focus::Settings | Focus::Import | Focus::Confirm | Focus::Facts | Focus::Branches | Focus::Memory)
             || state.active_pending()
         {
             return Some(LoopControl::Continue);
@@ -1553,7 +1678,7 @@ fn handle_global_key(
         });
         return Some(LoopControl::Continue);
     }
-    if matches!(state.focus, Focus::Settings | Focus::Import | Focus::Confirm | Focus::Facts | Focus::Branches) {
+    if matches!(state.focus, Focus::Settings | Focus::Import | Focus::Confirm | Focus::Facts | Focus::Branches | Focus::Memory) {
         return None;
     }
     if key.code == KeyCode::Char('w') && key.modifiers.contains(KeyModifiers::CONTROL) {
@@ -1598,7 +1723,7 @@ fn handle_key(
         if state.focus == Focus::Import {
             state.import = None;
             state.focus = Focus::Input;
-        } else if !matches!(state.focus, Focus::Settings | Focus::Confirm | Focus::Facts | Focus::Branches)
+        } else if !matches!(state.focus, Focus::Settings | Focus::Confirm | Focus::Facts | Focus::Branches | Focus::Memory)
             && let Some(chat_index) = state.active_chat_index() {
                 state.import = Some(ImportPicker::new(&state.chats[chat_index], &state.chats));
                 state.focus = Focus::Import;
@@ -1606,7 +1731,7 @@ fn handle_key(
         return LoopControl::Continue;
     }
     if key.code == KeyCode::Char('p') && key.modifiers.contains(KeyModifiers::CONTROL) {
-        if matches!(state.focus, Focus::Import | Focus::Confirm | Focus::Facts | Focus::Branches) {
+        if matches!(state.focus, Focus::Import | Focus::Confirm | Focus::Facts | Focus::Branches | Focus::Memory) {
             return LoopControl::Continue;
         }
         if state.focus == Focus::Settings {
@@ -1653,16 +1778,32 @@ fn handle_key(
         }
         return LoopControl::Continue;
     }
+    if key.code == KeyCode::Char('m') && key.modifiers.contains(KeyModifiers::CONTROL) {
+        if state.focus == Focus::Memory {
+            state.memory = None;
+            state.focus = Focus::Input;
+        } else if matches!(state.focus, Focus::Input | Focus::Sidebar)
+            && let Some(chat_index) = state.active_chat_index()
+        {
+            let chat_id = state.chats[chat_index].id.clone();
+            let chat_title = state.chats[chat_index].title.clone();
+            state.memory = Some(MemoryPicker::new(&chat_id, &chat_title));
+            state.focus = Focus::Memory;
+            request_working_memory(state, &chat_id, tx);
+            request_long_term_memory(state, &chat_id, tx);
+        }
+        return LoopControl::Continue;
+    }
     if key.code == KeyCode::Tab
         && !matches!(
             state.focus,
-            Focus::Settings | Focus::Import | Focus::Confirm | Focus::Facts | Focus::Branches
+            Focus::Settings | Focus::Import | Focus::Confirm | Focus::Facts | Focus::Branches | Focus::Memory
         )
     {
         state.focus = match state.focus {
             Focus::Input => Focus::Sidebar,
             Focus::Sidebar => Focus::Input,
-            Focus::Settings | Focus::Import | Focus::Confirm | Focus::Facts | Focus::Branches => unreachable!(),
+            Focus::Settings | Focus::Import | Focus::Confirm | Focus::Facts | Focus::Branches | Focus::Memory => unreachable!(),
         };
         return LoopControl::Continue;
     }
@@ -1673,6 +1814,7 @@ fn handle_key(
         Focus::Confirm => handle_confirm_key(key, state, tx),
         Focus::Facts => handle_facts_key(key, state, tx),
         Focus::Branches => handle_branches_key(key, state, tx),
+        Focus::Memory => handle_memory_key(key, state, tx),
         Focus::Sidebar => handle_sidebar_key(key, state, tx),
         Focus::Input => {
             if state.active_pending() || state.active_chat_id().is_none() {
@@ -2333,6 +2475,140 @@ fn handle_branches_key(
     LoopControl::Continue
 }
 
+fn handle_memory_key(
+    key: crossterm::event::KeyEvent,
+    state: &mut AppState,
+    tx: &mpsc::UnboundedSender<ChatEvent>,
+) -> LoopControl {
+    let picker = state.memory.as_mut().expect("memory focus implies picker");
+
+    if let Some(editor) = picker.editor.as_mut() {
+        match key.code {
+            KeyCode::Esc => picker.editor = None,
+            KeyCode::Tab => {
+                let fields = if editor.for_long_term { 3 } else { 2 };
+                editor.field = (editor.field + 1) % fields;
+            }
+            KeyCode::Enter => {
+                let key_text = editor.key.trim().to_string();
+                let value_text = editor.value.trim().to_string();
+                if key_text.is_empty() {
+                    state.notify("Ключ записи памяти не может быть пустым");
+                    return LoopControl::Continue;
+                }
+                let chat_id = picker.chat_id.clone();
+                if editor.for_long_term {
+                    let entry_type = editor.entry_type.clone();
+                    request_set_long_term_memory(state, &chat_id, &entry_type, &key_text, &value_text, tx);
+                } else {
+                    request_set_working_memory(state, &chat_id, &key_text, &value_text, tx);
+                }
+            }
+            KeyCode::Left | KeyCode::Right if editor.for_long_term && editor.field == 2 => {
+                const TYPES: [&str; 3] = ["profile", "decision", "knowledge"];
+                let current = TYPES.iter().position(|t| *t == editor.entry_type).unwrap_or(0) as i32;
+                let delta = if key.code == KeyCode::Right { 1 } else { -1 };
+                let len = TYPES.len() as i32;
+                editor.entry_type = TYPES[(current + delta).rem_euclid(len) as usize].to_string();
+            }
+            KeyCode::Backspace => match editor.field {
+                0 => {
+                    editor.key.pop();
+                }
+                1 => {
+                    editor.value.pop();
+                }
+                _ => {}
+            },
+            KeyCode::Char(c) => match editor.field {
+                0 => editor.key.push(c),
+                1 => editor.value.push(c),
+                _ => {}
+            },
+            _ => {}
+        }
+        return LoopControl::Continue;
+    }
+
+    match key.code {
+        KeyCode::Esc => {
+            state.memory = None;
+            state.focus = Focus::Input;
+        }
+        KeyCode::Left => picker.cycle_section(-1),
+        KeyCode::Right => picker.cycle_section(1),
+        KeyCode::Up => picker.move_cursor(-1),
+        KeyCode::Down => picker.move_cursor(1),
+        KeyCode::Char('n') => match picker.current_section() {
+            MemorySection::ShortTerm => {}
+            MemorySection::Working => {
+                picker.editor = Some(MemoryEditor {
+                    for_long_term: false,
+                    key: String::new(),
+                    value: String::new(),
+                    entry_type: String::new(),
+                    field: 0,
+                });
+            }
+            MemorySection::LongTerm => {
+                picker.editor = Some(MemoryEditor {
+                    for_long_term: true,
+                    key: String::new(),
+                    value: String::new(),
+                    entry_type: "knowledge".to_string(),
+                    field: 0,
+                });
+            }
+        },
+        KeyCode::Enter => match picker.current_section() {
+            MemorySection::ShortTerm => {}
+            MemorySection::Working => {
+                if let Some(entry) = picker.working.get(picker.working_cursor) {
+                    picker.editor = Some(MemoryEditor {
+                        for_long_term: false,
+                        key: entry.key.clone(),
+                        value: entry.value.clone(),
+                        entry_type: String::new(),
+                        field: 1,
+                    });
+                }
+            }
+            MemorySection::LongTerm => {
+                if let Some(entry) = picker.long_term.get(picker.long_term_cursor) {
+                    picker.editor = Some(MemoryEditor {
+                        for_long_term: true,
+                        key: entry.key.clone().unwrap_or_default(),
+                        value: entry.value.clone(),
+                        entry_type: entry.entry_type.clone(),
+                        field: 1,
+                    });
+                }
+            }
+        },
+        KeyCode::Char('d') => match picker.current_section() {
+            MemorySection::ShortTerm => {}
+            MemorySection::Working => {
+                if let Some(key) = picker.selected_working_key().map(str::to_string) {
+                    let chat_id = picker.chat_id.clone();
+                    request_delete_working_memory(state, &chat_id, &key, tx);
+                }
+            }
+            MemorySection::LongTerm => {
+                if let Some(id) = picker.selected_long_term_id().map(str::to_string) {
+                    let chat_id = picker.chat_id.clone();
+                    request_delete_long_term_memory(state, &chat_id, &id, tx);
+                }
+            }
+        },
+        KeyCode::Char('t') if picker.current_section() == MemorySection::Working => {
+            let chat_id = picker.chat_id.clone();
+            request_finish_task(state, &chat_id, tx);
+        }
+        _ => {}
+    }
+    LoopControl::Continue
+}
+
 fn handle_confirm_key(
     key: crossterm::event::KeyEvent,
     state: &mut AppState,
@@ -2700,6 +2976,115 @@ fn request_activate_branch(state: &AppState, chat_id: &str, branch_id: &str, tx:
     });
 }
 
+// --- Память (specs/memory-layers) ---
+
+fn request_working_memory(state: &AppState, chat_id: &str, tx: &mpsc::UnboundedSender<ChatEvent>) {
+    let client = state.chats_client.clone();
+    let tx = tx.clone();
+    let id = chat_id.to_string();
+    tokio::spawn(async move {
+        let result = client.working_memory(&id).await.map_err(|err| failure_text(&err));
+        let _ = tx.send(ChatEvent::WorkingMemoryLoaded(id, result));
+    });
+}
+
+fn request_set_working_memory(
+    state: &AppState,
+    chat_id: &str,
+    key: &str,
+    value: &str,
+    tx: &mpsc::UnboundedSender<ChatEvent>,
+) {
+    let client = state.chats_client.clone();
+    let tx = tx.clone();
+    let id = chat_id.to_string();
+    let key = key.to_string();
+    let value = value.to_string();
+    tokio::spawn(async move {
+        let result = client.set_working_memory(&id, &key, &value).await.map_err(|err| failure_text(&err));
+        let _ = tx.send(ChatEvent::WorkingMemorySet(id, result));
+    });
+}
+
+fn request_delete_working_memory(state: &AppState, chat_id: &str, key: &str, tx: &mpsc::UnboundedSender<ChatEvent>) {
+    let client = state.chats_client.clone();
+    let tx = tx.clone();
+    let id = chat_id.to_string();
+    let key = key.to_string();
+    tokio::spawn(async move {
+        let result = client
+            .delete_working_memory(&id, &key)
+            .await
+            .map(|()| key.clone())
+            .map_err(|err| failure_text(&err));
+        let _ = tx.send(ChatEvent::WorkingMemoryDeleted(id, result));
+    });
+}
+
+fn request_finish_task(state: &AppState, chat_id: &str, tx: &mpsc::UnboundedSender<ChatEvent>) {
+    let client = state.chats_client.clone();
+    let tx = tx.clone();
+    let id = chat_id.to_string();
+    tokio::spawn(async move {
+        // Ручное завершение задачи из TUI переносит все записи текущей
+        // рабочей памяти без выборочного отбора: точечный выбор ключей для
+        // переноса остаётся полем маршрутизатора и HTTP-клиентов сервиса.
+        let result = client.finish_task(&id, &[]).await.map_err(|err| failure_text(&err));
+        let _ = tx.send(ChatEvent::TaskFinished(id, result));
+    });
+}
+
+fn request_long_term_memory(state: &AppState, chat_id: &str, tx: &mpsc::UnboundedSender<ChatEvent>) {
+    let client = state.chats_client.clone();
+    let tx = tx.clone();
+    let id = chat_id.to_string();
+    tokio::spawn(async move {
+        let result = client.long_term_memory().await.map_err(|err| failure_text(&err));
+        let _ = tx.send(ChatEvent::LongTermMemoryLoaded(id, result));
+    });
+}
+
+fn request_set_long_term_memory(
+    state: &AppState,
+    chat_id: &str,
+    entry_type: &str,
+    key: &str,
+    value: &str,
+    tx: &mpsc::UnboundedSender<ChatEvent>,
+) {
+    let client = state.chats_client.clone();
+    let tx = tx.clone();
+    let id = chat_id.to_string();
+    let entry_type = entry_type.to_string();
+    let key = key.to_string();
+    let value = value.to_string();
+    tokio::spawn(async move {
+        let key_arg = if key.is_empty() { None } else { Some(key.as_str()) };
+        let result = client.set_long_term_memory(&entry_type, key_arg, &value).await.map_err(|err| failure_text(&err));
+        let _ = tx.send(ChatEvent::LongTermMemorySet(id, result));
+    });
+}
+
+fn request_delete_long_term_memory(
+    state: &AppState,
+    chat_id: &str,
+    entry_id: &str,
+    tx: &mpsc::UnboundedSender<ChatEvent>,
+) {
+    let client = state.chats_client.clone();
+    let tx = tx.clone();
+    let id = chat_id.to_string();
+    let entry_id = entry_id.to_string();
+    tokio::spawn(async move {
+        let result = client
+            .delete_long_term_memory(&entry_id)
+            .await
+            .map(|()| entry_id.clone())
+            .map_err(|err| failure_text(&err));
+        let _ = tx.send(ChatEvent::LongTermMemoryDeleted(id, result));
+    });
+}
+
 /// Фоновый запрос списка локальных моделей Ollama.
 fn fetch_ollama_models(config: &Config, tx: &mpsc::UnboundedSender<ChatEvent>) {
     let url = config.effective_ollama_url();
@@ -2792,6 +3177,34 @@ fn handle_chat_event(
         }
         ChatEvent::BranchActivated(chat_id, result) => {
             handle_branch_activated(chat_id, result, state, tx);
+            return;
+        }
+        ChatEvent::WorkingMemoryLoaded(chat_id, result) => {
+            handle_working_memory_loaded(chat_id, result, state);
+            return;
+        }
+        ChatEvent::WorkingMemorySet(chat_id, result) => {
+            handle_working_memory_set(chat_id, result, state);
+            return;
+        }
+        ChatEvent::WorkingMemoryDeleted(chat_id, result) => {
+            handle_working_memory_deleted(chat_id, result, state);
+            return;
+        }
+        ChatEvent::TaskFinished(chat_id, result) => {
+            handle_task_finished(chat_id, result, state, tx);
+            return;
+        }
+        ChatEvent::LongTermMemoryLoaded(chat_id, result) => {
+            handle_long_term_memory_loaded(chat_id, result, state);
+            return;
+        }
+        ChatEvent::LongTermMemorySet(chat_id, result) => {
+            handle_long_term_memory_set(chat_id, result, state);
+            return;
+        }
+        ChatEvent::LongTermMemoryDeleted(chat_id, result) => {
+            handle_long_term_memory_deleted(chat_id, result, state);
             return;
         }
         other => other,
@@ -3117,6 +3530,125 @@ fn handle_branch_activated(
     }
 }
 
+// --- Память (specs/memory-layers) ---
+
+fn handle_working_memory_loaded(chat_id: String, result: Result<Vec<WorkingMemoryEntry>, String>, state: &mut AppState) {
+    let Some(picker) = state.memory.as_mut() else { return };
+    if picker.chat_id != chat_id {
+        return;
+    }
+    picker.working_loading = false;
+    match result {
+        Ok(entries) => {
+            picker.working_cursor = picker.working_cursor.min(entries.len().saturating_sub(1));
+            picker.working = entries;
+            picker.working_error = None;
+        }
+        Err(reason) => picker.working_error = Some(reason),
+    }
+}
+
+fn handle_working_memory_set(chat_id: String, result: Result<WorkingMemoryEntry, String>, state: &mut AppState) {
+    let Some(picker) = state.memory.as_mut() else { return };
+    if picker.chat_id != chat_id {
+        return;
+    }
+    match result {
+        Ok(entry) => {
+            picker.editor = None;
+            if let Some(existing) = picker.working.iter_mut().find(|e| e.key == entry.key) {
+                *existing = entry;
+            } else {
+                picker.working.push(entry);
+                picker.working.sort_by(|a, b| a.key.cmp(&b.key));
+            }
+        }
+        Err(reason) => state.notify(format!("Не удалось сохранить запись рабочей памяти: {reason}")),
+    }
+}
+
+fn handle_working_memory_deleted(chat_id: String, result: Result<String, String>, state: &mut AppState) {
+    let Some(picker) = state.memory.as_mut() else { return };
+    if picker.chat_id != chat_id {
+        return;
+    }
+    match result {
+        Ok(key) => {
+            picker.working.retain(|e| e.key != key);
+            picker.working_cursor = picker.working_cursor.min(picker.working.len().saturating_sub(1));
+        }
+        Err(reason) => state.notify(format!("Не удалось удалить запись рабочей памяти: {reason}")),
+    }
+}
+
+fn handle_task_finished(
+    chat_id: String,
+    result: Result<Vec<LongTermMemoryEntry>, String>,
+    state: &mut AppState,
+    tx: &mpsc::UnboundedSender<ChatEvent>,
+) {
+    match result {
+        Ok(transferred) => {
+            state.notify(format!("Задача завершена, перенесено записей: {}", transferred.len()));
+            if let Some(picker) = state.memory.as_ref()
+                && picker.chat_id == chat_id
+            {
+                request_working_memory(state, &chat_id, tx);
+                request_long_term_memory(state, &chat_id, tx);
+            }
+        }
+        Err(reason) => state.notify(format!("Не удалось завершить задачу: {reason}")),
+    }
+}
+
+fn handle_long_term_memory_loaded(chat_id: String, result: Result<Vec<LongTermMemoryEntry>, String>, state: &mut AppState) {
+    let Some(picker) = state.memory.as_mut() else { return };
+    if picker.chat_id != chat_id {
+        return;
+    }
+    picker.long_term_loading = false;
+    match result {
+        Ok(entries) => {
+            picker.long_term_cursor = picker.long_term_cursor.min(entries.len().saturating_sub(1));
+            picker.long_term = entries;
+            picker.long_term_error = None;
+        }
+        Err(reason) => picker.long_term_error = Some(reason),
+    }
+}
+
+fn handle_long_term_memory_set(chat_id: String, result: Result<LongTermMemoryEntry, String>, state: &mut AppState) {
+    let Some(picker) = state.memory.as_mut() else { return };
+    if picker.chat_id != chat_id {
+        return;
+    }
+    match result {
+        Ok(entry) => {
+            picker.editor = None;
+            if let Some(existing) = picker.long_term.iter_mut().find(|e| e.id == entry.id) {
+                *existing = entry;
+            } else {
+                picker.long_term.push(entry);
+            }
+        }
+        Err(reason) => state.notify(format!("Не удалось сохранить запись долговременной памяти: {reason}")),
+    }
+}
+
+fn handle_long_term_memory_deleted(chat_id: String, result: Result<String, String>, state: &mut AppState) {
+    let Some(picker) = state.memory.as_mut() else { return };
+    if picker.chat_id != chat_id {
+        return;
+    }
+    match result {
+        Ok(id) => {
+            picker.long_term.retain(|e| e.id != id);
+            picker.long_term_cursor = picker.long_term_cursor.min(picker.long_term.len().saturating_sub(1));
+        }
+        Err(reason) => state.notify(format!("Не удалось удалить запись долговременной памяти: {reason}")),
+    }
+}
+
 /// Обновить список локальных моделей в состоянии и в открытом редакторе
 /// настроек. Ошибка не мешает работе: облачные чаты от неё не зависят.
 fn handle_ollama_models(result: Result<Vec<String>, String>, state: &mut AppState) {
@@ -3222,6 +3754,16 @@ fn render_ui(f: &mut Frame, state: &mut AppState) {
     }
     if let Some(picker) = &state.branches {
         render_branches_popup(f, picker);
+    }
+    if let Some(picker) = &state.memory {
+        let tail: Vec<Message> = state
+            .chat_index(&picker.chat_id)
+            .map(|index| {
+                let messages = &state.chats[index].messages;
+                messages.iter().rev().take(10).rev().cloned().collect()
+            })
+            .unwrap_or_default();
+        render_memory_popup(f, picker, &tail);
     }
 }
 
@@ -3330,6 +3872,27 @@ fn context_status_line(context: &agentcore::config::ContextObservability) -> Str
     if let Some(branch_id) = &context.branch_id {
         let short: String = branch_id.chars().take(8).collect();
         parts.push(format!("ветка {short}"));
+    }
+    if let Some(entries) = context.memory_long_term_entries {
+        let chars = context.memory_long_term_chars.unwrap_or(0);
+        parts.push(format!("долговременная {entries} ({chars} симв.)"));
+    }
+    if let Some(entries) = context.memory_working_entries {
+        let chars = context.memory_working_chars.unwrap_or(0);
+        parts.push(format!("рабочая {entries} ({chars} симв.)"));
+    }
+    if let Some(messages) = context.memory_short_term_messages {
+        let chars = context.memory_short_term_chars.unwrap_or(0);
+        parts.push(format!("краткосрочная {messages} сообщ. ({chars} симв.)"));
+    }
+    let router_applied = context.memory_router_applied_set.unwrap_or(0)
+        + context.memory_router_applied_update.unwrap_or(0)
+        + context.memory_router_applied_delete.unwrap_or(0);
+    if router_applied > 0 || context.memory_router_rejected.unwrap_or(0) > 0 {
+        parts.push(format!(
+            "маршрутизатор: применено {router_applied}, отброшено {}",
+            context.memory_router_rejected.unwrap_or(0)
+        ));
     }
     parts.join(" · ")
 }
@@ -4414,6 +4977,183 @@ fn render_branches_popup(f: &mut Frame, picker: &BranchesPicker) {
     );
 }
 
+/// Экран памяти чата на стратегии `memory_layers`: три раздела —
+/// краткосрочная (только просмотр хвоста сообщений), рабочая и
+/// долговременная (просмотр, добавление, правка, удаление записей)
+/// (specs/memory-layers, «Ручное управление памятью через HTTP»).
+fn render_memory_popup(f: &mut Frame, picker: &MemoryPicker, short_term_tail: &[Message]) {
+    let area = centered_rect(76, 24, f.area());
+    f.render_widget(Clear, area);
+
+    let title = format!(" Память чата «{}» ", picker.chat_title);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan))
+        .title(title);
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(1), Constraint::Length(1), Constraint::Min(0), Constraint::Length(1)])
+        .split(inner);
+
+    let tabs: Vec<Span> = MemorySection::ALL
+        .iter()
+        .enumerate()
+        .flat_map(|(index, section)| {
+            let style = if index == picker.section {
+                Style::default().fg(Color::Black).bg(Color::Cyan).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::White)
+            };
+            vec![Span::styled(format!(" {} ", section.label()), style), Span::raw(" ")]
+        })
+        .collect();
+    f.render_widget(Paragraph::new(Line::from(tabs)), rows[0]);
+
+    if let Some(editor) = &picker.editor {
+        render_memory_editor(f, editor, rows[2].union(rows[1]));
+        f.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                " Tab — переключить поле · ←/→ — тип записи · Enter — сохранить · Esc — отмена",
+                Style::default().fg(Color::DarkGray),
+            ))),
+            rows[3],
+        );
+        return;
+    }
+
+    let lines: Vec<Line> = match picker.current_section() {
+        MemorySection::ShortTerm => {
+            if short_term_tail.is_empty() {
+                vec![Line::from(Span::styled(" Сообщений пока нет", Style::default().fg(Color::DarkGray)))]
+            } else {
+                short_term_tail
+                    .iter()
+                    .map(|m| {
+                        let who = match m.role {
+                            Role::User => "Вы",
+                            Role::Assistant => "Модель",
+                            Role::System => "Система",
+                        };
+                        Line::from(Span::raw(format!(" {who}: {}", m.content)))
+                    })
+                    .collect()
+            }
+        }
+        MemorySection::Working => {
+            if picker.working_loading {
+                vec![Line::from(Span::styled(" Загрузка...", Style::default().fg(Color::DarkGray)))]
+            } else if let Some(error) = &picker.working_error {
+                vec![Line::from(Span::styled(format!(" Ошибка: {error}"), Style::default().fg(Color::Red)))]
+            } else if picker.working.is_empty() {
+                vec![Line::from(Span::styled(
+                    " Рабочей памяти пока нет — n добавит первую запись",
+                    Style::default().fg(Color::DarkGray),
+                ))]
+            } else {
+                picker
+                    .working
+                    .iter()
+                    .enumerate()
+                    .map(|(index, entry)| {
+                        let style = if index == picker.working_cursor {
+                            Style::default().fg(Color::Black).bg(Color::Cyan).add_modifier(Modifier::BOLD)
+                        } else {
+                            Style::default().fg(Color::White)
+                        };
+                        Line::from(Span::styled(
+                            format!(" [{}] {}: {}", entry.source, entry.key, entry.value),
+                            style,
+                        ))
+                    })
+                    .collect()
+            }
+        }
+        MemorySection::LongTerm => {
+            if picker.long_term_loading {
+                vec![Line::from(Span::styled(" Загрузка...", Style::default().fg(Color::DarkGray)))]
+            } else if let Some(error) = &picker.long_term_error {
+                vec![Line::from(Span::styled(format!(" Ошибка: {error}"), Style::default().fg(Color::Red)))]
+            } else if picker.long_term.is_empty() {
+                vec![Line::from(Span::styled(
+                    " Долговременной памяти пока нет — n добавит первую запись",
+                    Style::default().fg(Color::DarkGray),
+                ))]
+            } else {
+                picker
+                    .long_term
+                    .iter()
+                    .enumerate()
+                    .map(|(index, entry)| {
+                        let style = if index == picker.long_term_cursor {
+                            Style::default().fg(Color::Black).bg(Color::Cyan).add_modifier(Modifier::BOLD)
+                        } else {
+                            Style::default().fg(Color::White)
+                        };
+                        Line::from(Span::styled(
+                            format!(
+                                " [{}] {}: {}",
+                                entry.entry_type,
+                                entry.key.as_deref().unwrap_or("(без ключа)"),
+                                entry.value
+                            ),
+                            style,
+                        ))
+                    })
+                    .collect()
+            }
+        }
+    };
+    f.render_widget(Paragraph::new(Text::from(lines)).wrap(Wrap { trim: false }), rows[2]);
+
+    let hint = match picker.current_section() {
+        MemorySection::ShortTerm => " ←/→ — раздел · Esc — закрыть",
+        MemorySection::Working => " ←/→ — раздел · ↑/↓ — выбор · Enter — править · n — новая · d — удалить · t — завершить задачу · Esc — закрыть",
+        MemorySection::LongTerm => " ←/→ — раздел · ↑/↓ — выбор · Enter — править · n — новая · d — удалить · Esc — закрыть",
+    };
+    f.render_widget(Paragraph::new(Line::from(Span::styled(hint, Style::default().fg(Color::DarkGray)))), rows[3]);
+}
+
+fn render_memory_editor(f: &mut Frame, editor: &MemoryEditor, area: Rect) {
+    let field_count = if editor.for_long_term { 3 } else { 2 };
+    let mut constraints = vec![Constraint::Length(1); field_count];
+    constraints.push(Constraint::Min(0));
+    let rows = Layout::default().direction(Direction::Vertical).constraints(constraints).split(area);
+
+    let field_style = |index: usize| {
+        if editor.field == index {
+            Style::default().fg(Color::Black).bg(Color::Cyan)
+        } else {
+            Style::default().fg(Color::White)
+        }
+    };
+    f.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::raw(" Ключ: "),
+            Span::styled(editor.key.clone(), field_style(0)),
+        ])),
+        rows[0],
+    );
+    f.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::raw(" Значение: "),
+            Span::styled(editor.value.clone(), field_style(1)),
+        ])),
+        rows[1],
+    );
+    if editor.for_long_term {
+        f.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::raw(" Тип: "),
+                Span::styled(editor.entry_type.clone(), field_style(2)),
+            ])),
+            rows[2],
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4450,6 +5190,7 @@ mod tests {
             delete_confirm: None,
             facts: None,
             branches: None,
+            memory: None,
             notice: None,
             show_reasoning: true,
             ollama_models: Vec::new(),
@@ -4986,6 +5727,53 @@ mod tests {
         assert!(line.contains("отброшено 14"));
         assert!(!line.contains("факт"), "поля стратегии facts не должны выводиться: {line}");
         assert!(!line.contains("ветка"), "поле стратегии branching не должно выводиться: {line}");
+    }
+
+    #[test]
+    fn context_status_line_shows_memory_layers_breakdown() {
+        use agentcore::config::{ContextObservability, ContextStrategy};
+
+        let context = ContextObservability {
+            strategy: Some(ContextStrategy::MemoryLayers),
+            memory_long_term_entries: Some(2),
+            memory_long_term_chars: Some(40),
+            memory_working_entries: Some(1),
+            memory_working_chars: Some(10),
+            memory_short_term_messages: Some(4),
+            memory_short_term_chars: Some(80),
+            memory_router_applied_set: Some(1),
+            memory_router_rejected: Some(1),
+            ..ContextObservability::default()
+        };
+
+        let line = context_status_line(&context);
+
+        assert!(line.contains("долговременная 2"));
+        assert!(line.contains("рабочая 1"));
+        assert!(line.contains("краткосрочная 4 сообщ."));
+        assert!(line.contains("применено 1"));
+        assert!(line.contains("отброшено 1"));
+    }
+
+    // --- 8.2 Экран памяти ---
+
+    #[test]
+    fn memory_picker_cycles_sections_and_moves_cursor_within_section() {
+        let mut picker = MemoryPicker::new("chat-1", "Чат");
+        picker.working = vec![
+            WorkingMemoryEntry { key: "a".to_string(), value: "1".to_string(), source: "manual".to_string(), updated_at: 1 },
+            WorkingMemoryEntry { key: "b".to_string(), value: "2".to_string(), source: "manual".to_string(), updated_at: 2 },
+        ];
+        assert!(matches!(picker.current_section(), MemorySection::ShortTerm));
+        picker.cycle_section(1);
+        assert!(matches!(picker.current_section(), MemorySection::Working));
+        picker.move_cursor(1);
+        assert_eq!(picker.working_cursor, 1);
+        assert_eq!(picker.selected_working_key(), Some("b"));
+        picker.cycle_section(1);
+        assert!(matches!(picker.current_section(), MemorySection::LongTerm));
+        picker.cycle_section(1);
+        assert!(matches!(picker.current_section(), MemorySection::ShortTerm), "цикл разделов замкнут");
     }
 
     // --- 8.3 Экран фактов ---

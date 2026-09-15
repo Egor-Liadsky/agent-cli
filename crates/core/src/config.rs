@@ -305,6 +305,38 @@ pub struct ContextObservability {
     /// Ветка, из которой собрана история (стратегия `branching`).
     #[serde(default)]
     pub branch_id: Option<String>,
+    /// Число записей долговременной памяти в контексте (стратегия `memory_layers`).
+    #[serde(default)]
+    pub memory_long_term_entries: Option<u32>,
+    /// Объём долговременной памяти в контексте, в символах (`memory_layers`).
+    #[serde(default)]
+    pub memory_long_term_chars: Option<u32>,
+    /// Число записей рабочей памяти в контексте (`memory_layers`).
+    #[serde(default)]
+    pub memory_working_entries: Option<u32>,
+    /// Объём рабочей памяти в контексте, в символах (`memory_layers`).
+    #[serde(default)]
+    pub memory_working_chars: Option<u32>,
+    /// Число сообщений хвоста краткосрочной памяти (`memory_layers`).
+    #[serde(default)]
+    pub memory_short_term_messages: Option<u32>,
+    /// Объём хвоста краткосрочной памяти, в символах (`memory_layers`).
+    #[serde(default)]
+    pub memory_short_term_chars: Option<u32>,
+    /// Сколько операций `set` маршрутизатора памяти применено — новые
+    /// ключи, счётчики относятся к маршрутизации ПРЕДЫДУЩЕГО сообщения
+    /// (`memory_layers`).
+    #[serde(default)]
+    pub memory_router_applied_set: Option<u32>,
+    /// Сколько операций маршрутизатора обновили существующий ключ (`memory_layers`).
+    #[serde(default)]
+    pub memory_router_applied_update: Option<u32>,
+    /// Сколько операций `delete` маршрутизатора применено (`memory_layers`).
+    #[serde(default)]
+    pub memory_router_applied_delete: Option<u32>,
+    /// Сколько операций маршрутизатора отброшено валидацией (`memory_layers`).
+    #[serde(default)]
+    pub memory_router_rejected: Option<u32>,
 }
 
 /// Параметры агента, привязанные к конкретному чату.

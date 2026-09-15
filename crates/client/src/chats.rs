@@ -60,6 +60,26 @@ pub struct Fact {
     pub through_seq: i64,
 }
 
+/// Запись рабочей памяти активной задачи чата — стратегия `memory_layers`.
+#[derive(Debug, Clone)]
+pub struct WorkingMemoryEntry {
+    pub key: String,
+    pub value: String,
+    pub source: String,
+    pub updated_at: i64,
+}
+
+/// Запись долговременной памяти владельца — стратегия `memory_layers`.
+#[derive(Debug, Clone)]
+pub struct LongTermMemoryEntry {
+    pub id: String,
+    pub entry_type: String,
+    pub key: Option<String>,
+    pub value: String,
+    pub source: String,
+    pub updated_at: i64,
+}
+
 /// Ветка чата стратегии `branching`.
 #[derive(Debug, Clone)]
 pub struct Branch {
@@ -311,6 +331,82 @@ impl ChatsClient {
             None,
         )
         .await?;
+        Ok(())
+    }
+
+    /// Рабочая память активной задачи чата (specs/memory-layers, «Ручное
+    /// управление памятью через HTTP»).
+    pub async fn working_memory(&self, chat_id: &str) -> Result<Vec<WorkingMemoryEntry>> {
+        let payload: WorkingMemoryPayload = self
+            .send(
+                reqwest::Method::GET,
+                self.url(&format!("/chats/{chat_id}/memory/working")),
+                None,
+            )
+            .await?;
+        Ok(payload.entries.into_iter().map(WorkingMemoryEntry::from).collect())
+    }
+
+    pub async fn set_working_memory(&self, chat_id: &str, key: &str, value: &str) -> Result<WorkingMemoryEntry> {
+        let payload: WorkingMemoryEntryPayload = self
+            .send(
+                reqwest::Method::POST,
+                self.url(&format!("/chats/{chat_id}/memory/working")),
+                Some(serde_json::json!({ "key": key, "value": value })),
+            )
+            .await?;
+        Ok(WorkingMemoryEntry::from(payload))
+    }
+
+    pub async fn delete_working_memory(&self, chat_id: &str, key: &str) -> Result<()> {
+        self.send_raw(
+            reqwest::Method::DELETE,
+            self.url(&format!("/chats/{chat_id}/memory/working?key={key}")),
+            None,
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// Явное завершение текущей задачи: перенос отмеченных ключей в
+    /// долговременную память, затем очистка рабочей памяти прежней задачи
+    /// (specs/memory-layers, «Рабочая память привязана к задаче»).
+    pub async fn finish_task(&self, chat_id: &str, carry_forward_keys: &[String]) -> Result<Vec<LongTermMemoryEntry>> {
+        let payload: LongTermMemoryPayload = self
+            .send(
+                reqwest::Method::POST,
+                self.url(&format!("/chats/{chat_id}/memory/working/finish-task")),
+                Some(serde_json::json!({ "carry_forward_keys": carry_forward_keys })),
+            )
+            .await?;
+        Ok(payload.entries.into_iter().map(LongTermMemoryEntry::from).collect())
+    }
+
+    /// Долговременная память владельца (specs/memory-layers).
+    pub async fn long_term_memory(&self) -> Result<Vec<LongTermMemoryEntry>> {
+        let payload: LongTermMemoryPayload =
+            self.send(reqwest::Method::GET, self.url("/memory/long-term"), None).await?;
+        Ok(payload.entries.into_iter().map(LongTermMemoryEntry::from).collect())
+    }
+
+    pub async fn set_long_term_memory(
+        &self,
+        entry_type: &str,
+        key: Option<&str>,
+        value: &str,
+    ) -> Result<LongTermMemoryEntry> {
+        let payload: LongTermMemoryEntryPayload = self
+            .send(
+                reqwest::Method::POST,
+                self.url("/memory/long-term"),
+                Some(serde_json::json!({ "entry_type": entry_type, "key": key, "value": value })),
+            )
+            .await?;
+        Ok(LongTermMemoryEntry::from(payload))
+    }
+
+    pub async fn delete_long_term_memory(&self, id: &str) -> Result<()> {
+        self.send_raw(reqwest::Method::DELETE, self.url(&format!("/memory/long-term?id={id}")), None).await?;
         Ok(())
     }
 
@@ -607,6 +703,56 @@ impl From<FactPayload> for Fact {
             value: payload.value,
             updated_at: payload.updated_at,
             through_seq: payload.through_seq,
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct WorkingMemoryPayload {
+    #[serde(default)]
+    entries: Vec<WorkingMemoryEntryPayload>,
+}
+
+#[derive(Deserialize)]
+struct WorkingMemoryEntryPayload {
+    key: String,
+    value: String,
+    source: String,
+    updated_at: i64,
+}
+
+impl From<WorkingMemoryEntryPayload> for WorkingMemoryEntry {
+    fn from(payload: WorkingMemoryEntryPayload) -> Self {
+        Self { key: payload.key, value: payload.value, source: payload.source, updated_at: payload.updated_at }
+    }
+}
+
+#[derive(Deserialize)]
+struct LongTermMemoryPayload {
+    #[serde(default)]
+    entries: Vec<LongTermMemoryEntryPayload>,
+}
+
+#[derive(Deserialize)]
+struct LongTermMemoryEntryPayload {
+    id: String,
+    entry_type: String,
+    #[serde(default)]
+    key: Option<String>,
+    value: String,
+    source: String,
+    updated_at: i64,
+}
+
+impl From<LongTermMemoryEntryPayload> for LongTermMemoryEntry {
+    fn from(payload: LongTermMemoryEntryPayload) -> Self {
+        Self {
+            id: payload.id,
+            entry_type: payload.entry_type,
+            key: payload.key,
+            value: payload.value,
+            source: payload.source,
+            updated_at: payload.updated_at,
         }
     }
 }

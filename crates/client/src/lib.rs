@@ -227,6 +227,26 @@ struct ContextPayload {
     facts_updated: Option<bool>,
     #[serde(default)]
     branch_id: Option<String>,
+    #[serde(default)]
+    memory_long_term_entries: Option<u32>,
+    #[serde(default)]
+    memory_long_term_chars: Option<u32>,
+    #[serde(default)]
+    memory_working_entries: Option<u32>,
+    #[serde(default)]
+    memory_working_chars: Option<u32>,
+    #[serde(default)]
+    memory_short_term_messages: Option<u32>,
+    #[serde(default)]
+    memory_short_term_chars: Option<u32>,
+    #[serde(default)]
+    memory_router_applied_set: Option<u32>,
+    #[serde(default)]
+    memory_router_applied_update: Option<u32>,
+    #[serde(default)]
+    memory_router_applied_delete: Option<u32>,
+    #[serde(default)]
+    memory_router_rejected: Option<u32>,
 }
 
 impl From<ContextPayload> for agentcore::config::ContextObservability {
@@ -240,6 +260,16 @@ impl From<ContextPayload> for agentcore::config::ContextObservability {
             facts_applied: payload.facts_applied,
             facts_updated: payload.facts_updated,
             branch_id: payload.branch_id,
+            memory_long_term_entries: payload.memory_long_term_entries,
+            memory_long_term_chars: payload.memory_long_term_chars,
+            memory_working_entries: payload.memory_working_entries,
+            memory_working_chars: payload.memory_working_chars,
+            memory_short_term_messages: payload.memory_short_term_messages,
+            memory_short_term_chars: payload.memory_short_term_chars,
+            memory_router_applied_set: payload.memory_router_applied_set,
+            memory_router_applied_update: payload.memory_router_applied_update,
+            memory_router_applied_delete: payload.memory_router_applied_delete,
+            memory_router_rejected: payload.memory_router_rejected,
         }
     }
 }
@@ -550,7 +580,9 @@ pub async fn list_models(server_url: &str, token: &str) -> Result<Vec<String>> {
 }
 
 mod chats;
-pub use chats::{Branch, ChatHistory, ChatSummary, ChatsClient, Fact, StoredMessage};
+pub use chats::{
+    Branch, ChatHistory, ChatSummary, ChatsClient, Fact, LongTermMemoryEntry, StoredMessage, WorkingMemoryEntry,
+};
 
 #[cfg(test)]
 mod tests;
