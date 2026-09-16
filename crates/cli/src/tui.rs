@@ -99,6 +99,14 @@ enum ChatEvent {
     LongTermMemorySet(String, Result<LongTermMemoryEntry, String>),
     /// Удаление записи долговременной памяти (`DELETE /v1/memory/long-term`).
     LongTermMemoryDeleted(String, Result<String, String>),
+    /// Состояние задачи чата (`GET /v1/chats/{id}/task`).
+    TaskLoaded(String, Result<agentclient::TaskState, String>),
+    /// Переход состояния задачи (`POST /v1/chats/{id}/task/transition`).
+    TaskTransitioned(String, Result<agentclient::TaskState, String>),
+    /// Пауза задачи (`POST /v1/chats/{id}/task/pause`).
+    TaskPaused(String, Result<agentclient::TaskState, String>),
+    /// Снятие задачи с паузы (`POST /v1/chats/{id}/task/resume`).
+    TaskResumed(String, Result<agentclient::TaskState, String>),
 }
 
 #[derive(PartialEq)]
@@ -111,6 +119,7 @@ enum Focus {
     Facts,
     Branches,
     Memory,
+    Task,
 }
 
 /// Запрос подтверждения на удаление чата.
@@ -324,6 +333,68 @@ impl MemoryPicker {
     }
 }
 
+/// Экран состояния задачи чата по `Ctrl+T`: этап, шаг, ожидаемое действие,
+/// пауза и последние переходы; переход по допустимым рёбрам, правка
+/// текстов, пауза и возобновление (specs/task-state, design.md решение 9).
+struct TaskPicker {
+    chat_id: String,
+    chat_title: String,
+    state: Option<agentclient::TaskState>,
+    loading: bool,
+    error: Option<String>,
+    /// Индекс предложенного следующего этапа в
+    /// `allowed_next_stages(текущий этап)`, сдвинутый на 1: 0 — «без смены
+    /// этапа». Недопустимые рёбра в список не попадают — автомат на сервере
+    /// остаётся арбитром, но клиент не предлагает заведомо отклоняемый
+    /// переход (design.md, решение 9).
+    next_stage_cursor: usize,
+    /// Открытая правка шага или ожидаемого действия.
+    editor: Option<TaskFieldEditor>,
+}
+
+struct TaskFieldEditor {
+    editing_expected_action: bool,
+    value: String,
+}
+
+impl TaskPicker {
+    fn new(chat_id: &str, chat_title: &str) -> Self {
+        Self {
+            chat_id: chat_id.to_string(),
+            chat_title: chat_title.to_string(),
+            state: None,
+            loading: true,
+            error: None,
+            next_stage_cursor: 0,
+            editor: None,
+        }
+    }
+
+    /// Допустимые следующие этапы для текущего состояния, пустой список у
+    /// незагруженного состояния или у задачи в `done`.
+    fn allowed_next_stages(&self) -> Vec<&'static str> {
+        self.state
+            .as_ref()
+            .map(|task| agentclient::allowed_next_stages(&task.stage))
+            .unwrap_or_default()
+    }
+
+    fn cycle_next_stage(&mut self, delta: i32) {
+        let len = self.allowed_next_stages().len() as i32 + 1;
+        self.next_stage_cursor = (self.next_stage_cursor as i32 + delta).rem_euclid(len) as usize;
+    }
+
+    /// `None` — «без смены этапа» (курсор на позиции 0).
+    fn selected_next_stage(&self) -> Option<&'static str> {
+        let options = self.allowed_next_stages();
+        if self.next_stage_cursor == 0 {
+            None
+        } else {
+            options.get(self.next_stage_cursor - 1).copied()
+        }
+    }
+}
+
 #[derive(Clone, Copy, PartialEq)]
 enum FormatField {
     Provider,
@@ -342,6 +413,8 @@ enum FormatField {
     MemoryRouterEnabled,
     MemoryWorkingMaxEntries,
     MemoryLongTermMaxEntries,
+    TaskStateEnabled,
+    TaskStateAutoEnabled,
     Mode,
     Reasoning,
     Thinking,
@@ -435,6 +508,8 @@ impl SettingsSection {
                 FormatField::MemoryRouterEnabled,
                 FormatField::MemoryWorkingMaxEntries,
                 FormatField::MemoryLongTermMaxEntries,
+                FormatField::TaskStateEnabled,
+                FormatField::TaskStateAutoEnabled,
             ],
             SettingsSection::Format => &[
                 FormatField::Mode,
@@ -546,6 +621,8 @@ impl FormatField {
             FormatField::MemoryRouterEnabled => "Автомаршрутизатор памяти",
             FormatField::MemoryWorkingMaxEntries => "Лимит записей рабочей памяти",
             FormatField::MemoryLongTermMaxEntries => "Лимит записей долговременной памяти",
+            FormatField::TaskStateEnabled => "Состояние задачи",
+            FormatField::TaskStateAutoEnabled => "Автотрекер состояния задачи",
             FormatField::Mode => "Режим",
             FormatField::Reasoning => "Стратегия рассуждения",
             FormatField::Thinking => "Режим thinking у модели",
@@ -640,6 +717,16 @@ AGENTD_MEMORY_LAYERS_ENABLED (по умолчанию выключено)."
                 "Сколько записей долговременной памяти владельца подставляется в контекст при включённой слоистой \
 памяти. Пусто — действует операторское умолчание сервиса."
             }
+            FormatField::TaskStateEnabled => {
+                "◀/▶ или Space — переключить. Включает или выключает для этого чата явное состояние активной задачи \
+(этап, шаг, ожидаемое действие) — экран Ctrl+T и раздел в системном сообщении. «Умолчание сервиса» — решает \
+AGENTD_TASK_STATE_ENABLED (по умолчанию выключено)."
+            }
+            FormatField::TaskStateAutoEnabled => {
+                "◀/▶ или Space — переключить. Включает или выключает автоматический трекер, который после каждого \
+ответа предлагает переход состояния задачи. «Умолчание сервиса» — решает AGENTD_TASK_STATE_AUTO_ENABLED. Имеет \
+смысл только при включённом состоянии задачи."
+            }
             FormatField::Mode => {
                 "◀/▶ или Space — переключить. Кастомный режим задаёт свой формат ответа вместо формата по умолчанию."
             }
@@ -683,6 +770,8 @@ AGENTD_MEMORY_LAYERS_ENABLED (по умолчанию выключено)."
                 | FormatField::ContextStrategy
                 | FormatField::MemoryLayersEnabled
                 | FormatField::MemoryRouterEnabled
+                | FormatField::TaskStateEnabled
+                | FormatField::TaskStateAutoEnabled
         )
     }
 
@@ -706,6 +795,8 @@ AGENTD_MEMORY_LAYERS_ENABLED (по умолчанию выключено)."
                 | FormatField::MemoryRouterEnabled
                 | FormatField::MemoryWorkingMaxEntries
                 | FormatField::MemoryLongTermMaxEntries
+                | FormatField::TaskStateEnabled
+                | FormatField::TaskStateAutoEnabled
         )
     }
 
@@ -777,6 +868,13 @@ struct SettingsEditor {
     /// Лимит записей долговременной памяти — настройка этого чата. Пусто —
     /// операторское умолчание сервиса.
     memory_long_term_max_entries: String,
+    /// Состояние задачи этого чата: "" — операторское умолчание сервиса,
+    /// "on"/"off" — явное включение/выключение (specs/task-state).
+    task_state_enabled: String,
+    /// Автоматический трекер состояния задачи этого чата: "" — операторское
+    /// умолчание сервиса, "on"/"off" — явное включение/выключение. Имеет
+    /// смысл только при включённом состоянии задачи.
+    task_state_auto_enabled: String,
     /// Облачные модели для переключения стрелками в поле «Модель».
     model_choices: Vec<String>,
     /// Локально скачанные модели Ollama, полученные с `/api/tags`.
@@ -875,6 +973,16 @@ impl SettingsEditor {
                 .memory_long_term_max_entries
                 .map(|v| v.to_string())
                 .unwrap_or_default(),
+            task_state_enabled: match settings.task_state_enabled {
+                None => String::new(),
+                Some(true) => "on".to_string(),
+                Some(false) => "off".to_string(),
+            },
+            task_state_auto_enabled: match settings.task_state_auto_enabled {
+                None => String::new(),
+                Some(true) => "on".to_string(),
+                Some(false) => "off".to_string(),
+            },
             // приходит из AppState.model_choices: список сервиса, если фоновый
             // запрос уже ответил, иначе — встроенный/конфигурный список
             model_choices: model_choices.to_vec(),
@@ -935,6 +1043,8 @@ impl SettingsEditor {
                 FormatField::MemoryRouterEnabled
                 | FormatField::MemoryWorkingMaxEntries
                 | FormatField::MemoryLongTermMaxEntries => self.memory_layers_enabled == "on",
+                // автотрекер имеет смысл только при включённом состоянии задачи
+                FormatField::TaskStateAutoEnabled => self.task_state_enabled == "on",
                 _ => true,
             })
             .collect()
@@ -1084,6 +1194,33 @@ impl SettingsEditor {
         self.memory_router_enabled = STATES[(current + delta).rem_euclid(len) as usize].to_string();
     }
 
+    /// Перебор трёх состояний состояния задачи: не задано → включено →
+    /// выключено → снова не задано.
+    fn cycle_task_state_enabled(&mut self, delta: i32) {
+        const STATES: [&str; 3] = ["", "on", "off"];
+        let current = STATES
+            .iter()
+            .position(|s| *s == self.task_state_enabled)
+            .unwrap_or(0) as i32;
+        let len = STATES.len() as i32;
+        self.task_state_enabled = STATES[(current + delta).rem_euclid(len) as usize].to_string();
+        // поле автотрекера появляется и исчезает вместе с переключателем
+        let len = self.visible_fields().len();
+        self.field = self.field.min(len.saturating_sub(1));
+    }
+
+    /// Перебор трёх состояний автотрекера состояния задачи: не задано →
+    /// включён → выключен → снова не задано.
+    fn cycle_task_state_auto_enabled(&mut self, delta: i32) {
+        const STATES: [&str; 3] = ["", "on", "off"];
+        let current = STATES
+            .iter()
+            .position(|s| *s == self.task_state_auto_enabled)
+            .unwrap_or(0) as i32;
+        let len = STATES.len() as i32;
+        self.task_state_auto_enabled = STATES[(current + delta).rem_euclid(len) as usize].to_string();
+    }
+
     /// Перебор известных моделей стрелками. Если в поле введено что-то своё,
     /// перебор начинается с первой модели списка.
     fn cycle_model(&mut self, delta: i32) {
@@ -1133,6 +1270,8 @@ impl SettingsEditor {
             Some(FormatField::ContextStrategy) => self.context_strategy.clear(),
             Some(FormatField::MemoryLayersEnabled) => self.memory_layers_enabled.clear(),
             Some(FormatField::MemoryRouterEnabled) => self.memory_router_enabled.clear(),
+            Some(FormatField::TaskStateEnabled) => self.task_state_enabled.clear(),
+            Some(FormatField::TaskStateAutoEnabled) => self.task_state_auto_enabled.clear(),
             _ => {
                 if let Some(value) = self.field_value_mut() {
                     value.clear();
@@ -1150,7 +1289,9 @@ impl SettingsEditor {
             | FormatField::SummaryEnabled
             | FormatField::ContextStrategy
             | FormatField::MemoryLayersEnabled
-            | FormatField::MemoryRouterEnabled => None,
+            | FormatField::MemoryRouterEnabled
+            | FormatField::TaskStateEnabled
+            | FormatField::TaskStateAutoEnabled => None,
             FormatField::Model => Some(&mut self.model),
             FormatField::ServerUrl => Some(&mut self.server_url),
             FormatField::ClientToken => Some(&mut self.client_token),
@@ -1335,6 +1476,22 @@ impl SettingsEditor {
         }
     }
 
+    fn build_task_state_enabled(&self) -> Option<bool> {
+        match self.task_state_enabled.as_str() {
+            "on" => Some(true),
+            "off" => Some(false),
+            _ => None,
+        }
+    }
+
+    fn build_task_state_auto_enabled(&self) -> Option<bool> {
+        match self.task_state_auto_enabled.as_str() {
+            "on" => Some(true),
+            "off" => Some(false),
+            _ => None,
+        }
+    }
+
     fn build_memory_working_max_entries(&self) -> Result<Option<u32>, String> {
         Self::build_summary_count(
             &self.memory_working_max_entries,
@@ -1477,6 +1634,8 @@ struct AppState {
     branches: Option<BranchesPicker>,
     /// Экран слоистой памяти чата, если он открыт.
     memory: Option<MemoryPicker>,
+    /// Экран состояния задачи чата, если он открыт.
+    task: Option<TaskPicker>,
     /// Короткое уведомление внизу экрана (например, «скопировано»).
     notice: Option<(String, Instant)>,
     /// Показывать ли цепочку рассуждений модели в истории.
@@ -1622,6 +1781,7 @@ async fn run_app(
         facts: None,
         branches: None,
         memory: None,
+        task: None,
         notice: None,
         show_reasoning: true,
         ollama_models: Vec::new(),
@@ -1885,16 +2045,37 @@ fn handle_key(
         }
         return LoopControl::Continue;
     }
+    if key.code == KeyCode::Char('t') && key.modifiers.contains(KeyModifiers::CONTROL) {
+        if state.focus == Focus::Task {
+            state.task = None;
+            state.focus = Focus::Input;
+        } else if matches!(state.focus, Focus::Input | Focus::Sidebar)
+            && let Some(chat_index) = state.active_chat_index()
+        {
+            let chat_id = state.chats[chat_index].id.clone();
+            let chat_title = state.chats[chat_index].title.clone();
+            state.task = Some(TaskPicker::new(&chat_id, &chat_title));
+            state.focus = Focus::Task;
+            request_task(state, &chat_id, tx);
+        }
+        return LoopControl::Continue;
+    }
     if key.code == KeyCode::Tab
         && !matches!(
             state.focus,
-            Focus::Settings | Focus::Import | Focus::Confirm | Focus::Facts | Focus::Branches | Focus::Memory
+            Focus::Settings | Focus::Import | Focus::Confirm | Focus::Facts | Focus::Branches | Focus::Memory | Focus::Task
         )
     {
         state.focus = match state.focus {
             Focus::Input => Focus::Sidebar,
             Focus::Sidebar => Focus::Input,
-            Focus::Settings | Focus::Import | Focus::Confirm | Focus::Facts | Focus::Branches | Focus::Memory => unreachable!(),
+            Focus::Settings
+            | Focus::Import
+            | Focus::Confirm
+            | Focus::Facts
+            | Focus::Branches
+            | Focus::Memory
+            | Focus::Task => unreachable!(),
         };
         return LoopControl::Continue;
     }
@@ -1906,6 +2087,7 @@ fn handle_key(
         Focus::Facts => handle_facts_key(key, state, tx),
         Focus::Branches => handle_branches_key(key, state, tx),
         Focus::Memory => handle_memory_key(key, state, tx),
+        Focus::Task => handle_task_key(key, state, tx),
         Focus::Sidebar => handle_sidebar_key(key, state, tx),
         Focus::Input => {
             if state.active_pending() || state.active_chat_id().is_none() {
@@ -2033,6 +2215,8 @@ fn handle_settings_key(
                     let profile_id = editor.build_profile_id();
                     let memory_layers_enabled = editor.build_memory_layers_enabled();
                     let memory_router_enabled = editor.build_memory_router_enabled();
+                    let task_state_enabled = editor.build_task_state_enabled();
+                    let task_state_auto_enabled = editor.build_task_state_auto_enabled();
                     let reasoning = editor.reasoning;
                     let thinking = editor.thinking;
                     // состав сохраняем всегда: при возврате к «Группе экспертов»
@@ -2067,6 +2251,8 @@ fn handle_settings_key(
                             memory_working_max_entries,
                             memory_long_term_max_entries,
                             profile_id,
+                            task_state_enabled,
+                            task_state_auto_enabled,
                         };
                         // Настройки чата хранит сервис: локально они
                         // применяются ответом на PATCH, а не сразу.
@@ -2221,6 +2407,30 @@ fn handle_settings_key(
                 && editor.current_field() == Some(FormatField::MemoryRouterEnabled) =>
         {
             editor.cycle_memory_router_enabled(1);
+        }
+        KeyCode::Left
+            if editor.pane == SettingsPane::Fields
+                && editor.current_field() == Some(FormatField::TaskStateEnabled) =>
+        {
+            editor.cycle_task_state_enabled(-1);
+        }
+        KeyCode::Right | KeyCode::Char(' ')
+            if editor.pane == SettingsPane::Fields
+                && editor.current_field() == Some(FormatField::TaskStateEnabled) =>
+        {
+            editor.cycle_task_state_enabled(1);
+        }
+        KeyCode::Left
+            if editor.pane == SettingsPane::Fields
+                && editor.current_field() == Some(FormatField::TaskStateAutoEnabled) =>
+        {
+            editor.cycle_task_state_auto_enabled(-1);
+        }
+        KeyCode::Right | KeyCode::Char(' ')
+            if editor.pane == SettingsPane::Fields
+                && editor.current_field() == Some(FormatField::TaskStateAutoEnabled) =>
+        {
+            editor.cycle_task_state_auto_enabled(1);
         }
         KeyCode::Left => {
             // из полей — обратно к списку разделов
@@ -2694,6 +2904,79 @@ fn handle_memory_key(
         KeyCode::Char('t') if picker.current_section() == MemorySection::Working => {
             let chat_id = picker.chat_id.clone();
             request_finish_task(state, &chat_id, tx);
+        }
+        _ => {}
+    }
+    LoopControl::Continue
+}
+
+/// Экран состояния задачи по `Ctrl+T`: перебор допустимых следующих этапов
+/// стрелками, Enter — применить; `s`/`a` — правка шага/ожидаемого действия;
+/// `p`/`r` — пауза/возобновление (specs/task-state, design.md решение 9).
+fn handle_task_key(
+    key: crossterm::event::KeyEvent,
+    state: &mut AppState,
+    tx: &mpsc::UnboundedSender<ChatEvent>,
+) -> LoopControl {
+    let picker = state.task.as_mut().expect("task focus implies picker");
+
+    if let Some(editor) = picker.editor.as_mut() {
+        match key.code {
+            KeyCode::Esc => picker.editor = None,
+            KeyCode::Enter => {
+                let chat_id = picker.chat_id.clone();
+                let value = editor.value.trim().to_string();
+                if editor.editing_expected_action {
+                    request_task_transition(state, &chat_id, None, None, Some(&value), tx);
+                } else {
+                    request_task_transition(state, &chat_id, None, Some(&value), None, tx);
+                }
+            }
+            KeyCode::Backspace => {
+                editor.value.pop();
+            }
+            KeyCode::Char(c) => editor.value.push(c),
+            _ => {}
+        }
+        return LoopControl::Continue;
+    }
+
+    match key.code {
+        KeyCode::Esc => {
+            state.task = None;
+            state.focus = Focus::Input;
+        }
+        KeyCode::Left => picker.cycle_next_stage(-1),
+        KeyCode::Right => picker.cycle_next_stage(1),
+        KeyCode::Enter => {
+            if let Some(stage) = picker.selected_next_stage() {
+                let chat_id = picker.chat_id.clone();
+                request_task_transition(state, &chat_id, Some(stage), None, None, tx);
+            }
+        }
+        KeyCode::Char('s') => {
+            if let Some(task) = &picker.state {
+                picker.editor = Some(TaskFieldEditor {
+                    editing_expected_action: false,
+                    value: task.step.clone(),
+                });
+            }
+        }
+        KeyCode::Char('a') => {
+            if let Some(task) = &picker.state {
+                picker.editor = Some(TaskFieldEditor {
+                    editing_expected_action: true,
+                    value: task.expected_action.clone(),
+                });
+            }
+        }
+        KeyCode::Char('p') => {
+            let chat_id = picker.chat_id.clone();
+            request_task_pause(state, &chat_id, tx);
+        }
+        KeyCode::Char('r') => {
+            let chat_id = picker.chat_id.clone();
+            request_task_resume(state, &chat_id, tx);
         }
         _ => {}
     }
@@ -3194,6 +3477,61 @@ fn request_delete_long_term_memory(
     });
 }
 
+/// Состояние задачи чата вместе с журналом переходов (specs/task-state).
+fn request_task(state: &AppState, chat_id: &str, tx: &mpsc::UnboundedSender<ChatEvent>) {
+    let client = state.chats_client.clone();
+    let tx = tx.clone();
+    let id = chat_id.to_string();
+    tokio::spawn(async move {
+        let result = client.task(&id).await.map_err(|err| failure_text(&err));
+        let _ = tx.send(ChatEvent::TaskLoaded(id, result));
+    });
+}
+
+#[allow(clippy::too_many_arguments)]
+fn request_task_transition(
+    state: &AppState,
+    chat_id: &str,
+    stage: Option<&str>,
+    step: Option<&str>,
+    expected_action: Option<&str>,
+    tx: &mpsc::UnboundedSender<ChatEvent>,
+) {
+    let client = state.chats_client.clone();
+    let tx = tx.clone();
+    let id = chat_id.to_string();
+    let stage = stage.map(str::to_string);
+    let step = step.map(str::to_string);
+    let expected_action = expected_action.map(str::to_string);
+    tokio::spawn(async move {
+        let result = client
+            .task_transition(&id, stage.as_deref(), step.as_deref(), expected_action.as_deref(), &[])
+            .await
+            .map_err(|err| failure_text(&err));
+        let _ = tx.send(ChatEvent::TaskTransitioned(id, result));
+    });
+}
+
+fn request_task_pause(state: &AppState, chat_id: &str, tx: &mpsc::UnboundedSender<ChatEvent>) {
+    let client = state.chats_client.clone();
+    let tx = tx.clone();
+    let id = chat_id.to_string();
+    tokio::spawn(async move {
+        let result = client.task_pause(&id).await.map_err(|err| failure_text(&err));
+        let _ = tx.send(ChatEvent::TaskPaused(id, result));
+    });
+}
+
+fn request_task_resume(state: &AppState, chat_id: &str, tx: &mpsc::UnboundedSender<ChatEvent>) {
+    let client = state.chats_client.clone();
+    let tx = tx.clone();
+    let id = chat_id.to_string();
+    tokio::spawn(async move {
+        let result = client.task_resume(&id).await.map_err(|err| failure_text(&err));
+        let _ = tx.send(ChatEvent::TaskResumed(id, result));
+    });
+}
+
 /// Фоновый запрос списка локальных моделей Ollama.
 fn fetch_ollama_models(config: &Config, tx: &mpsc::UnboundedSender<ChatEvent>) {
     let url = config.effective_ollama_url();
@@ -3332,6 +3670,22 @@ fn handle_chat_event(
         }
         ChatEvent::LongTermMemoryDeleted(chat_id, result) => {
             handle_long_term_memory_deleted(chat_id, result, state);
+            return;
+        }
+        ChatEvent::TaskLoaded(chat_id, result) => {
+            handle_task_loaded(chat_id, result, state);
+            return;
+        }
+        ChatEvent::TaskTransitioned(chat_id, result) => {
+            handle_task_transitioned(chat_id, result, state);
+            return;
+        }
+        ChatEvent::TaskPaused(chat_id, result) => {
+            handle_task_transitioned(chat_id, result, state);
+            return;
+        }
+        ChatEvent::TaskResumed(chat_id, result) => {
+            handle_task_transitioned(chat_id, result, state);
             return;
         }
         other => other,
@@ -3786,6 +4140,49 @@ fn handle_long_term_memory_deleted(chat_id: String, result: Result<String, Strin
     }
 }
 
+fn handle_task_loaded(
+    chat_id: String,
+    result: Result<agentclient::TaskState, String>,
+    state: &mut AppState,
+) {
+    let Some(picker) = state.task.as_mut() else { return };
+    if picker.chat_id != chat_id {
+        return;
+    }
+    picker.loading = false;
+    match result {
+        Ok(task) => {
+            picker.state = Some(task);
+            picker.next_stage_cursor = 0;
+            picker.error = None;
+        }
+        Err(reason) => picker.error = Some(reason),
+    }
+}
+
+/// Общий обработчик для перехода, паузы и возобновления: во всех трёх
+/// случаях сервис возвращает свежее состояние задачи, а экран просто его
+/// подставляет и закрывает открытую правку текста.
+fn handle_task_transitioned(
+    chat_id: String,
+    result: Result<agentclient::TaskState, String>,
+    state: &mut AppState,
+) {
+    let Some(picker) = state.task.as_mut() else { return };
+    if picker.chat_id != chat_id {
+        return;
+    }
+    match result {
+        Ok(task) => {
+            picker.state = Some(task);
+            picker.next_stage_cursor = 0;
+            picker.editor = None;
+            picker.error = None;
+        }
+        Err(reason) => state.notify(format!("Не удалось изменить состояние задачи: {reason}")),
+    }
+}
+
 /// Обновить список локальных моделей в состоянии и в открытом редакторе
 /// настроек. Ошибка не мешает работе: облачные чаты от неё не зависят.
 fn handle_ollama_models(result: Result<Vec<String>, String>, state: &mut AppState) {
@@ -3925,6 +4322,9 @@ fn render_ui(f: &mut Frame, state: &mut AppState) {
             .unwrap_or_default();
         render_memory_popup(f, picker, &tail);
     }
+    if let Some(picker) = &state.task {
+        render_task_popup(f, picker);
+    }
 }
 
 /// Подтверждение удаления чата: удаление необратимо, поэтому спрашиваем явно.
@@ -4053,6 +4453,12 @@ fn context_status_line(context: &agentcore::config::ContextObservability) -> Str
             "маршрутизатор: применено {router_applied}, отброшено {}",
             context.memory_router_rejected.unwrap_or(0)
         ));
+    }
+    // Состояние задачи в шапке чата видно без открытия экрана Ctrl+T
+    // (specs/task-state, design.md решение 9).
+    if let Some(stage) = &context.task_stage {
+        let paused = if context.task_paused == Some(true) { " (на паузе)" } else { "" };
+        parts.push(format!("задача: {stage}{paused}"));
     }
     parts.join(" · ")
 }
@@ -4824,6 +5230,16 @@ fn render_settings_fields(f: &mut Frame, editor: &SettingsEditor, area: Rect) {
             },
             FormatField::MemoryWorkingMaxEntries => editor.memory_working_max_entries.clone(),
             FormatField::MemoryLongTermMaxEntries => editor.memory_long_term_max_entries.clone(),
+            FormatField::TaskStateEnabled => match editor.task_state_enabled.as_str() {
+                "on" => "Включено".to_string(),
+                "off" => "Выключено".to_string(),
+                _ => "Умолчание сервиса".to_string(),
+            },
+            FormatField::TaskStateAutoEnabled => match editor.task_state_auto_enabled.as_str() {
+                "on" => "Включён".to_string(),
+                "off" => "Выключен".to_string(),
+                _ => "Умолчание сервиса".to_string(),
+            },
             FormatField::Mode => {
                 if editor.custom_mode {
                     "Кастомный".to_string()
@@ -5284,6 +5700,109 @@ fn render_memory_popup(f: &mut Frame, picker: &MemoryPicker, short_term_tail: &[
     f.render_widget(Paragraph::new(Line::from(Span::styled(hint, Style::default().fg(Color::DarkGray)))), rows[3]);
 }
 
+/// Экран состояния задачи чата: этап, шаг, ожидаемое действие, пауза,
+/// предложенный следующий этап и последние переходы (specs/task-state,
+/// design.md решение 9). Правка шага/ожидаемого действия — отдельный режим
+/// с одним полем ввода.
+fn render_task_popup(f: &mut Frame, picker: &TaskPicker) {
+    let area = centered_rect(76, 22, f.area());
+    f.render_widget(Clear, area);
+
+    let title = format!(" Задача чата «{}» ", picker.chat_title);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan))
+        .title(title);
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    if let Some(editor) = &picker.editor {
+        let field_label = if editor.editing_expected_action { "Ожидаемое действие" } else { "Шаг" };
+        let rows = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(1), Constraint::Min(0), Constraint::Length(1)])
+            .split(inner);
+        f.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::raw(format!(" {field_label}: ")),
+                Span::styled(editor.value.clone(), Style::default().fg(Color::Black).bg(Color::Cyan)),
+            ]))
+            .wrap(Wrap { trim: false }),
+            rows[0],
+        );
+        f.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                " Enter — сохранить · Esc — отмена",
+                Style::default().fg(Color::DarkGray),
+            ))),
+            rows[2],
+        );
+        return;
+    }
+
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(0), Constraint::Length(1)])
+        .split(inner);
+
+    let mut lines: Vec<Line> = Vec::new();
+    if picker.loading {
+        lines.push(Line::from(Span::styled(" Загрузка...", Style::default().fg(Color::DarkGray))));
+    } else if let Some(error) = &picker.error {
+        lines.push(Line::from(Span::styled(format!(" Ошибка: {error}"), Style::default().fg(Color::Red))));
+    } else if let Some(task) = &picker.state {
+        lines.push(Line::from(Span::styled(
+            format!(" Этап: {}{}", task.stage, if task.paused { " (на паузе)" } else { "" }),
+            Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+        )));
+        lines.push(Line::from(format!(
+            " Шаг: {}",
+            if task.step.is_empty() { "(не задан)" } else { &task.step }
+        )));
+        lines.push(Line::from(format!(
+            " Ожидаемое действие: {}",
+            if task.expected_action.is_empty() { "(не задано)" } else { &task.expected_action }
+        )));
+        if task.paused && !task.resume_brief.is_empty() {
+            lines.push(Line::raw(""));
+            lines.push(Line::from(Span::styled(" Бриф возобновления:", Style::default().fg(Color::DarkGray))));
+            for line in task.resume_brief.lines() {
+                lines.push(Line::from(format!(" {line}")));
+            }
+        }
+        let next_label = match picker.selected_next_stage() {
+            Some(stage) => stage.to_string(),
+            None => "без смены этапа".to_string(),
+        };
+        lines.push(Line::raw(""));
+        lines.push(Line::from(Span::styled(
+            format!(" ←/→ выбирает переход: {next_label}"),
+            Style::default().fg(Color::Cyan),
+        )));
+        if !task.transitions.is_empty() {
+            lines.push(Line::raw(""));
+            lines.push(Line::from(Span::styled(" Последние переходы:", Style::default().fg(Color::DarkGray))));
+            for transition in task.transitions.iter().rev().take(5) {
+                lines.push(Line::from(Span::styled(
+                    format!(" {} → {} ({})", transition.from_stage, transition.to_stage, transition.source),
+                    Style::default().fg(Color::DarkGray),
+                )));
+            }
+        }
+    } else {
+        lines.push(Line::from(Span::styled(" Состояние задачи недоступно", Style::default().fg(Color::DarkGray))));
+    }
+
+    f.render_widget(Paragraph::new(Text::from(lines)).wrap(Wrap { trim: false }), rows[0]);
+    f.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            " ←/→ — переход · Enter — применить · s — шаг · a — ожидаемое действие · p — пауза · r — возобновить · Esc — закрыть",
+            Style::default().fg(Color::DarkGray),
+        ))),
+        rows[1],
+    );
+}
+
 fn render_memory_editor(f: &mut Frame, editor: &MemoryEditor, area: Rect) {
     let field_count = if editor.for_long_term { 3 } else { 2 };
     let mut constraints = vec![Constraint::Length(1); field_count];
@@ -5359,6 +5878,7 @@ mod tests {
             facts: None,
             branches: None,
             memory: None,
+            task: None,
             notice: None,
             show_reasoning: true,
             ollama_models: Vec::new(),
@@ -5555,6 +6075,83 @@ mod tests {
         assert_eq!(editor.build_memory_router_enabled(), Some(false));
         editor.cycle_memory_router_enabled(1);
         assert_eq!(editor.build_memory_router_enabled(), None);
+    }
+
+    #[test]
+    fn task_state_auto_enabled_field_appears_only_when_task_state_enabled() {
+        let settings = ChatSettings::default();
+        let session = ChatSession {
+            id: "chat-1".to_string(),
+            title: "Чат".to_string(),
+            messages: Vec::new(),
+            updated_at: 0,
+            settings,
+            history_loaded: true,
+        };
+        let mut editor = SettingsEditor::from_chat(&session, &Config::default(), &[], &[], &[]);
+        editor.section = SettingsSection::ALL
+            .iter()
+            .position(|s| *s == SettingsSection::Memory)
+            .expect("раздел «Память» существует");
+        assert!(!editor.visible_fields().contains(&FormatField::TaskStateAutoEnabled));
+        editor.task_state_enabled = "on".to_string();
+        assert!(editor.visible_fields().contains(&FormatField::TaskStateAutoEnabled));
+    }
+
+    #[test]
+    fn task_state_enabled_cycles_three_states_and_saves_it() {
+        let settings = ChatSettings::default();
+        let session = ChatSession {
+            id: "chat-1".to_string(),
+            title: "Чат".to_string(),
+            messages: Vec::new(),
+            updated_at: 0,
+            settings,
+            history_loaded: true,
+        };
+        let mut editor = SettingsEditor::from_chat(&session, &Config::default(), &[], &[], &[]);
+        assert_eq!(editor.build_task_state_enabled(), None);
+        editor.cycle_task_state_enabled(1);
+        assert_eq!(editor.build_task_state_enabled(), Some(true));
+        editor.cycle_task_state_enabled(1);
+        assert_eq!(editor.build_task_state_enabled(), Some(false));
+        editor.cycle_task_state_enabled(1);
+        assert_eq!(editor.build_task_state_enabled(), None);
+    }
+
+    #[test]
+    fn task_state_auto_enabled_resets_on_ctrl_d() {
+        let settings = ChatSettings::default();
+        let session = ChatSession {
+            id: "chat-1".to_string(),
+            title: "Чат".to_string(),
+            messages: Vec::new(),
+            updated_at: 0,
+            settings,
+            history_loaded: true,
+        };
+        let mut editor = SettingsEditor::from_chat(&session, &Config::default(), &[], &[], &[]);
+        editor.task_state_enabled = "on".to_string();
+        editor.task_state_auto_enabled = "on".to_string();
+        editor.section = SettingsSection::ALL
+            .iter()
+            .position(|s| *s == SettingsSection::Memory)
+            .expect("раздел «Память» существует");
+        editor.field = editor
+            .visible_fields()
+            .iter()
+            .position(|f| *f == FormatField::TaskStateAutoEnabled)
+            .expect("поле автотрекера видно");
+        editor.reset_field();
+        assert_eq!(editor.build_task_state_auto_enabled(), None);
+    }
+
+    // --- Автомат допустимых переходов доступен экрану задачи ---
+
+    #[test]
+    fn allowed_next_stages_seeds_task_picker_cursor_options() {
+        let picker = TaskPicker::new("chat-1", "Чат");
+        assert!(picker.allowed_next_stages().is_empty(), "состояние ещё не загружено");
     }
 
     // --- 4.2 Отказ загрузки виден и объясним ---

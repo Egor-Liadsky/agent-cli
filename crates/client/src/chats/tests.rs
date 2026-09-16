@@ -205,6 +205,8 @@ fn settings_with(provider: Provider, model: &str) -> ChatSettings {
         memory_working_max_entries: None,
         memory_long_term_max_entries: None,
         profile_id: None,
+        task_state_enabled: None,
+        task_state_auto_enabled: None,
     }
 }
 
@@ -821,4 +823,124 @@ async fn unreachable_service_is_transport_error_with_address() {
         }
         other => panic!("ожидался Transport, получено: {other:?}"),
     }
+}
+
+// --- Состояние задачи (specs/task-state) ---
+
+fn task_state_body(stage: &str) -> serde_json::Value {
+    json!({
+        "id": "task-1",
+        "stage": stage,
+        "step": "",
+        "expected_action": "",
+        "paused": false,
+        "resume_brief": "",
+        "transitions": []
+    })
+}
+
+#[tokio::test]
+async fn task_reads_stage_step_and_transitions() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v1/chats/chat-1/task"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": "task-1",
+            "stage": "execution",
+            "step": "правит парсер",
+            "expected_action": "ждёт ревью",
+            "paused": false,
+            "resume_brief": "",
+            "transitions": [
+                { "from_stage": "planning", "to_stage": "execution", "source": "manual", "reason": "", "created_at": 10 }
+            ]
+        })))
+        .mount(&server)
+        .await;
+
+    let task = chats(&server, "token-a").task("chat-1").await.expect("состояние задачи");
+    assert_eq!(task.stage, "execution");
+    assert_eq!(task.step, "правит парсер");
+    assert_eq!(task.transitions.len(), 1);
+    assert_eq!(task.transitions[0].source, "manual");
+}
+
+#[tokio::test]
+async fn task_transition_sends_stage_step_and_expected_action() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chats/chat-1/task/transition"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(task_state_body("execution")))
+        .mount(&server)
+        .await;
+
+    let task = chats(&server, "token-a")
+        .task_transition("chat-1", Some("execution"), Some("шаг"), Some("действие"), &[])
+        .await
+        .expect("переход");
+    assert_eq!(task.stage, "execution");
+
+    let bodies = received_bodies(&server).await;
+    assert_eq!(bodies[0]["stage"], "execution");
+    assert_eq!(bodies[0]["step"], "шаг");
+    assert_eq!(bodies[0]["expected_action"], "действие");
+}
+
+#[tokio::test]
+async fn task_pause_and_resume_round_trip() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chats/chat-1/task/pause"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": "task-1", "stage": "execution", "step": "", "expected_action": "",
+            "paused": true, "resume_brief": "бриф", "transitions": []
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chats/chat-1/task/resume"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(task_state_body("execution")))
+        .mount(&server)
+        .await;
+
+    let client = chats(&server, "token-a");
+    let paused = client.task_pause("chat-1").await.expect("пауза");
+    assert!(paused.paused);
+    assert_eq!(paused.resume_brief, "бриф");
+
+    let resumed = client.task_resume("chat-1").await.expect("снятие с паузы");
+    assert!(!resumed.paused);
+}
+
+// --- Автомат допустимых переходов на клиенте (design.md, решение 9) ---
+
+#[test]
+fn allowed_next_stages_matches_server_automaton() {
+    assert_eq!(allowed_next_stages("planning"), vec!["execution"]);
+    assert_eq!(allowed_next_stages("execution"), vec!["validation", "planning"]);
+    assert_eq!(allowed_next_stages("validation"), vec!["done", "execution"]);
+    assert!(allowed_next_stages("done").is_empty());
+}
+
+// --- Настройки задачи в теле POST /v1/chats и PATCH /v1/chats/{id} ---
+
+#[tokio::test]
+async fn create_chat_sends_task_state_settings() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chats"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(chat_body("chat-1", "Чат")))
+        .mount(&server)
+        .await;
+
+    let settings = ChatSettings {
+        task_state_enabled: Some(true),
+        task_state_auto_enabled: Some(false),
+        ..ChatSettings::default()
+    };
+    chats(&server, "token-a").create(None, &settings).await.expect("чат создан");
+
+    let bodies = received_bodies(&server).await;
+    assert_eq!(bodies[0]["settings"]["task_state_enabled"], true);
+    assert_eq!(bodies[0]["settings"]["task_state_auto_enabled"], false);
 }

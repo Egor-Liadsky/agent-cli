@@ -176,6 +176,14 @@ struct ChatSettingsPayload {
     /// операторского умолчания»).
     #[serde(skip_serializing_if = "Option::is_none")]
     profile_id: Option<String>,
+    /// Разовое переопределение состояния задачи для этого запроса
+    /// (specs/task-state, «Операторские умолчания и клиентские
+    /// переключатели»): незаданное поле опускается, и действует настройка,
+    /// сохранённая в чате.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    task_state_enabled: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    task_state_auto_enabled: Option<bool>,
 }
 
 #[derive(Serialize)]
@@ -253,6 +261,18 @@ struct ContextPayload {
     memory_router_applied_delete: Option<u32>,
     #[serde(default)]
     memory_router_rejected: Option<u32>,
+    #[serde(default)]
+    task_stage: Option<String>,
+    #[serde(default)]
+    task_step: Option<String>,
+    #[serde(default)]
+    task_expected_action: Option<String>,
+    #[serde(default)]
+    task_paused: Option<bool>,
+    #[serde(default)]
+    task_tracker_applied: Option<u32>,
+    #[serde(default)]
+    task_tracker_rejected: Option<u32>,
 }
 
 impl From<ContextPayload> for agentcore::config::ContextObservability {
@@ -276,6 +296,12 @@ impl From<ContextPayload> for agentcore::config::ContextObservability {
             memory_router_applied_update: payload.memory_router_applied_update,
             memory_router_applied_delete: payload.memory_router_applied_delete,
             memory_router_rejected: payload.memory_router_rejected,
+            task_stage: payload.task_stage,
+            task_step: payload.task_step,
+            task_expected_action: payload.task_expected_action,
+            task_paused: payload.task_paused,
+            task_tracker_applied: payload.task_tracker_applied,
+            task_tracker_rejected: payload.task_tracker_rejected,
         }
     }
 }
@@ -433,6 +459,8 @@ impl ServerAgent {
                 context_strategy: settings.context_strategy,
                 context_window_messages: settings.context_window_messages,
                 profile_id: settings.profile_id.clone(),
+                task_state_enabled: settings.task_state_enabled,
+                task_state_auto_enabled: settings.task_state_auto_enabled,
             },
         }
     }
@@ -643,8 +671,8 @@ pub struct ProfileChoice {
 
 mod chats;
 pub use chats::{
-    Branch, ChatHistory, ChatSummary, ChatsClient, Fact, LongTermMemoryEntry, Profile, StoredMessage,
-    WorkingMemoryEntry,
+    allowed_next_stages, Branch, ChatHistory, ChatSummary, ChatsClient, Fact, LongTermMemoryEntry, Profile,
+    StoredMessage, TaskState, TaskTransition, WorkingMemoryEntry,
 };
 
 #[cfg(test)]

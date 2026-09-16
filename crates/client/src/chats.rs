@@ -93,6 +93,48 @@ pub struct Profile {
     pub built_in: bool,
 }
 
+/// Переход в журнале состояния задачи (specs/task-state, «Журнал переходов
+/// задачи»).
+#[derive(Debug, Clone)]
+pub struct TaskTransition {
+    pub from_stage: String,
+    pub to_stage: String,
+    pub source: String,
+    pub reason: String,
+    pub created_at: i64,
+}
+
+/// Состояние активной задачи чата: этап, шаг, ожидаемое действие, пауза и
+/// журнал переходов (specs/task-state).
+#[derive(Debug, Clone)]
+pub struct TaskState {
+    pub id: String,
+    pub stage: String,
+    pub step: String,
+    pub expected_action: String,
+    pub paused: bool,
+    pub resume_brief: String,
+    pub transitions: Vec<TaskTransition>,
+}
+
+/// Допустимые рёбра автомата состояния задачи (design.md, решение 3), в
+/// одном месте с сервером: клиент не провоцирует заведомо отклоняемый
+/// запрос, но окончательным арбитром остаётся сервер (design.md, решение 9).
+const TASK_STAGE_EDGES: [(&str, &str); 5] = [
+    ("planning", "execution"),
+    ("execution", "validation"),
+    ("validation", "done"),
+    ("validation", "execution"),
+    ("execution", "planning"),
+];
+
+/// Этапы, в которые можно перейти из данного, в порядке объявления рёбер —
+/// используется экраном состояния задачи, чтобы не предлагать заведомо
+/// недопустимые переходы (specs/task-state, design.md решение 9).
+pub fn allowed_next_stages(from: &str) -> Vec<&'static str> {
+    TASK_STAGE_EDGES.iter().filter(|(a, _)| *a == from).map(|(_, b)| *b).collect()
+}
+
 /// Ветка чата стратегии `branching`.
 #[derive(Debug, Clone)]
 pub struct Branch {
@@ -395,6 +437,69 @@ impl ChatsClient {
         Ok(payload.entries.into_iter().map(LongTermMemoryEntry::from).collect())
     }
 
+    /// Состояние активной задачи чата вместе с журналом переходов
+    /// (specs/task-state).
+    pub async fn task(&self, chat_id: &str) -> Result<TaskState> {
+        let payload: TaskStatePayload = self
+            .send(reqwest::Method::GET, self.url(&format!("/chats/{chat_id}/task")), None)
+            .await?;
+        Ok(TaskState::from(payload))
+    }
+
+    /// Переход этапа и/или правка шага и ожидаемого действия, без смены
+    /// этапа при `stage: None` (specs/task-state, «Обновление шага без
+    /// смены этапа»). `stage: Some("done")` завершает задачу и заводит
+    /// новую в `planning` — сервер несёт её идентификатор, но экран задачи
+    /// перечитывает состояние отдельным вызовом `task`.
+    pub async fn task_transition(
+        &self,
+        chat_id: &str,
+        stage: Option<&str>,
+        step: Option<&str>,
+        expected_action: Option<&str>,
+        carry_forward_keys: &[String],
+    ) -> Result<TaskState> {
+        let payload: TaskStatePayload = self
+            .send(
+                reqwest::Method::POST,
+                self.url(&format!("/chats/{chat_id}/task/transition")),
+                Some(serde_json::json!({
+                    "stage": stage,
+                    "step": step,
+                    "expected_action": expected_action,
+                    "carry_forward_keys": carry_forward_keys,
+                })),
+            )
+            .await?;
+        Ok(TaskState::from(payload))
+    }
+
+    /// Ставит задачу на паузу с брифом возобновления, собранным сервером
+    /// (specs/task-state, «Пауза на любом этапе»).
+    pub async fn task_pause(&self, chat_id: &str) -> Result<TaskState> {
+        let payload: TaskStatePayload = self
+            .send(
+                reqwest::Method::POST,
+                self.url(&format!("/chats/{chat_id}/task/pause")),
+                Some(serde_json::json!({})),
+            )
+            .await?;
+        Ok(TaskState::from(payload))
+    }
+
+    /// Снимает задачу с паузы, сохраняя прежний этап, шаг и ожидаемое
+    /// действие.
+    pub async fn task_resume(&self, chat_id: &str) -> Result<TaskState> {
+        let payload: TaskStatePayload = self
+            .send(
+                reqwest::Method::POST,
+                self.url(&format!("/chats/{chat_id}/task/resume")),
+                Some(serde_json::json!({})),
+            )
+            .await?;
+        Ok(TaskState::from(payload))
+    }
+
     /// Долговременная память владельца (specs/memory-layers).
     pub async fn long_term_memory(&self) -> Result<Vec<LongTermMemoryEntry>> {
         let payload: LongTermMemoryPayload =
@@ -553,6 +658,8 @@ fn settings_payload(settings: &ChatSettings) -> serde_json::Value {
         context_strategy: settings.context_strategy,
         context_window_messages: settings.context_window_messages,
         profile_id: settings.profile_id.clone(),
+        task_state_enabled: settings.task_state_enabled,
+        task_state_auto_enabled: settings.task_state_auto_enabled,
     };
     serde_json::to_value(payload).unwrap_or(serde_json::Value::Null)
 }
@@ -587,6 +694,8 @@ struct ChatSettingsUpdate {
     context_strategy: Option<ContextStrategy>,
     context_window_messages: Option<u32>,
     profile_id: Option<String>,
+    task_state_enabled: Option<bool>,
+    task_state_auto_enabled: Option<bool>,
 }
 
 #[derive(Serialize)]
@@ -776,6 +885,53 @@ struct WorkingMemoryEntryPayload {
 impl From<WorkingMemoryEntryPayload> for WorkingMemoryEntry {
     fn from(payload: WorkingMemoryEntryPayload) -> Self {
         Self { key: payload.key, value: payload.value, source: payload.source, updated_at: payload.updated_at }
+    }
+}
+
+#[derive(Deserialize)]
+struct TaskStatePayload {
+    id: String,
+    stage: String,
+    step: String,
+    expected_action: String,
+    paused: bool,
+    resume_brief: String,
+    #[serde(default)]
+    transitions: Vec<TaskTransitionPayload>,
+}
+
+#[derive(Deserialize)]
+struct TaskTransitionPayload {
+    from_stage: String,
+    to_stage: String,
+    source: String,
+    reason: String,
+    created_at: i64,
+}
+
+impl From<TaskTransitionPayload> for TaskTransition {
+    fn from(payload: TaskTransitionPayload) -> Self {
+        Self {
+            from_stage: payload.from_stage,
+            to_stage: payload.to_stage,
+            source: payload.source,
+            reason: payload.reason,
+            created_at: payload.created_at,
+        }
+    }
+}
+
+impl From<TaskStatePayload> for TaskState {
+    fn from(payload: TaskStatePayload) -> Self {
+        Self {
+            id: payload.id,
+            stage: payload.stage,
+            step: payload.step,
+            expected_action: payload.expected_action,
+            paused: payload.paused,
+            resume_brief: payload.resume_brief,
+            transitions: payload.transitions.into_iter().map(TaskTransition::from).collect(),
+        }
     }
 }
 

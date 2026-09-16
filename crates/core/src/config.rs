@@ -331,6 +331,27 @@ pub struct ContextObservability {
     /// Сколько операций маршрутизатора отброшено валидацией (слоистая память включена).
     #[serde(default)]
     pub memory_router_rejected: Option<u32>,
+    /// Этап активной задачи чата (состояние задачи включено).
+    #[serde(default)]
+    pub task_stage: Option<String>,
+    /// Текущий шаг активной задачи (состояние задачи включено).
+    #[serde(default)]
+    pub task_step: Option<String>,
+    /// Ожидаемое действие активной задачи (состояние задачи включено).
+    #[serde(default)]
+    pub task_expected_action: Option<String>,
+    /// Признак паузы активной задачи (состояние задачи включено).
+    #[serde(default)]
+    pub task_paused: Option<bool>,
+    /// Число переходов, применённых последним завершившимся прогоном
+    /// автоматического трекера состояния задачи — по ПРЕДЫДУЩЕМУ сообщению,
+    /// трекер фоновый (состояние задачи включено).
+    #[serde(default)]
+    pub task_tracker_applied: Option<u32>,
+    /// Число переходов, отклонённых тем же прогоном трекера (состояние
+    /// задачи включено).
+    #[serde(default)]
+    pub task_tracker_rejected: Option<u32>,
 }
 
 /// Параметры агента, привязанные к конкретному чату.
