@@ -411,6 +411,12 @@ pub struct ChatSettings {
     /// (`AGENTD_MEMORY_LONG_TERM_MAX_ENTRIES`).
     #[serde(default)]
     pub memory_long_term_max_entries: Option<u32>,
+    /// Профиль, применяемый к этому чату: встроенный (`teacher`,
+    /// `psychologist`, `reviewer`) или собственный профиль владельца.
+    /// `None` — операторское умолчание сервиса (`AGENTD_DEFAULT_PROFILE`,
+    /// пусто — без профиля).
+    #[serde(default)]
+    pub profile_id: Option<String>,
 }
 
 impl ChatSettings {
@@ -554,6 +560,7 @@ impl Config {
             memory_router_enabled: None,
             memory_working_max_entries: None,
             memory_long_term_max_entries: None,
+            profile_id: None,
         }
     }
 
@@ -806,6 +813,19 @@ server_url = "http://127.0.0.1:9000"
         assert_eq!(settings.memory_router_enabled, None);
         assert_eq!(settings.memory_working_max_entries, None);
         assert_eq!(settings.memory_long_term_max_entries, None);
+        assert_eq!(settings.profile_id, None);
+    }
+
+    #[test]
+    fn profile_id_round_trips_snake_case_json() {
+        let settings = ChatSettings {
+            profile_id: Some("teacher".to_string()),
+            ..ChatSettings::default()
+        };
+        let json = serde_json::to_string(&settings).expect("сериализация");
+        assert!(json.contains("\"profile_id\":\"teacher\""));
+        let parsed: ChatSettings = serde_json::from_str(&json).expect("разбор");
+        assert_eq!(parsed.profile_id, Some("teacher".to_string()));
     }
 
     #[test]
