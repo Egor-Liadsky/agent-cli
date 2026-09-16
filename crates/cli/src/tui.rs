@@ -1,7 +1,10 @@
 use crate::agent::CliAgent;
 use agentcore::agent::{AgentReply, Message, MessageMeta, Role};
 use crate::chats::{self, ChatSession};
-use agentclient::{Branch, ChatHistory, ChatSummary, ChatsClient, Fact, LongTermMemoryEntry, StoredMessage, WorkingMemoryEntry};
+use agentclient::{
+    Branch, ChatHistory, ChatSummary, ChatsClient, Fact, LongTermMemoryEntry, ProfileChoice, StoredMessage,
+    WorkingMemoryEntry,
+};
 use agentcore::config::{
     ChatSettings, Config, ContextStrategy, Provider, ReasoningMode, ResponseFormat, SamplingParams,
     ThinkingMode,
@@ -52,6 +55,9 @@ enum ChatEvent {
     OllamaModels(Result<Vec<String>, String>),
     /// Список облачных моделей сервиса: пришёл фоновой задачей.
     CloudModels(Result<Vec<String>, String>),
+    /// Список профилей владельца (`GET /v1/profiles`): пришёл фоновой
+    /// задачей (specs/user-profiles).
+    Profiles(Result<Vec<ProfileChoice>, String>),
     /// Список чатов сервиса (`GET /v1/chats`).
     ChatsLoaded(Result<Vec<ChatSummary>, String>),
     /// История одного чата (`GET /v1/chats/{id}`).
@@ -331,6 +337,7 @@ enum FormatField {
     SummaryStepMessages,
     ContextStrategy,
     ContextWindowMessages,
+    Profile,
     MemoryLayersEnabled,
     MemoryRouterEnabled,
     MemoryWorkingMaxEntries,
@@ -421,6 +428,7 @@ impl SettingsSection {
                 FormatField::SummaryEnabled,
                 FormatField::SummaryKeepMessages,
                 FormatField::SummaryStepMessages,
+                FormatField::Profile,
             ],
             SettingsSection::Memory => &[
                 FormatField::MemoryLayersEnabled,
@@ -533,6 +541,7 @@ impl FormatField {
             FormatField::SummaryStepMessages => "Шаг пересказа (сообщений)",
             FormatField::ContextStrategy => "Стратегия контекста",
             FormatField::ContextWindowMessages => "Окно последних сообщений",
+            FormatField::Profile => "Профиль",
             FormatField::MemoryLayersEnabled => "Слоистая память",
             FormatField::MemoryRouterEnabled => "Автомаршрутизатор памяти",
             FormatField::MemoryWorkingMaxEntries => "Лимит записей рабочей памяти",
@@ -606,6 +615,12 @@ impl FormatField {
             FormatField::ContextWindowMessages => {
                 "Сколько последних сообщений чата уходят провайдеру при стратегиях «Окно последних сообщений» и \
 «Устойчивые факты». Пусто — действует операторское умолчание сервиса."
+            }
+            FormatField::Profile => {
+                "◀/▶ — выбрать из профилей, доступных владельцу (встроенные и свои, список приходит с сервиса), \
+ввод — задать идентификатор вручную, Ctrl+D — снять профиль. Профиль подставляет роль, стиль, формат и ограничения \
+в системное сообщение каждого запроса этого чата, поверх стратегии контекста и слоистой памяти. «Умолчание сервиса» \
+— решает AGENTD_DEFAULT_PROFILE (по умолчанию без профиля). Список профилей: agentcli profiles list."
             }
             FormatField::MemoryLayersEnabled => {
                 "◀/▶ или Space — переключить. Включает или выключает для этого чата слоистую память (рабочий и \
@@ -686,6 +701,7 @@ AGENTD_MEMORY_LAYERS_ENABLED (по умолчанию выключено)."
                 | FormatField::SummaryStepMessages
                 | FormatField::ContextStrategy
                 | FormatField::ContextWindowMessages
+                | FormatField::Profile
                 | FormatField::MemoryLayersEnabled
                 | FormatField::MemoryRouterEnabled
                 | FormatField::MemoryWorkingMaxEntries
@@ -740,6 +756,13 @@ struct SettingsEditor {
     /// Размер окна последних сообщений для стратегий `sliding_window` и
     /// `facts` — настройка этого чата. Пусто — операторское умолчание сервиса.
     context_window_messages: String,
+    /// Профиль этого чата (id): "" — операторское умолчание сервиса
+    /// (`AGENTD_DEFAULT_PROFILE`). Подставляется поверх стратегии контекста
+    /// и слоистой памяти (specs/user-profiles).
+    profile_id: String,
+    /// Профили, доступные владельцу — встроенные и свои, для перебора
+    /// стрелками и подписи текущего значения по имени, а не только id.
+    profile_choices: Vec<ProfileChoice>,
     /// Слоистая память этого чата: "" — операторское умолчание сервиса,
     /// "on"/"off" — явное включение/выключение. Независима от
     /// `context_strategy` — применяется поверх любой стратегии.
@@ -793,6 +816,7 @@ impl SettingsEditor {
         config: &Config,
         model_choices: &[String],
         ollama_models: &[String],
+        profile_choices: &[ProfileChoice],
     ) -> Self {
         let settings = &chat.settings;
         let custom_mode = settings.custom_response_mode;
@@ -831,6 +855,8 @@ impl SettingsEditor {
                 .context_window_messages
                 .map(|v| v.to_string())
                 .unwrap_or_default(),
+            profile_id: settings.profile_id.clone().unwrap_or_default(),
+            profile_choices: profile_choices.to_vec(),
             memory_layers_enabled: match settings.memory_layers_enabled {
                 None => String::new(),
                 Some(true) => "on".to_string(),
@@ -1074,6 +1100,28 @@ impl SettingsEditor {
         self.model = choices[next as usize].clone();
     }
 
+    /// Перебор профилей, доступных владельцу, стрелками: пусто → первый →
+    /// … → последний → снова пусто. Если в поле введён id, которого нет в
+    /// списке, перебор начинается с первого профиля.
+    fn cycle_profile(&mut self, delta: i32) {
+        if self.profile_choices.is_empty() {
+            return;
+        }
+        // Состояния — "" (нет профиля) плюс id каждого профиля списка.
+        let len = self.profile_choices.len() as i32 + 1;
+        let current = match self.profile_choices.iter().position(|p| p.id == self.profile_id) {
+            Some(index) if !self.profile_id.is_empty() => index as i32 + 1,
+            _ if self.profile_id.is_empty() => 0,
+            _ => 0,
+        };
+        let next = (current + delta).rem_euclid(len);
+        self.profile_id = if next == 0 {
+            String::new()
+        } else {
+            self.profile_choices[(next - 1) as usize].id.clone()
+        };
+    }
+
     /// Сбросить текущее поле к значению по умолчанию.
     fn reset_field(&mut self) {
         match self.current_field() {
@@ -1111,6 +1159,7 @@ impl SettingsEditor {
             FormatField::SummaryKeepMessages => Some(&mut self.summary_keep_messages),
             FormatField::SummaryStepMessages => Some(&mut self.summary_step_messages),
             FormatField::ContextWindowMessages => Some(&mut self.context_window_messages),
+            FormatField::Profile => Some(&mut self.profile_id),
             FormatField::MemoryWorkingMaxEntries => Some(&mut self.memory_working_max_entries),
             FormatField::MemoryLongTermMaxEntries => Some(&mut self.memory_long_term_max_entries),
             FormatField::Experts => Some(&mut self.experts),
@@ -1263,6 +1312,11 @@ impl SettingsEditor {
 
     fn build_context_window_messages(&self) -> Result<Option<u32>, String> {
         Self::build_summary_count(&self.context_window_messages, "Окно последних сообщений")
+    }
+
+    /// Разобрать профиль: пусто — `None` (умолчание сервиса).
+    fn build_profile_id(&self) -> Option<String> {
+        non_empty(&self.profile_id)
     }
 
     fn build_memory_layers_enabled(&self) -> Option<bool> {
@@ -1435,6 +1489,9 @@ struct AppState {
     /// конфигурного списка, чтобы выбор модели не был пустым, пока сервис не
     /// ответил или если он недоступен.
     model_choices: Vec<String>,
+    /// Профили, доступные владельцу (`GET /v1/profiles`): подгружаются фоном
+    /// при старте и обновляются по Ctrl+L, как модели (specs/user-profiles).
+    profile_choices: Vec<ProfileChoice>,
 }
 
 impl AppState {
@@ -1569,6 +1626,7 @@ async fn run_app(
         show_reasoning: true,
         ollama_models: Vec::new(),
         model_choices,
+        profile_choices: Vec::new(),
     };
 
     let (tx, mut rx) = mpsc::unbounded_channel::<ChatEvent>();
@@ -1578,6 +1636,9 @@ async fn run_app(
     // список облачных моделей тоже тянем фоном: сервис может быть недоступен,
     // а падать в этом случае незачем — остаёмся на встроенном списке
     fetch_cloud_models(&state.config, &tx);
+    // Список профилей владельца тоже тянем фоном (specs/user-profiles):
+    // сервис может быть недоступен, поле профиля тогда просто пустует.
+    fetch_profiles(&state.config, &tx);
     // Список чатов тоже тянем фоном: сервис может быть недоступен, и тогда
     // TUI открывается с баннером причины, а не падает.
     fetch_chats(&state, &tx);
@@ -1770,6 +1831,7 @@ fn handle_key(
                 &state.config,
                 &state.model_choices,
                 &state.ollama_models,
+                &state.profile_choices,
             ));
             state.focus = Focus::Settings;
         }
@@ -1968,6 +2030,7 @@ fn handle_settings_key(
                 )) => {
                     let summary_enabled = editor.build_summary_enabled();
                     let context_strategy = editor.build_context_strategy();
+                    let profile_id = editor.build_profile_id();
                     let memory_layers_enabled = editor.build_memory_layers_enabled();
                     let memory_router_enabled = editor.build_memory_router_enabled();
                     let reasoning = editor.reasoning;
@@ -2003,6 +2066,7 @@ fn handle_settings_key(
                             memory_router_enabled,
                             memory_working_max_entries,
                             memory_long_term_max_entries,
+                            profile_id,
                         };
                         // Настройки чата хранит сервис: локально они
                         // применяются ответом на PATCH, а не сразу.
@@ -2121,6 +2185,18 @@ fn handle_settings_key(
                 && editor.current_field() == Some(FormatField::ContextStrategy) =>
         {
             editor.cycle_context_strategy(1);
+        }
+        KeyCode::Left
+            if editor.pane == SettingsPane::Fields
+                && editor.current_field() == Some(FormatField::Profile) =>
+        {
+            editor.cycle_profile(-1);
+        }
+        KeyCode::Right
+            if editor.pane == SettingsPane::Fields
+                && editor.current_field() == Some(FormatField::Profile) =>
+        {
+            editor.cycle_profile(1);
         }
         KeyCode::Left
             if editor.pane == SettingsPane::Fields
@@ -2711,11 +2787,10 @@ fn handle_input_key(
             }
             state.chats[chat_index].messages.push(Message::user(line.clone()));
             state.chats[chat_index].touch_quietly();
-            // Заголовок нового чата выводится из первой реплики и уходит в
-            // сервис: без этого список чатов остался бы с «Новым чатом».
-            if let Some(title) = state.chats[chat_index].title_from_first_message() {
-                request_update_chat(state, &chat_id, Some(title), None, tx);
-            }
+            // Заголовок нового чата придумывает сервис после первого обмена
+            // (AGENTD_AUTO_TITLE): клиент больше не подставляет свой,
+            // иначе он гарантированно перебивал бы серверную генерацию,
+            // отправляясь раньше, чем сервис успевал ответить.
             {
                 let ui = state.chat_ui.entry(chat_id.clone()).or_default();
                 ui.pending = true;
@@ -2791,6 +2866,25 @@ fn fetch_chats(state: &AppState, tx: &mpsc::UnboundedSender<ChatEvent>) {
     let client = state.chats_client.clone();
     let tx = tx.clone();
     tokio::spawn(async move {
+        let result = client.list().await.map_err(|err| failure_text(&err));
+        let _ = tx.send(ChatEvent::ChatsLoaded(result));
+    });
+}
+
+/// Заголовок, который сервис ставит новому чату и меняет один раз после
+/// первого обмена (`AGENTD_AUTO_TITLE`) — клиент это название сам не
+/// подбирает, только подтягивает его у сервиса.
+const DEFAULT_CHAT_TITLE: &str = "Новый чат";
+
+/// Отложенный запрос списка чатов: подтягивает заголовок, который сервис
+/// придумывает в фоне после первого обмена. Задержка даёт серверному
+/// вызову модели время завершиться — обновлённого списка сразу после
+/// ответа ещё не будет.
+fn schedule_title_refresh(state: &AppState, tx: &mpsc::UnboundedSender<ChatEvent>) {
+    let client = state.chats_client.clone();
+    let tx = tx.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_secs(3)).await;
         let result = client.list().await.map_err(|err| failure_text(&err));
         let _ = tx.send(ChatEvent::ChatsLoaded(result));
     });
@@ -3128,6 +3222,20 @@ fn fetch_cloud_models(config: &Config, tx: &mpsc::UnboundedSender<ChatEvent>) {
     });
 }
 
+/// Фоновый запрос списка профилей владельца у сервиса (`GET /v1/profiles`,
+/// specs/user-profiles) — для перебора стрелками в поле «Профиль».
+fn fetch_profiles(config: &Config, tx: &mpsc::UnboundedSender<ChatEvent>) {
+    let server_url = config.effective_server_url();
+    let token = config.client_token();
+    let tx = tx.clone();
+    tokio::spawn(async move {
+        let result = agentclient::list_profiles(&server_url, &token)
+            .await
+            .map_err(|err| err.to_string());
+        let _ = tx.send(ChatEvent::Profiles(result));
+    });
+}
+
 fn handle_chat_event(
     chat_event: ChatEvent,
     state: &mut AppState,
@@ -3140,6 +3248,10 @@ fn handle_chat_event(
         }
         ChatEvent::CloudModels(result) => {
             handle_cloud_models(result, state);
+            return;
+        }
+        ChatEvent::Profiles(result) => {
+            handle_profiles(result, state);
             return;
         }
         ChatEvent::ChatsLoaded(result) => {
@@ -3254,6 +3366,16 @@ fn handle_chat_event(
     }
     state.chats[chat_index].messages.push(message.clone());
     state.chats[chat_index].touch_quietly();
+    // Первый обмен чата с заголовком по умолчанию: сервис после него сам
+    // придумывает название (title.rs), но фоном — список чатов, полученный
+    // прямо сейчас, его ещё не знает. Подтягиваем список ещё раз спустя
+    // паузу, чтобы название появилось без ручного обновления.
+    if !failed
+        && state.chats[chat_index].title == DEFAULT_CHAT_TITLE
+        && state.chats[chat_index].messages.len() == 2
+    {
+        schedule_title_refresh(&state, tx);
+    }
     // Обмен облачного чата записал сам сервис (запрос шёл с `chat_id`), а
     // обмен локального записывает клиент: ответ дала модель на машине
     // пользователя. Неудачный запрос не записывается: текст ошибки — не
@@ -3719,6 +3841,29 @@ fn handle_cloud_models(result: Result<Vec<String>, String>, state: &mut AppState
             }
             if let Some(editor) = state.settings.as_mut() {
                 editor.error = Some(err);
+            }
+        }
+    }
+}
+
+/// Обновить список профилей в состоянии и в открытом редакторе настроек.
+/// Как у облачных моделей: при ошибке список не очищаем — недоступность
+/// сервиса не должна сбрасывать уже выбранный профиль (specs/user-profiles).
+fn handle_profiles(result: Result<Vec<ProfileChoice>, String>, state: &mut AppState) {
+    match result {
+        Ok(profiles) => {
+            let count = profiles.len();
+            state.profile_choices = profiles.clone();
+            if let Some(editor) = state.settings.as_mut() {
+                editor.profile_choices = profiles;
+            }
+            if state.focus == Focus::Settings {
+                state.notify(format!("Сервис: найдено профилей — {count}"));
+            }
+        }
+        Err(err) => {
+            if state.focus == Focus::Settings {
+                state.notify(format!("Список профилей сервиса недоступен: {err}"));
             }
         }
     }
@@ -4662,6 +4807,11 @@ fn render_settings_fields(f: &mut Frame, editor: &SettingsEditor, area: Rect) {
                 None => "Умолчание сервиса".to_string(),
             },
             FormatField::ContextWindowMessages => editor.context_window_messages.clone(),
+            FormatField::Profile => match editor.profile_choices.iter().find(|p| p.id == editor.profile_id) {
+                Some(profile) => format!("{} ({})", profile.name, profile.id),
+                None if editor.profile_id.is_empty() => "Умолчание сервиса".to_string(),
+                None => editor.profile_id.clone(),
+            },
             FormatField::MemoryLayersEnabled => match editor.memory_layers_enabled.as_str() {
                 "on" => "Включена".to_string(),
                 "off" => "Выключена".to_string(),
@@ -5213,6 +5363,7 @@ mod tests {
             show_reasoning: true,
             ollama_models: Vec::new(),
             model_choices: Vec::new(),
+            profile_choices: Vec::new(),
         }
     }
 
@@ -5276,7 +5427,7 @@ mod tests {
             settings,
             history_loaded: true,
         };
-        let editor = SettingsEditor::from_chat(&session, &Config::default(), &[], &[]);
+        let editor = SettingsEditor::from_chat(&session, &Config::default(), &[], &[], &[]);
         assert_eq!(editor.context_limit, "4000");
     }
 
@@ -5291,7 +5442,7 @@ mod tests {
             settings,
             history_loaded: true,
         };
-        let mut editor = SettingsEditor::from_chat(&session, &Config::default(), &[], &[]);
+        let mut editor = SettingsEditor::from_chat(&session, &Config::default(), &[], &[], &[]);
         assert_eq!(editor.build_context_strategy(), None);
         editor.cycle_context_strategy(1);
         assert_eq!(editor.build_context_strategy(), Some(ContextStrategy::Summary));
@@ -5299,6 +5450,65 @@ mod tests {
         assert_eq!(editor.build_context_strategy(), Some(ContextStrategy::SlidingWindow));
         editor.cycle_context_strategy(-1);
         assert_eq!(editor.build_context_strategy(), Some(ContextStrategy::Summary));
+    }
+
+    #[test]
+    fn settings_editor_cycles_profile_and_saves_it() {
+        let settings = ChatSettings::default();
+        let session = ChatSession {
+            id: "chat-1".to_string(),
+            title: "Чат".to_string(),
+            messages: Vec::new(),
+            updated_at: 0,
+            settings,
+            history_loaded: true,
+        };
+        let profiles = vec![
+            ProfileChoice { id: "teacher".to_string(), name: "Преподаватель".to_string(), built_in: true },
+            ProfileChoice { id: "reviewer".to_string(), name: "Ревьюер".to_string(), built_in: true },
+        ];
+        let mut editor = SettingsEditor::from_chat(&session, &Config::default(), &[], &[], &profiles);
+        assert_eq!(editor.build_profile_id(), None);
+        editor.cycle_profile(1);
+        assert_eq!(editor.build_profile_id(), Some("teacher".to_string()));
+        editor.cycle_profile(1);
+        assert_eq!(editor.build_profile_id(), Some("reviewer".to_string()));
+        editor.cycle_profile(1);
+        assert_eq!(editor.build_profile_id(), None, "перебор возвращается к «без профиля»");
+        editor.cycle_profile(-1);
+        assert_eq!(editor.build_profile_id(), Some("reviewer".to_string()));
+    }
+
+    #[test]
+    fn profile_selected_by_typing_id_round_trips_through_chat_settings() {
+        let settings = ChatSettings::default();
+        let session = ChatSession {
+            id: "chat-1".to_string(),
+            title: "Чат".to_string(),
+            messages: Vec::new(),
+            updated_at: 0,
+            settings,
+            history_loaded: true,
+        };
+        let mut editor = SettingsEditor::from_chat(&session, &Config::default(), &[], &[], &[]);
+        editor.profile_id = "own-profile-id".to_string();
+        assert_eq!(editor.build_profile_id(), Some("own-profile-id".to_string()));
+    }
+
+    #[test]
+    fn existing_chat_profile_is_loaded_into_editor() {
+        let settings = ChatSettings { profile_id: Some("psychologist".to_string()), ..ChatSettings::default() };
+        let session = ChatSession {
+            id: "chat-1".to_string(),
+            title: "Чат".to_string(),
+            messages: Vec::new(),
+            updated_at: 0,
+            settings,
+            history_loaded: true,
+        };
+        let editor = SettingsEditor::from_chat(&session, &Config::default(), &[], &[], &[]);
+        assert_eq!(editor.profile_id, "psychologist");
+        assert_eq!(editor.build_profile_id(), Some("psychologist".to_string()));
     }
 
     #[test]
@@ -5312,7 +5522,7 @@ mod tests {
             settings,
             history_loaded: true,
         };
-        let mut editor = SettingsEditor::from_chat(&session, &Config::default(), &[], &[]);
+        let mut editor = SettingsEditor::from_chat(&session, &Config::default(), &[], &[], &[]);
         editor.section = SettingsSection::ALL
             .iter()
             .position(|s| *s == SettingsSection::Memory)
@@ -5337,7 +5547,7 @@ mod tests {
             settings,
             history_loaded: true,
         };
-        let mut editor = SettingsEditor::from_chat(&session, &Config::default(), &[], &[]);
+        let mut editor = SettingsEditor::from_chat(&session, &Config::default(), &[], &[], &[]);
         assert_eq!(editor.build_memory_router_enabled(), None);
         editor.cycle_memory_router_enabled(1);
         assert_eq!(editor.build_memory_router_enabled(), Some(true));

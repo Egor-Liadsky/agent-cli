@@ -41,6 +41,28 @@ pub enum Commands {
         #[command(subcommand)]
         action: BranchesAction,
     },
+    /// Профили владельца (specs/user-profiles): встроенные (`teacher`,
+    /// `psychologist`, `reviewer`) и собственные, подключаемые к чату полем
+    /// `profile_id` в параметрах чата (TUI, Ctrl+P)
+    Profiles {
+        #[command(subcommand)]
+        action: ProfilesAction,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum ProfilesAction {
+    /// Показать доступные профили: встроенные и собственные
+    List,
+    /// Показать один профиль по идентификатору
+    Show { id: String },
+    /// Создать собственный профиль из JSON-файла с полями name, persona,
+    /// style, format, constraints (непустой обязательно хотя бы один из
+    /// persona/style/format/constraints)
+    Create {
+        #[arg(long)]
+        file: String,
+    },
 }
 
 #[derive(Subcommand)]

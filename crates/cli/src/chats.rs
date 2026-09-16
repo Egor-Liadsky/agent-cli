@@ -8,10 +8,6 @@ use agentclient::{ChatHistory, ChatSummary};
 use agentcore::agent::{Message, Role};
 use agentcore::config::ChatSettings;
 
-/// Заголовок нового чата. Совпадает с заголовком, который ставит сервис:
-/// по нему клиент понимает, что заголовок ещё не выведен из первой реплики.
-pub const DEFAULT_TITLE: &str = "Новый чат";
-
 #[derive(Clone)]
 pub struct ChatSession {
     pub id: String,
@@ -52,29 +48,10 @@ impl ChatSession {
         self.history_loaded = true;
     }
 
-    /// Обновить время изменения. Заголовок при этом не меняется: он
-    /// приходит от сервиса, а вывод его из первой реплики — отдельное
-    /// действие с запросом `PATCH`.
+    /// Обновить время изменения. Заголовок при этом не меняется: его
+    /// придумывает сервис после первого обмена (`AGENTD_AUTO_TITLE`).
     pub fn touch_quietly(&mut self) {
         self.updated_at = agentcore::agent::now_secs().max(0) as u64;
-    }
-
-    /// Заголовок, выведенный из первой реплики пользователя. `None`, если
-    /// заголовок уже задан — сервисом или самим пользователем: заданное
-    /// вручную имя чата не перезаписывается.
-    pub fn title_from_first_message(&self) -> Option<String> {
-        if self.title != DEFAULT_TITLE {
-            return None;
-        }
-        let first_user = self
-            .messages
-            .iter()
-            .find(|message| matches!(message.role, Role::User))?;
-        let mut title: String = first_user.content.chars().take(40).collect();
-        if first_user.content.chars().count() > 40 {
-            title.push('…');
-        }
-        Some(title)
     }
 }
 
@@ -127,50 +104,11 @@ mod tests {
         }
     }
 
-    // --- 5.4 Заголовок из первой реплики ---
-
-    #[test]
-    fn title_comes_from_first_user_message() {
-        let mut chat = ChatSession::from_summary(summary(DEFAULT_TITLE, 0));
-        chat.messages.push(Message::user("Как собрать проект?"));
-
-        assert_eq!(
-            chat.title_from_first_message().as_deref(),
-            Some("Как собрать проект?")
-        );
-    }
-
-    #[test]
-    fn long_first_message_is_trimmed_with_ellipsis() {
-        let mut chat = ChatSession::from_summary(summary(DEFAULT_TITLE, 0));
-        chat.messages.push(Message::user("я".repeat(50)));
-
-        let title = chat.title_from_first_message().expect("заголовок");
-        assert_eq!(title.chars().count(), 41, "40 символов и многоточие");
-        assert!(title.ends_with('…'));
-    }
-
-    #[test]
-    fn manual_title_is_never_overwritten() {
-        let mut chat = ChatSession::from_summary(summary("Мой чат", 0));
-        chat.messages.push(Message::user("вопрос"));
-
-        assert!(chat.title_from_first_message().is_none());
-    }
-
-    #[test]
-    fn assistant_only_history_gives_no_title() {
-        let mut chat = ChatSession::from_summary(summary(DEFAULT_TITLE, 0));
-        chat.messages.push(Message::assistant("ответ"));
-
-        assert!(chat.title_from_first_message().is_none());
-    }
-
     // --- 4.4 История накладывается на чат ---
 
     #[test]
     fn history_replaces_messages_and_marks_chat_loaded() {
-        let mut chat = ChatSession::from_summary(summary(DEFAULT_TITLE, 2));
+        let mut chat = ChatSession::from_summary(summary("Новый чат", 2));
         assert!(!chat.history_loaded, "чат с сообщениями не загружен по списку");
 
         chat.apply_history(ChatHistory {

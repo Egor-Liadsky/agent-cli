@@ -80,6 +80,19 @@ pub struct LongTermMemoryEntry {
     pub updated_at: i64,
 }
 
+/// Профиль владельца: встроенный (`teacher`/`psychologist`/`reviewer`) или
+/// собственный (specs/user-profiles).
+#[derive(Debug, Clone)]
+pub struct Profile {
+    pub id: String,
+    pub name: String,
+    pub persona: String,
+    pub style: String,
+    pub format: String,
+    pub constraints: Vec<String>,
+    pub built_in: bool,
+}
+
 /// Ветка чата стратегии `branching`.
 #[derive(Debug, Clone)]
 pub struct Branch {
@@ -410,6 +423,43 @@ impl ChatsClient {
         Ok(())
     }
 
+    /// Профили, доступные владельцу: встроенные плюс собственные
+    /// (specs/user-profiles, «Встроенные профили видны без создания»).
+    pub async fn profiles(&self) -> Result<Vec<Profile>> {
+        let payload: ProfilesPayload = self.send(reqwest::Method::GET, self.url("/profiles"), None).await?;
+        Ok(payload.profiles.into_iter().map(Profile::from).collect())
+    }
+
+    pub async fn profile(&self, id: &str) -> Result<Profile> {
+        let payload: ProfilePayload =
+            self.send(reqwest::Method::GET, self.url(&format!("/profiles/{id}")), None).await?;
+        Ok(Profile::from(payload))
+    }
+
+    pub async fn create_profile(
+        &self,
+        name: &str,
+        persona: &str,
+        style: &str,
+        format: &str,
+        constraints: &[String],
+    ) -> Result<Profile> {
+        let payload: ProfilePayload = self
+            .send(
+                reqwest::Method::POST,
+                self.url("/profiles"),
+                Some(serde_json::json!({
+                    "name": name,
+                    "persona": persona,
+                    "style": style,
+                    "format": format,
+                    "constraints": constraints,
+                })),
+            )
+            .await?;
+        Ok(Profile::from(payload))
+    }
+
     pub async fn create(&self, title: Option<&str>, settings: &ChatSettings) -> Result<ChatSummary> {
         let mut body = serde_json::json!({ "settings": settings_payload(settings) });
         if let Some(title) = title.map(str::trim).filter(|title| !title.is_empty()) {
@@ -502,6 +552,7 @@ fn settings_payload(settings: &ChatSettings) -> serde_json::Value {
         summary_step_messages: settings.summary_step_messages,
         context_strategy: settings.context_strategy,
         context_window_messages: settings.context_window_messages,
+        profile_id: settings.profile_id.clone(),
     };
     serde_json::to_value(payload).unwrap_or(serde_json::Value::Null)
 }
@@ -535,6 +586,7 @@ struct ChatSettingsUpdate {
     summary_step_messages: Option<u32>,
     context_strategy: Option<ContextStrategy>,
     context_window_messages: Option<u32>,
+    profile_id: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -724,6 +776,37 @@ struct WorkingMemoryEntryPayload {
 impl From<WorkingMemoryEntryPayload> for WorkingMemoryEntry {
     fn from(payload: WorkingMemoryEntryPayload) -> Self {
         Self { key: payload.key, value: payload.value, source: payload.source, updated_at: payload.updated_at }
+    }
+}
+
+#[derive(Deserialize)]
+struct ProfilesPayload {
+    #[serde(default)]
+    profiles: Vec<ProfilePayload>,
+}
+
+#[derive(Deserialize)]
+struct ProfilePayload {
+    id: String,
+    name: String,
+    persona: String,
+    style: String,
+    format: String,
+    constraints: Vec<String>,
+    built_in: bool,
+}
+
+impl From<ProfilePayload> for Profile {
+    fn from(payload: ProfilePayload) -> Self {
+        Self {
+            id: payload.id,
+            name: payload.name,
+            persona: payload.persona,
+            style: payload.style,
+            format: payload.format,
+            constraints: payload.constraints,
+            built_in: payload.built_in,
+        }
     }
 }
 

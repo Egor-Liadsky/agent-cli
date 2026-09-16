@@ -170,6 +170,12 @@ struct ChatSettingsPayload {
     context_strategy: Option<ContextStrategy>,
     #[serde(skip_serializing_if = "Option::is_none")]
     context_window_messages: Option<u32>,
+    /// Разовое переопределение профиля этого запроса: незаданное поле
+    /// опускается, и действует профиль, сохранённый в чате
+    /// (specs/user-profiles, «Профиль выбирается настройкой чата поверх
+    /// операторского умолчания»).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    profile_id: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -426,6 +432,7 @@ impl ServerAgent {
                 summary_step_messages: settings.summary_step_messages,
                 context_strategy: settings.context_strategy,
                 context_window_messages: settings.context_window_messages,
+                profile_id: settings.profile_id.clone(),
             },
         }
     }
@@ -579,9 +586,65 @@ pub async fn list_models(server_url: &str, token: &str) -> Result<Vec<String>> {
     Ok(parsed.models)
 }
 
+#[derive(Deserialize)]
+struct ProfilesResponse {
+    #[serde(default)]
+    profiles: Vec<ProfileSummaryPayload>,
+}
+
+#[derive(Deserialize)]
+struct ProfileSummaryPayload {
+    id: String,
+    name: String,
+    built_in: bool,
+}
+
+/// Профили, доступные владельцу (`GET /v1/profiles`): встроенные плюс
+/// собственные (specs/user-profiles). Только сводка — id/название/признак
+/// встроенности, достаточная для поля выбора в настройках чата; полные поля
+/// профиля читаются через `chats::Profile` по конкретному id.
+pub async fn list_profiles(server_url: &str, token: &str) -> Result<Vec<ProfileChoice>> {
+    let url = format!("{}/v1/profiles", server_url.trim_end_matches('/'));
+    let request = reqwest::Client::new().get(&url);
+    let request = if token.trim().is_empty() {
+        request
+    } else {
+        request.bearer_auth(token.trim())
+    };
+    let response = request.send().await.map_err(|err| {
+        transport_error(&format!("сервис недоступен по адресу {server_url}"), err)
+    })?;
+    let status = response.status();
+    let header_id = header_request_id(&response);
+    let body = response
+        .text()
+        .await
+        .map_err(|err| transport_error("не удалось прочитать список профилей", err))?;
+    if !status.is_success() {
+        return Err(parse_service_error(status, &body, header_id, None).into());
+    }
+    let parsed: ProfilesResponse = serde_json::from_str(&body).map_err(|err| {
+        AgentError::Decode(format!("не удалось разобрать список профилей сервиса: {err}"))
+    })?;
+    Ok(parsed
+        .profiles
+        .into_iter()
+        .map(|p| ProfileChoice { id: p.id, name: p.name, built_in: p.built_in })
+        .collect())
+}
+
+/// Сводка профиля для поля выбора в настройках чата.
+#[derive(Debug, Clone)]
+pub struct ProfileChoice {
+    pub id: String,
+    pub name: String,
+    pub built_in: bool,
+}
+
 mod chats;
 pub use chats::{
-    Branch, ChatHistory, ChatSummary, ChatsClient, Fact, LongTermMemoryEntry, StoredMessage, WorkingMemoryEntry,
+    Branch, ChatHistory, ChatSummary, ChatsClient, Fact, LongTermMemoryEntry, Profile, StoredMessage,
+    WorkingMemoryEntry,
 };
 
 #[cfg(test)]

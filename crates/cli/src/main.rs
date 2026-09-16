@@ -12,7 +12,7 @@ use anyhow::Context;
 use clap::Parser;
 use cli::{
     BranchesAction, Cli, Commands, ConfigAction, ContextLimitAction, FactsAction, FormatAction,
-    OllamaAction, SamplingAction, SummaryAction,
+    OllamaAction, ProfilesAction, SamplingAction, SummaryAction,
 };
 use agentcore::config::{Config, Provider, ReasoningMode, ThinkingMode};
 use console::style;
@@ -36,6 +36,7 @@ async fn main() -> anyhow::Result<()> {
         Commands::Ollama { action } => run_ollama(action).await?,
         Commands::Facts { chat_id, action } => run_facts(chat_id, action).await?,
         Commands::Branches { chat_id, action } => run_branches(chat_id, action).await?,
+        Commands::Profiles { action } => run_profiles(action).await?,
     }
 
     Ok(())
@@ -88,6 +89,65 @@ async fn run_branches(chat_id: String, action: BranchesAction) -> anyhow::Result
         BranchesAction::Activate { branch_id } => {
             client.activate_branch(&chat_id, &branch_id).await?;
             println!("Ветка {branch_id} активна.");
+        }
+    }
+    Ok(())
+}
+
+/// Поля профиля, читаемые из файла `profiles create --file`
+/// (specs/user-profiles, «Ручное управление профилями через HTTP»).
+#[derive(serde::Deserialize)]
+struct ProfileFile {
+    name: String,
+    #[serde(default)]
+    persona: String,
+    #[serde(default)]
+    style: String,
+    #[serde(default)]
+    format: String,
+    #[serde(default)]
+    constraints: Vec<String>,
+}
+
+async fn run_profiles(action: ProfilesAction) -> anyhow::Result<()> {
+    let config = load_config()?;
+    let client = tui::chats_client(&config);
+    match action {
+        ProfilesAction::List => {
+            let profiles = client.profiles().await?;
+            for profile in profiles {
+                let mark = if profile.built_in { "[встроенный]" } else { "[свой]" };
+                println!("{mark} {} — {}", profile.id, profile.name);
+            }
+        }
+        ProfilesAction::Show { id } => {
+            let profile = client.profile(&id).await?;
+            println!("{} ({})", profile.name, profile.id);
+            if !profile.persona.is_empty() {
+                println!("Роль: {}", profile.persona);
+            }
+            if !profile.style.is_empty() {
+                println!("Стиль: {}", profile.style);
+            }
+            if !profile.format.is_empty() {
+                println!("Формат ответа: {}", profile.format);
+            }
+            if !profile.constraints.is_empty() {
+                println!("Ограничения:");
+                for constraint in &profile.constraints {
+                    println!("- {constraint}");
+                }
+            }
+        }
+        ProfilesAction::Create { file } => {
+            let content = std::fs::read_to_string(&file)
+                .with_context(|| format!("не удалось прочитать файл профиля {file}"))?;
+            let parsed: ProfileFile = serde_json::from_str(&content)
+                .with_context(|| format!("не удалось разобрать файл профиля {file}"))?;
+            let created = client
+                .create_profile(&parsed.name, &parsed.persona, &parsed.style, &parsed.format, &parsed.constraints)
+                .await?;
+            println!("Создан профиль {} ({}).", created.name, created.id);
         }
     }
     Ok(())

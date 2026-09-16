@@ -204,6 +204,7 @@ fn settings_with(provider: Provider, model: &str) -> ChatSettings {
         memory_router_enabled: None,
         memory_working_max_entries: None,
         memory_long_term_max_entries: None,
+        profile_id: None,
     }
 }
 
@@ -535,6 +536,55 @@ async fn long_term_memory_is_listed_set_and_deleted() {
     assert_eq!(set.value, "Егор");
 
     client.delete_long_term_memory("id-2").await.expect("удаление записи долговременной памяти");
+}
+
+#[tokio::test]
+async fn profiles_are_listed_read_and_created() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v1/profiles"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "profiles": [
+                {
+                    "id": "teacher", "name": "Преподаватель", "persona": "персона",
+                    "style": "стиль", "format": "формат", "constraints": ["к1"], "built_in": true
+                }
+            ]
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/v1/profiles/teacher"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": "teacher", "name": "Преподаватель", "persona": "персона",
+            "style": "стиль", "format": "формат", "constraints": ["к1"], "built_in": true
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1/profiles"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(json!({
+            "id": "id-1", "name": "Свой", "persona": "", "style": "кратко", "format": "",
+            "constraints": [], "built_in": false
+        })))
+        .mount(&server)
+        .await;
+
+    let client = chats(&server, "token-a");
+    let profiles = client.profiles().await.expect("список профилей");
+    assert_eq!(profiles.len(), 1);
+    assert_eq!(profiles[0].id, "teacher");
+    assert!(profiles[0].built_in);
+
+    let profile = client.profile("teacher").await.expect("чтение профиля");
+    assert_eq!(profile.name, "Преподаватель");
+
+    let created = client
+        .create_profile("Свой", "", "кратко", "", &[])
+        .await
+        .expect("создание профиля");
+    assert_eq!(created.id, "id-1");
+    assert!(!created.built_in);
 }
 
 #[tokio::test]
