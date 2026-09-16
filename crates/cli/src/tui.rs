@@ -355,15 +355,17 @@ enum FormatField {
 enum SettingsSection {
     Connection,
     Context,
+    Memory,
     Format,
     Reasoning,
     Sampling,
 }
 
 impl SettingsSection {
-    const ALL: [SettingsSection; 5] = [
+    const ALL: [SettingsSection; 6] = [
         SettingsSection::Connection,
         SettingsSection::Context,
+        SettingsSection::Memory,
         SettingsSection::Format,
         SettingsSection::Reasoning,
         SettingsSection::Sampling,
@@ -373,6 +375,7 @@ impl SettingsSection {
         match self {
             SettingsSection::Connection => "Подключение",
             SettingsSection::Context => "Контекст",
+            SettingsSection::Memory => "Память",
             SettingsSection::Format => "Формат ответа",
             SettingsSection::Reasoning => "Рассуждение",
             SettingsSection::Sampling => "Сэмплинг",
@@ -388,6 +391,9 @@ impl SettingsSection {
             }
             SettingsSection::Context => {
                 "Лимит контекстного окна и компактизация истории — настройки конкретно этого чата."
+            }
+            SettingsSection::Memory => {
+                "Слоистая память: рабочая и долговременная память, независимо от стратегии контекста."
             }
             SettingsSection::Format => "Формат ответа: кастомный режим, длина, стоп-условия.",
             SettingsSection::Reasoning => {
@@ -415,6 +421,8 @@ impl SettingsSection {
                 FormatField::SummaryEnabled,
                 FormatField::SummaryKeepMessages,
                 FormatField::SummaryStepMessages,
+            ],
+            SettingsSection::Memory => &[
                 FormatField::MemoryLayersEnabled,
                 FormatField::MemoryRouterEnabled,
                 FormatField::MemoryWorkingMaxEntries,
@@ -5307,8 +5315,8 @@ mod tests {
         let mut editor = SettingsEditor::from_chat(&session, &Config::default(), &[], &[]);
         editor.section = SettingsSection::ALL
             .iter()
-            .position(|s| *s == SettingsSection::Context)
-            .expect("раздел «Контекст» существует");
+            .position(|s| *s == SettingsSection::Memory)
+            .expect("раздел «Память» существует");
         editor.context_strategy = ContextStrategy::SlidingWindow.as_str().to_string();
         assert!(!editor.visible_fields().contains(&FormatField::MemoryRouterEnabled));
         editor.memory_layers_enabled = "on".to_string();
