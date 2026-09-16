@@ -417,6 +417,16 @@ pub struct ChatSettings {
     /// пусто — без профиля).
     #[serde(default)]
     pub profile_id: Option<String>,
+    /// Включает или выключает состояние задачи (этап, шаг, ожидаемое
+    /// действие, пауза) для этого чата. `None` — операторское умолчание
+    /// сервиса (`AGENTD_TASK_STATE_ENABLED`, выключено по умолчанию).
+    #[serde(default)]
+    pub task_state_enabled: Option<bool>,
+    /// Включает или выключает автоматический трекер состояния задачи, когда
+    /// состояние задачи включено. `None` — операторское умолчание сервиса
+    /// (`AGENTD_TASK_STATE_AUTO_ENABLED`).
+    #[serde(default)]
+    pub task_state_auto_enabled: Option<bool>,
 }
 
 impl ChatSettings {
@@ -561,6 +571,8 @@ impl Config {
             memory_working_max_entries: None,
             memory_long_term_max_entries: None,
             profile_id: None,
+            task_state_enabled: None,
+            task_state_auto_enabled: None,
         }
     }
 
@@ -814,6 +826,23 @@ server_url = "http://127.0.0.1:9000"
         assert_eq!(settings.memory_working_max_entries, None);
         assert_eq!(settings.memory_long_term_max_entries, None);
         assert_eq!(settings.profile_id, None);
+        assert_eq!(settings.task_state_enabled, None);
+        assert_eq!(settings.task_state_auto_enabled, None);
+    }
+
+    #[test]
+    fn task_state_enabled_round_trips_snake_case_json() {
+        let settings = ChatSettings {
+            task_state_enabled: Some(true),
+            task_state_auto_enabled: Some(false),
+            ..ChatSettings::default()
+        };
+        let json = serde_json::to_string(&settings).expect("сериализация");
+        assert!(json.contains("\"task_state_enabled\":true"));
+        assert!(json.contains("\"task_state_auto_enabled\":false"));
+        let parsed: ChatSettings = serde_json::from_str(&json).expect("разбор");
+        assert_eq!(parsed.task_state_enabled, Some(true));
+        assert_eq!(parsed.task_state_auto_enabled, Some(false));
     }
 
     #[test]
