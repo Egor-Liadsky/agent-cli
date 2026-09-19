@@ -167,6 +167,14 @@ pub enum ConfigAction {
         #[command(subcommand)]
         action: SummaryAction,
     },
+    /// Задать путь к файлу инвариантов (`invariants.toml`)
+    SetInvariantsPath {
+        /// Путь к файлу; пустая строка снимает умолчание
+        path: String,
+    },
+    /// Показать активные инварианты из настроенного файла (источник —
+    /// конфигурация, не диалог)
+    Invariants,
 }
 
 #[derive(Subcommand)]

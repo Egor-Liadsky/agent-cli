@@ -245,6 +245,31 @@ cargo run -p agentcli -- config summary show    # показать текущи�
 }
 ```
 
+Инварианты — архитектурные и бизнес-правила, которые агент обязан соблюдать
+независимо от того, о чём просит пользователь (см. `agent-sever/README.md`,
+раздел «Инварианты», за полным описанием формата и проверки). Клиент только
+задаёт путь к файлу и показывает его содержимое — редактировать список из
+диалога нельзя:
+
+```bash
+cargo run -p agentcli -- config set-invariants-path ~/.config/agentcli/invariants.toml
+cargo run -p agentcli -- config invariants   # список: id, категория, формулировка
+```
+
+Пустая строка в `set-invariants-path` снимает путь: инвариантов нет, конвейер
+ведёт себя как раньше. Формат файла — `invariants.toml`, записи `[[invariant]]`
+с полями `id`, `statement`, `category`, необязательный `rationale`:
+
+```toml
+[[invariant]]
+id = "no-client-side-secrets"
+statement = "Ключ провайдера принадлежит сервису, не клиенту."
+category = "security"
+rationale = "Ключ утечёт при компрометации клиента."
+```
+
+`config show` печатает путь к файлу (`invariants_path`), а не его содержимое.
+
 По умолчанию используется `server_url = http://127.0.0.1:8080` и
 `model = deepseek-v4-flash`. Конфиг лежит в
 `~/.config/agentcli/config.toml` (на macOS —

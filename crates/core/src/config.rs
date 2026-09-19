@@ -520,6 +520,13 @@ pub struct Config {
     pub context_strategy: Option<ContextStrategy>,
     #[serde(default)]
     pub context_window_messages: Option<u32>,
+    /// Путь к файлу инвариантов (`invariants.toml`). Не задан — набор
+    /// инвариантов пуст, поведение конвейера не меняется (design.md,
+    /// «Формат файла — `invariants.toml`»). Инварианты живут отдельно от
+    /// этого конфига и от чатов — здесь хранится только путь к ним, не их
+    /// содержимое.
+    #[serde(default)]
+    pub invariants_path: Option<String>,
 }
 
 impl Config {
@@ -641,6 +648,14 @@ impl Config {
         } else {
             self.models.clone()
         }
+    }
+
+    /// Путь к файлу инвариантов, если он задан в конфиге.
+    pub fn invariants_path(&self) -> Option<PathBuf> {
+        self.invariants_path
+            .as_ref()
+            .filter(|p| !p.trim().is_empty())
+            .map(PathBuf::from)
     }
 
     pub fn masked_client_token(&self) -> String {
@@ -883,6 +898,36 @@ server_url = "http://127.0.0.1:9000"
         let settings: ChatSettings =
             serde_json::from_str(r#"{"memory_short_term_tail": 12}"#).expect("настройки чата");
         assert_eq!(settings.memory_layers_enabled, None);
+    }
+
+    #[test]
+    fn old_config_without_invariants_path_parses_as_none() {
+        let content = r#"
+server_url = "http://127.0.0.1:9000"
+"#;
+        let (config, _legacy) = Config::parse_with_legacy_fields(content).expect("конфиг");
+        assert_eq!(config.invariants_path(), None);
+    }
+
+    #[test]
+    fn invariants_path_is_read_from_config() {
+        let content = r#"
+invariants_path = "/etc/agentcli/invariants.toml"
+"#;
+        let (config, _legacy) = Config::parse_with_legacy_fields(content).expect("конфиг");
+        assert_eq!(
+            config.invariants_path(),
+            Some(PathBuf::from("/etc/agentcli/invariants.toml"))
+        );
+    }
+
+    #[test]
+    fn blank_invariants_path_is_treated_as_not_set() {
+        let config = Config {
+            invariants_path: Some("   ".to_string()),
+            ..Config::default()
+        };
+        assert_eq!(config.invariants_path(), None);
     }
 
     #[test]

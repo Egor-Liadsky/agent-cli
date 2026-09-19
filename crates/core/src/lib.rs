@@ -6,5 +6,6 @@
 
 pub mod agent;
 pub mod config;
+pub mod invariants;
 pub mod logging;
 pub mod pipeline;

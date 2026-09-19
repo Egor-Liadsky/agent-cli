@@ -7,6 +7,7 @@
 
 use crate::agent::{Agent, AgentReply, Message};
 use crate::config::ChatSettings;
+use crate::invariants::InvariantSet;
 use anyhow::Result;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -104,6 +105,9 @@ pub struct RequestContext {
     /// Кто прислал запрос, если транспорт это знает.
     pub client_id: Option<String>,
     pub policy: PolicyLog,
+    /// Активные инварианты этого процесса: не приходят с запросом и не
+    /// сериализуются в файл чата (design.md, «Отдельный тип `InvariantSet`»).
+    pub invariants: InvariantSet,
 }
 
 impl RequestContext {
@@ -114,11 +118,17 @@ impl RequestContext {
             settings,
             client_id: None,
             policy: PolicyLog::default(),
+            invariants: InvariantSet::default(),
         }
     }
 
     pub fn with_client_id(mut self, client_id: impl Into<String>) -> Self {
         self.client_id = Some(client_id.into());
+        self
+    }
+
+    pub fn with_invariants(mut self, invariants: InvariantSet) -> Self {
+        self.invariants = invariants;
         self
     }
 }
@@ -287,6 +297,21 @@ impl Pipeline {
         self
     }
 
+    /// История, которая уходит модели на основном вызове: при непустом
+    /// наборе инвариантов перед сообщениями пользователя добавляется
+    /// отдельный системный блок с их текстом (spec.md, «Инварианты явно
+    /// присутствуют в контексте рассуждения»). `context.history` при этом не
+    /// меняется: более поздние стадии продолжают видеть исходную историю.
+    fn history_with_invariants(context: &RequestContext) -> Vec<Message> {
+        if context.invariants.is_empty() {
+            return context.history.clone();
+        }
+        let mut history = Vec::with_capacity(context.history.len() + 1);
+        history.push(Message::system(context.invariants.render()));
+        history.extend(context.history.iter().cloned());
+        history
+    }
+
     /// Нормализация запроса: убираются сообщения, состоящие из одних пробелов,
     /// у остальных обрезаются краевые пробелы.
     fn normalize(history: &mut Vec<Message>) {
@@ -339,7 +364,7 @@ impl Pipeline {
 
         let mut reply = self
             .agent
-            .ask(&context.history, &context.settings)
+            .ask(&Self::history_with_invariants(&context), &context.settings)
             .await?;
 
         for policy in &self.output {
@@ -694,6 +719,42 @@ mod tests {
         );
         assert!(policy.judge.is_none());
         assert_eq!(agent.calls(), 1);
+    }
+
+    #[tokio::test]
+    async fn invariants_block_reaches_model_as_separate_system_message() {
+        use crate::invariants::{Invariant, InvariantSet};
+
+        let agent = FakeAgent::new("ответ модели");
+        let set = InvariantSet {
+            invariants: vec![Invariant {
+                id: "no-client-side-secrets".to_string(),
+                statement: "ключ провайдера принадлежит сервису".to_string(),
+                category: "security".to_string(),
+                rationale: None,
+            }],
+        };
+        let context = context().with_invariants(set);
+        let pipeline = Pipeline::new(agent.clone());
+        completed(pipeline.run(context).await.expect("конвейер"));
+
+        let history = agent.last_history();
+        assert_eq!(history.len(), 2, "блок инвариантов плюс исходный вопрос");
+        assert!(matches!(history[0].role, crate::agent::Role::System));
+        assert!(history[0].content.contains("no-client-side-secrets"));
+        assert_eq!(history[1].content, "исходный вопрос");
+    }
+
+    #[tokio::test]
+    async fn empty_invariant_set_matches_behavior_before_the_change() {
+        let agent = FakeAgent::new("ответ модели");
+        let context = context().with_invariants(crate::invariants::InvariantSet::default());
+        let pipeline = Pipeline::new(agent.clone());
+        completed(pipeline.run(context).await.expect("конвейер"));
+
+        let history = agent.last_history();
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].content, "исходный вопрос");
     }
 
     #[tokio::test]

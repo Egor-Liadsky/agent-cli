@@ -242,6 +242,50 @@ fn run_config(action: ConfigAction) -> anyhow::Result<()> {
         } => run_reasoning_action(mode, experts, thinking)?,
         ConfigAction::ContextLimit { action } => run_context_limit_action(action)?,
         ConfigAction::Summary { action } => run_summary_action(action)?,
+        ConfigAction::SetInvariantsPath { path } => {
+            let mut config = load_config()?;
+            config.invariants_path = if path.trim().is_empty() { None } else { Some(path) };
+            config.save()?;
+            println!("{}", style("Путь к файлу инвариантов сохранён.").green().bold());
+            print_invariants_path(&config);
+        }
+        ConfigAction::Invariants => run_config_invariants()?,
+    }
+    Ok(())
+}
+
+fn print_invariants_path(config: &Config) {
+    println!(
+        "{} {}",
+        style("invariants_path:").cyan().bold(),
+        config
+            .invariants_path()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| "<не задан>".to_string())
+    );
+}
+
+/// Печатает активные инварианты из настроенного файла: источник —
+/// конфигурация оператора, не диалог (design.md, «Отдельный тип
+/// `InvariantSet`»). Само содержимое чата эта команда не читает и не меняет.
+fn run_config_invariants() -> anyhow::Result<()> {
+    let config = load_config()?;
+    let Some(path) = config.invariants_path() else {
+        println!("{}", style("Путь к файлу инвариантов не задан.").yellow());
+        return Ok(());
+    };
+    let set = agentcore::invariants::InvariantSet::load(&path)?;
+    if set.is_empty() {
+        println!("Инвариантов нет.");
+        return Ok(());
+    }
+    for invariant in &set.invariants {
+        println!(
+            "{} {} — {}",
+            style(format!("[{}]", invariant.id)).cyan().bold(),
+            style(format!("({})", invariant.category)).dim(),
+            invariant.statement
+        );
     }
     Ok(())
 }
@@ -508,6 +552,7 @@ fn show_config() -> anyhow::Result<()> {
     print_sampling_params(&config.sampling);
     print_context_limit(&config);
     print_summary(&config);
+    print_invariants_path(&config);
     Ok(())
 }
 
