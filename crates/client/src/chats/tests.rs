@@ -914,9 +914,14 @@ async fn task_pause_and_resume_round_trip() {
 
 // --- Автомат допустимых переходов на клиенте (design.md, решение 9) ---
 
+/// Перечисляет рёбра явным списком по всем пяти этапам: таблица клиента
+/// дублирует серверную, и именно её молчаливое расхождение с сервером
+/// запирало задачу на `clarification`
+/// (fix-task-state-clarification-stall, решение 5).
 #[test]
 fn allowed_next_stages_matches_server_automaton() {
-    assert_eq!(allowed_next_stages("planning"), vec!["execution"]);
+    assert_eq!(allowed_next_stages("planning"), vec!["clarification"]);
+    assert_eq!(allowed_next_stages("clarification"), vec!["execution", "planning"]);
     assert_eq!(allowed_next_stages("execution"), vec!["validation", "planning"]);
     assert_eq!(allowed_next_stages("validation"), vec!["done", "execution"]);
     assert!(allowed_next_stages("done").is_empty());

@@ -120,8 +120,14 @@ pub struct TaskState {
 /// Допустимые рёбра автомата состояния задачи (design.md, решение 3), в
 /// одном месте с сервером: клиент не провоцирует заведомо отклоняемый
 /// запрос, но окончательным арбитром остаётся сервер (design.md, решение 9).
-const TASK_STAGE_EDGES: [(&str, &str); 5] = [
-    ("planning", "execution"),
+/// Список сверяется с разделом состояния задачи в README сервиса: таблица
+/// дублируется на клиенте осознанно, и разъехавшись она делает ручной выход
+/// из `clarification` невозможным (fix-task-state-clarification-stall,
+/// решение 5).
+const TASK_STAGE_EDGES: [(&str, &str); 7] = [
+    ("planning", "clarification"),
+    ("clarification", "execution"),
+    ("clarification", "planning"),
     ("execution", "validation"),
     ("validation", "done"),
     ("validation", "execution"),

@@ -6575,6 +6575,39 @@ mod tests {
         assert!(picker.allowed_next_stages().is_empty(), "состояние ещё не загружено");
     }
 
+    fn task_picker_at(stage: &str) -> TaskPicker {
+        let mut picker = TaskPicker::new("chat-1", "Чат");
+        picker.state = Some(agentclient::TaskState {
+            id: "t1".to_string(),
+            stage: stage.to_string(),
+            step: "шаг".to_string(),
+            expected_action: "действие".to_string(),
+            paused: false,
+            resume_brief: String::new(),
+            transitions: Vec::new(),
+        });
+        picker
+    }
+
+    /// Экран должен предлагать выход из `clarification`: до починки список
+    /// там был пуст, и выйти из этапа вручную было нельзя
+    /// (fix-task-state-clarification-stall, решение 5).
+    #[test]
+    fn task_picker_offers_transitions_for_clarification_stage() {
+        assert_eq!(task_picker_at("planning").allowed_next_stages(), vec!["clarification"]);
+        let mut picker = task_picker_at("clarification");
+        assert_eq!(picker.allowed_next_stages(), vec!["execution", "planning"]);
+
+        // Позиция 0 — «без смены этапа», дальше идут допустимые рёбра.
+        assert_eq!(picker.selected_next_stage(), None);
+        picker.cycle_next_stage(1);
+        assert_eq!(picker.selected_next_stage(), Some("execution"));
+        picker.cycle_next_stage(1);
+        assert_eq!(picker.selected_next_stage(), Some("planning"));
+        picker.cycle_next_stage(1);
+        assert_eq!(picker.selected_next_stage(), None, "список замкнут");
+    }
+
     // --- 4.2 Отказ загрузки виден и объясним ---
 
     #[test]
