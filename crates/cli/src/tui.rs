@@ -13,13 +13,13 @@ use crate::markdown::agent_skin;
 use ansi_to_tui::IntoText;
 use crossterm::{
     event::{
-        DisableBracketedPaste, EnableBracketedPaste, Event, EventStream, KeyCode, KeyEventKind,
-        KeyModifiers,
+        DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture, Event,
+        EventStream, KeyCode, KeyEventKind, KeyModifiers, MouseEventKind,
     },
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
-use futures::StreamExt;
+use futures::{FutureExt, StreamExt};
 use ratatui::{
     backend::CrosstermBackend,
     layout::{Constraint, Direction, Layout, Rect},
@@ -113,6 +113,9 @@ enum ChatEvent {
 enum Focus {
     Input,
     Sidebar,
+    /// Режим выбора сообщения в истории: перебор сообщений с клавиатуры ради
+    /// копирования текста одного из них.
+    MessageSelect,
     Settings,
     Import,
     Confirm,
@@ -436,16 +439,18 @@ enum SettingsSection {
     Connection,
     Context,
     Memory,
+    Profile,
     Format,
     Reasoning,
     Sampling,
 }
 
 impl SettingsSection {
-    const ALL: [SettingsSection; 6] = [
+    const ALL: [SettingsSection; 7] = [
         SettingsSection::Connection,
         SettingsSection::Context,
         SettingsSection::Memory,
+        SettingsSection::Profile,
         SettingsSection::Format,
         SettingsSection::Reasoning,
         SettingsSection::Sampling,
@@ -456,6 +461,7 @@ impl SettingsSection {
             SettingsSection::Connection => "Подключение",
             SettingsSection::Context => "Контекст",
             SettingsSection::Memory => "Память",
+            SettingsSection::Profile => "Профиль",
             SettingsSection::Format => "Формат ответа",
             SettingsSection::Reasoning => "Рассуждение",
             SettingsSection::Sampling => "Сэмплинг",
@@ -474,6 +480,9 @@ impl SettingsSection {
             }
             SettingsSection::Memory => {
                 "Слоистая память: рабочая и долговременная память, независимо от стратегии контекста."
+            }
+            SettingsSection::Profile => {
+                "Профиль владельца: роль, стиль, формат и ограничения ответа, заданные сервисом."
             }
             SettingsSection::Format => "Формат ответа: кастомный режим, длина, стоп-условия.",
             SettingsSection::Reasoning => {
@@ -501,7 +510,6 @@ impl SettingsSection {
                 FormatField::SummaryEnabled,
                 FormatField::SummaryKeepMessages,
                 FormatField::SummaryStepMessages,
-                FormatField::Profile,
             ],
             SettingsSection::Memory => &[
                 FormatField::MemoryLayersEnabled,
@@ -511,6 +519,7 @@ impl SettingsSection {
                 FormatField::TaskStateEnabled,
                 FormatField::TaskStateAutoEnabled,
             ],
+            SettingsSection::Profile => &[FormatField::Profile],
             SettingsSection::Format => &[
                 FormatField::Mode,
                 FormatField::Description,
@@ -1530,10 +1539,16 @@ pub async fn run(agent: CliAgent, config: Config) -> anyhow::Result<()> {
 
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    // Mouse capture намеренно не включаем: он перехватывает колесо мыши для
-    // прокрутки, но заодно отключает нативное выделение текста терминалом.
-    // Прокрутка и так доступна с клавиатуры (стрелки, PageUp/PageDown).
-    execute!(stdout, EnterAlternateScreen, EnableBracketedPaste)?;
+    // Захват мыши нужен ради колеса: история длинная, и листать её клавишами
+    // неудобно. Нативное выделение текста терминалом при этом не теряется —
+    // оно доступно с зажатым Shift, а сообщение целиком копируется из самого
+    // TUI (Ctrl+G, затем Enter или Ctrl+Y).
+    execute!(
+        stdout,
+        EnterAlternateScreen,
+        EnableBracketedPaste,
+        EnableMouseCapture
+    )?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
@@ -1542,6 +1557,7 @@ pub async fn run(agent: CliAgent, config: Config) -> anyhow::Result<()> {
     disable_raw_mode()?;
     execute!(
         terminal.backend_mut(),
+        DisableMouseCapture,
         DisableBracketedPaste,
         LeaveAlternateScreen
     )?;
@@ -1567,6 +1583,9 @@ struct ChatUi {
     max_scroll: u16,
     auto_scroll: bool,
     scroll_to_message: Option<usize>,
+    /// Сообщение, выбранное в режиме `Focus::MessageSelect`. Выбор привязан к
+    /// чату, как и прокрутка, поэтому переживает переключение панелей.
+    selected_message: Option<usize>,
     /// Запрошена история чата у сервиса: ввод заблокирован, пока она не
     /// пришла, иначе реплика ушла бы с неполным контекстом.
     history_loading: bool,
@@ -1578,6 +1597,24 @@ struct ChatUi {
     /// Блок наблюдаемости стратегии контекста последнего ответа
     /// (specs/context-strategies, «Переключение стратегии из клиента»).
     last_context: Option<agentcore::config::ContextObservability>,
+    /// Кеш отрисованных сообщений истории, по одному элементу на сообщение
+    /// в том же порядке.
+    rendered: Vec<RenderedMessage>,
+}
+
+/// Одно сообщение истории, уже разобранное в строки терминала.
+///
+/// Markdown прогоняется через termimad и парсер ANSI — это самая дорогая
+/// часть кадра, поэтому результат живёт между кадрами и пересобирается
+/// только при изменении самого сообщения или того, как его надо показать.
+struct RenderedMessage {
+    /// Отпечаток исходных данных: текст, рассуждение, показ рассуждения и
+    /// подсветка выбора. Несовпадение — повод отрисовать заново.
+    fingerprint: u64,
+    lines: Vec<Line<'static>>,
+    /// Высота блока после переноса строк: ширина, на которой она посчитана,
+    /// и число строк. Перенос считается заново при смене ширины окна.
+    wrapped: Option<(u16, usize)>,
 }
 
 /// Обмен локального чата, оставшийся только в памяти клиента.
@@ -1596,10 +1633,12 @@ impl Default for ChatUi {
             max_scroll: 0,
             auto_scroll: true,
             scroll_to_message: None,
+            selected_message: None,
             history_loading: false,
             history_error: None,
             unsaved: None,
             last_context: None,
+            rendered: Vec::new(),
         }
     }
 }
@@ -1651,6 +1690,9 @@ struct AppState {
     /// Профили, доступные владельцу (`GET /v1/profiles`): подгружаются фоном
     /// при старте и обновляются по Ctrl+L, как модели (specs/user-profiles).
     profile_choices: Vec<ProfileChoice>,
+    /// Области истории каждой открытой панели с прошлого кадра: по ним
+    /// колесо мыши находит чат под курсором.
+    history_areas: Vec<(String, Rect)>,
 }
 
 impl AppState {
@@ -1787,6 +1829,7 @@ async fn run_app(
         ollama_models: Vec::new(),
         model_choices,
         profile_choices: Vec::new(),
+        history_areas: Vec::new(),
     };
 
     let (tx, mut rx) = mpsc::unbounded_channel::<ChatEvent>();
@@ -1804,57 +1847,110 @@ async fn run_app(
     fetch_chats(&state, &tx);
     let mut events = EventStream::new();
     let mut tick = tokio::time::interval(Duration::from_millis(80));
+    // Кадр рисуется только после изменения состояния: на длинной истории
+    // холостая перерисовка по каждому тику заметна как лаг.
+    let mut dirty = true;
 
     loop {
-        terminal.draw(|f| render_ui(f, &mut state))?;
+        if dirty {
+            terminal.draw(|f| render_ui(f, &mut state))?;
+            dirty = false;
+        }
 
         tokio::select! {
             _ = tick.tick() => {
                 if state.any_pane_pending() {
                     state.spinner_frame = (state.spinner_frame + 1) % SPINNER_FRAMES.len();
+                    dirty = true;
                 }
             }
             maybe_event = events.next() => {
                 let Some(Ok(event)) = maybe_event else { continue };
-                match event {
-                    Event::Key(key) if key.kind == KeyEventKind::Press => {
-                        if matches!(handle_key(key, &mut state, &agent, &tx), LoopControl::Break) {
-                            break;
-                        }
-                        // токен или адрес сервиса поменяли — дальше шлём запросы
-                        // уже новым агентом (запущенные ждут на старом)
-                        if state.agent_dirty {
-                            state.agent_dirty = false;
-                            match CliAgent::from_config(&state.config, crate::logging::exchange_log())
-                                .map(|agent| {
-                                    agent.with_unauthorized_hint(
-                                        crate::logging::UNAUTHORIZED_HINT,
-                                    )
-                                })
-                            {
-                                Ok(updated) => agent = Arc::new(updated),
-                                Err(err) => state.notify(format!(
-                                    "Не удалось применить настройки подключения: {err}"
-                                )),
-                            }
-                            // Клиент чатов ходит по тому же адресу с тем же
-                            // токеном, поэтому пересобирается вместе с агентом.
-                            state.chats_client = Arc::new(chats_client(&state.config));
-                            fetch_chats(&state, &tx);
-                        }
+                // События разбираются пачкой: при быстром наборе или удержании
+                // клавиши они приходят чаще, чем успевает кадр, и рисовать надо
+                // итог пачки, а не каждое промежуточное состояние.
+                let mut next = Some(event);
+                let mut stop = false;
+                while let Some(event) = next.take() {
+                    dirty = true;
+                    if matches!(
+                        handle_terminal_event(event, &mut state, &mut agent, &tx),
+                        LoopControl::Break
+                    ) {
+                        stop = true;
+                        break;
                     }
-                    // вставка из буфера обмена приходит одним событием (bracketed paste)
-                    Event::Paste(text) => state.insert_into_input(&text),
-                    _ => {}
+                    next = events
+                        .next()
+                        .now_or_never()
+                        .flatten()
+                        .and_then(|event| event.ok());
+                }
+                if stop {
+                    break;
                 }
             }
             Some(chat_event) = rx.recv() => {
+                dirty = true;
                 handle_chat_event(chat_event, &mut state, &tx);
+                // Ответы и фоновые загрузки тоже приходят пачками — добираем
+                // всё, что уже в очереди, до следующей отрисовки.
+                while let Ok(chat_event) = rx.try_recv() {
+                    handle_chat_event(chat_event, &mut state, &tx);
+                }
             }
         }
     }
 
     Ok(())
+}
+
+/// Обработка одного события терминала. Вынесена из цикла, чтобы события
+/// можно было разбирать пачкой между кадрами.
+fn handle_terminal_event(
+    event: Event,
+    state: &mut AppState,
+    agent: &mut Arc<CliAgent>,
+    tx: &mpsc::UnboundedSender<ChatEvent>,
+) -> LoopControl {
+    match event {
+        Event::Key(key) if key.kind == KeyEventKind::Press => {
+            if matches!(handle_key(key, state, agent, tx), LoopControl::Break) {
+                return LoopControl::Break;
+            }
+            // токен или адрес сервиса поменяли — дальше шлём запросы
+            // уже новым агентом (запущенные ждут на старом)
+            if state.agent_dirty {
+                state.agent_dirty = false;
+                match CliAgent::from_config(&state.config, crate::logging::exchange_log())
+                    .map(|agent| agent.with_unauthorized_hint(crate::logging::UNAUTHORIZED_HINT))
+                {
+                    Ok(updated) => *agent = Arc::new(updated),
+                    Err(err) => state.notify(format!(
+                        "Не удалось применить настройки подключения: {err}"
+                    )),
+                }
+                // Клиент чатов ходит по тому же адресу с тем же токеном,
+                // поэтому пересобирается вместе с агентом.
+                state.chats_client = Arc::new(chats_client(&state.config));
+                fetch_chats(state, tx);
+            }
+        }
+        Event::Mouse(mouse) => {
+            let delta = match mouse.kind {
+                MouseEventKind::ScrollUp => -(MOUSE_SCROLL_STEP as i32),
+                MouseEventKind::ScrollDown => MOUSE_SCROLL_STEP as i32,
+                // Клики и перетаскивания TUI не использует: выделение текста
+                // остаётся за терминалом (Shift + перетаскивание).
+                _ => return LoopControl::Continue,
+            };
+            scroll_history_at(state, mouse.column, mouse.row, delta);
+        }
+        // вставка из буфера обмена приходит одним событием (bracketed paste)
+        Event::Paste(text) => state.insert_into_input(&text),
+        _ => {}
+    }
+    LoopControl::Continue
 }
 
 /// Глобальные сочетания клавиш, работающие вне зависимости от фокуса/состояния "pending".
@@ -1881,7 +1977,12 @@ fn handle_global_key(
         state.notify("Создаю чат в сервисе…");
         return Some(LoopControl::Continue);
     }
-    if key.code == KeyCode::Char('y') && key.modifiers.contains(KeyModifiers::CONTROL) {
+    // В режиме выбора у Ctrl+Y другой смысл — копировать выбранное сообщение,
+    // поэтому глобальная ветка его туда пропускает.
+    if key.code == KeyCode::Char('y')
+        && key.modifiers.contains(KeyModifiers::CONTROL)
+        && state.focus != Focus::MessageSelect
+    {
         let text = state.active_input().to_string();
         if text.is_empty() {
             state.notify("Поле ввода пустое — копировать нечего");
@@ -1891,6 +1992,32 @@ fn handle_global_key(
                 Err(err) => state.notify(format!("Не удалось скопировать: {err}")),
             }
         }
+        return Some(LoopControl::Continue);
+    }
+    // Ctrl+G — режим выбора сообщения. `Char('п')` — та же физическая клавиша
+    // на русской раскладке: crossterm отдаёт символ раскладки, а не позицию.
+    if matches!(key.code, KeyCode::Char('g') | KeyCode::Char('п'))
+        && key.modifiers.contains(KeyModifiers::CONTROL)
+        && matches!(state.focus, Focus::Input | Focus::Sidebar)
+    {
+        let count = state
+            .active_chat_index()
+            .map(|index| state.chats[index].messages.len())
+            .unwrap_or(0);
+        if count == 0 {
+            state.notify("В чате нет сообщений — копировать нечего");
+            return Some(LoopControl::Continue);
+        }
+        // выбор начинается с последнего сообщения: чаще всего копируют
+        // свежий ответ модели
+        let last = count - 1;
+        if let Some(chat_id) = state.active_chat_id() {
+            let ui = state.chat_ui.entry(chat_id).or_default();
+            ui.selected_message = Some(last);
+            ui.auto_scroll = false;
+            ui.scroll_to_message = Some(last);
+        }
+        state.focus = Focus::MessageSelect;
         return Some(LoopControl::Continue);
     }
     if key.code == KeyCode::Char('e') && key.modifiers.contains(KeyModifiers::CONTROL) {
@@ -2063,7 +2190,7 @@ fn handle_key(
     if key.code == KeyCode::Tab
         && !matches!(
             state.focus,
-            Focus::Settings | Focus::Import | Focus::Confirm | Focus::Facts | Focus::Branches | Focus::Memory | Focus::Task
+            Focus::Settings | Focus::Import | Focus::Confirm | Focus::Facts | Focus::Branches | Focus::Memory | Focus::Task | Focus::MessageSelect
         )
     {
         state.focus = match state.focus {
@@ -2075,7 +2202,8 @@ fn handle_key(
             | Focus::Facts
             | Focus::Branches
             | Focus::Memory
-            | Focus::Task => unreachable!(),
+            | Focus::Task
+            | Focus::MessageSelect => unreachable!(),
         };
         return LoopControl::Continue;
     }
@@ -2088,6 +2216,7 @@ fn handle_key(
         Focus::Branches => handle_branches_key(key, state, tx),
         Focus::Memory => handle_memory_key(key, state, tx),
         Focus::Task => handle_task_key(key, state, tx),
+        Focus::MessageSelect => handle_message_select_key(key, state),
         Focus::Sidebar => handle_sidebar_key(key, state, tx),
         Focus::Input => {
             if state.active_pending() || state.active_chat_id().is_none() {
@@ -3102,16 +3231,8 @@ fn handle_input_key(
         KeyCode::Backspace => {
             state.chat_ui.entry(chat_id).or_default().input.pop();
         }
-        KeyCode::Up => {
-            let ui = state.chat_ui.entry(chat_id).or_default();
-            ui.scroll = ui.scroll.saturating_sub(1);
-            ui.auto_scroll = false;
-        }
-        KeyCode::Down => {
-            let ui = state.chat_ui.entry(chat_id).or_default();
-            ui.scroll = ui.scroll.saturating_add(1).min(ui.max_scroll);
-            ui.auto_scroll = ui.scroll >= ui.max_scroll;
-        }
+        // Стрелки историю не листают: построчная прокрутка ушла на колесо
+        // мыши, а ↑/↓ в поле ввода нужны под перемещение по сообщениям.
         KeyCode::PageUp => {
             let ui = state.chat_ui.entry(chat_id).or_default();
             ui.scroll = ui.scroll.saturating_sub(10);
@@ -3121,6 +3242,143 @@ fn handle_input_key(
             let ui = state.chat_ui.entry(chat_id).or_default();
             ui.scroll = ui.scroll.saturating_add(10).min(ui.max_scroll);
             ui.auto_scroll = ui.scroll >= ui.max_scroll;
+        }
+        _ => {}
+    }
+    LoopControl::Continue
+}
+
+/// Сколько строк истории проматывает один щелчок колеса.
+const MOUSE_SCROLL_STEP: u16 = 3;
+
+/// Чат, чья история накрывает точку под курсором.
+fn chat_at_position(areas: &[(String, Rect)], column: u16, row: u16) -> Option<&str> {
+    areas
+        .iter()
+        .find(|(_, area)| {
+            column >= area.x
+                && column < area.x.saturating_add(area.width)
+                && row >= area.y
+                && row < area.y.saturating_add(area.height)
+        })
+        .map(|(chat_id, _)| chat_id.as_str())
+}
+
+/// Прокрутка истории под курсором на `delta` строк.
+///
+/// Колесо листает ту панель, на которую пользователь смотрит, а не активную:
+/// при двух открытых чатах это разные вещи. Пока открыто модальное окно,
+/// колесо историю не трогает — она в этот момент перекрыта.
+fn scroll_history_at(state: &mut AppState, column: u16, row: u16, delta: i32) {
+    if !matches!(
+        state.focus,
+        Focus::Input | Focus::Sidebar | Focus::MessageSelect
+    ) {
+        return;
+    }
+    let Some(chat_id) = chat_at_position(&state.history_areas, column, row).map(str::to_string)
+    else {
+        return;
+    };
+    let ui = state.chat_ui.entry(chat_id).or_default();
+    if delta < 0 {
+        ui.scroll = ui.scroll.saturating_sub(delta.unsigned_abs() as u16);
+        // Отмотали вверх — новые ответы больше не утаскивают историю вниз,
+        // пока пользователь сам не вернётся к последней строке.
+        ui.auto_scroll = false;
+    } else {
+        ui.scroll = ui.scroll.saturating_add(delta as u16).min(ui.max_scroll);
+        ui.auto_scroll = ui.scroll >= ui.max_scroll;
+    }
+}
+
+/// Смещение выбора по истории с упором в границы: на краях выбор остаётся на
+/// первом или последнем сообщении, а не перескакивает по кругу.
+fn shift_selection(current: usize, len: usize, down: bool) -> usize {
+    if len == 0 {
+        return 0;
+    }
+    if down {
+        (current + 1).min(len - 1)
+    } else {
+        current.saturating_sub(1)
+    }
+}
+
+/// Выбор, приведённый к текущей длине истории: после перезагрузки чата
+/// (например, при переключении ветки) прежний индекс может указывать за конец
+/// списка, а у пустого чата выбирать нечего.
+fn normalize_selection(selected: Option<usize>, len: usize) -> Option<usize> {
+    let selected = selected?;
+    if len == 0 {
+        None
+    } else {
+        Some(selected.min(len - 1))
+    }
+}
+
+/// Копирование текста выбранного сообщения. В буфер уходит `Message.content`
+/// из модели: без заголовка роли, метрик токенов, рамок и переносов по ширине
+/// панели, которые существуют только в отрисовке. `Message.reasoning` не
+/// добавляется независимо от Ctrl+R — он управляет только показом.
+fn copy_selected_message(state: &mut AppState, chat_id: &str, selected: usize) {
+    let text = state
+        .chat_index(chat_id)
+        .and_then(|index| state.chats[index].messages.get(selected))
+        .map(|message| message.content.clone());
+    let Some(text) = text else {
+        state.notify("Сообщение не найдено — копировать нечего");
+        return;
+    };
+    match crate::clipboard::copy(&text) {
+        Ok(()) => state.notify("Текст сообщения скопирован в буфер обмена"),
+        Err(err) => state.notify(format!("Не удалось скопировать: {err}")),
+    }
+}
+
+/// Клавиши режима выбора сообщения. `Esc` здесь перехватывается раньше ветки
+/// `Focus::Input`, где он завершает TUI, поэтому выход из режима работу не
+/// прекращает.
+fn handle_message_select_key(key: crossterm::event::KeyEvent, state: &mut AppState) -> LoopControl {
+    let Some(chat_id) = state.active_chat_id() else {
+        state.focus = Focus::Input;
+        return LoopControl::Continue;
+    };
+    let len = state
+        .chat_index(&chat_id)
+        .map(|index| state.chats[index].messages.len())
+        .unwrap_or(0);
+    let selected = normalize_selection(
+        state.chat_ui.get(&chat_id).and_then(|ui| ui.selected_message),
+        len,
+    );
+    // История опустела, пока режим был открыт: выбирать нечего.
+    let Some(selected) = selected else {
+        state.chat_ui.entry(chat_id).or_default().selected_message = None;
+        state.focus = Focus::Input;
+        return LoopControl::Continue;
+    };
+    match key.code {
+        KeyCode::Up | KeyCode::Down => {
+            let next = shift_selection(selected, len, key.code == KeyCode::Down);
+            let ui = state.chat_ui.entry(chat_id).or_default();
+            ui.selected_message = Some(next);
+            // выбранное доводится в видимую область тем же механизмом, что и
+            // новый ответ модели
+            ui.auto_scroll = false;
+            ui.scroll_to_message = Some(next);
+        }
+        KeyCode::Enter => {
+            copy_selected_message(state, &chat_id, selected);
+            state.chat_ui.entry(chat_id).or_default().selected_message = None;
+            state.focus = Focus::Input;
+        }
+        KeyCode::Char('y') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            copy_selected_message(state, &chat_id, selected);
+        }
+        KeyCode::Esc => {
+            state.chat_ui.entry(chat_id).or_default().selected_message = None;
+            state.focus = Focus::Input;
         }
         _ => {}
     }
@@ -3822,10 +4080,17 @@ fn handle_history_loaded(chat_id: String, result: Result<ChatHistory, String>, s
             if let Some(index) = state.chat_index(&chat_id) {
                 state.chats[index].apply_history(history);
             }
+            let len = state
+                .chat_index(&chat_id)
+                .map(|index| state.chats[index].messages.len())
+                .unwrap_or(0);
             let ui = state.chat_ui.entry(chat_id).or_default();
             ui.history_loading = false;
             ui.history_error = None;
             ui.auto_scroll = true;
+            // Перезагруженная история могла стать короче: прежний индекс
+            // выбора указывал бы мимо сообщения.
+            ui.selected_message = normalize_selection(ui.selected_message, len);
         }
         Err(reason) => {
             let ui = state.chat_ui.entry(chat_id).or_default();
@@ -4267,6 +4532,9 @@ fn handle_profiles(result: Result<Vec<ProfileChoice>, String>, state: &mut AppSt
 }
 
 fn render_ui(f: &mut Frame, state: &mut AppState) {
+    // Области истории пересобираются каждый кадр: панели открываются,
+    // закрываются и меняют размер вместе с окном терминала.
+    state.history_areas.clear();
     let outer = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Length(28), Constraint::Min(20)])
@@ -4389,6 +4657,7 @@ fn render_pane(f: &mut Frame, state: &mut AppState, pane_idx: usize, area: Rect)
         .split(area);
 
     render_pane_title(f, state, chat_index, is_active_pane, chunks[0]);
+    state.history_areas.push((chat_id.clone(), chunks[1]));
     render_history(f, state, &chat_id, chat_index, chunks[1]);
     let input_area = if let Some(footer) = &footer {
         render_token_footer(f, footer, chunks[2]);
@@ -4791,6 +5060,13 @@ fn render_history(
     let pending_since = state.chat_ui.get(chat_id).and_then(|u| u.pending_since);
     let show_reasoning = state.show_reasoning;
     let scroll_to_message = state.chat_ui.get(chat_id).and_then(|u| u.scroll_to_message);
+    // Подсветка выбора живёт только пока открыт режим выбора: вне его индекс
+    // сохраняется, но на экране ничем не выделен.
+    let selected_message = state
+        .chat_ui
+        .get(chat_id)
+        .and_then(|u| u.selected_message)
+        .filter(|_| state.focus == Focus::MessageSelect);
 
     let history_loading = state
         .chat_ui
@@ -4806,112 +5082,66 @@ fn render_history(
         .get(chat_id)
         .and_then(|ui| ui.unsaved.as_ref().map(|unsaved| unsaved.reason.clone()));
 
-    let mut lines: Vec<Line> = Vec::new();
-    let mut target_line: Option<usize> = None;
+    // Ширина/высота содержимого внутри рамки.
+    let inner_width = area.width.saturating_sub(2);
+    let visible = area.height.saturating_sub(2);
+
+    // Шапка истории: баннеры загрузки и заставка пустого чата. Она короткая
+    // и зависит от состояния загрузки, поэтому собирается каждый кадр.
+    let mut head: Vec<Line<'static>> = Vec::new();
     if history_loading {
-        lines.push(Line::from(Span::styled(
+        head.push(Line::from(Span::styled(
             " Загружаю историю чата с сервиса…",
             Style::default().fg(Color::DarkGray),
         )));
-        lines.push(Line::raw(""));
+        head.push(Line::raw(""));
     }
     if let Some(reason) = &history_error {
-        lines.push(Line::from(Span::styled(
+        head.push(Line::from(Span::styled(
             format!(" История чата не загружена: {reason}"),
             Style::default().fg(Color::Red),
         )));
-        lines.push(Line::raw(""));
+        head.push(Line::raw(""));
     }
     if !state.chats[chat_index].history_loaded
         && !history_loading
         && history_error.is_none()
         && state.chats[chat_index].messages.is_empty()
     {
-        lines.push(Line::from(Span::styled(
+        head.push(Line::from(Span::styled(
             " История чата ещё не запрошена у сервиса",
             Style::default().fg(Color::DarkGray),
         )));
-        lines.push(Line::raw(""));
+        head.push(Line::raw(""));
     }
     if state.chats[chat_index].messages.is_empty()
         && state.chats[chat_index].history_loaded
         && state.panes.len() == 1
     {
-        if let Ok(text) = BILLY_ART.into_text() {
-            lines.extend(text.lines);
-        }
-        lines.push(Line::raw(""));
-        lines.push(Line::from(Span::styled(
+        head.extend(billy_art().iter().cloned());
+        head.push(Line::raw(""));
+        head.push(Line::from(Span::styled(
             "        agent-cli — консольный AI-агент",
             Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
         )));
-        lines.push(Line::raw(""));
+        head.push(Line::raw(""));
     }
-    for (i, entry) in state.chats[chat_index].messages.iter().enumerate() {
-        if scroll_to_message == Some(i) {
-            target_line = Some(lines.len());
-        }
-        let (label, color) = match entry.role {
-            Role::User => ("Вы", Color::Green),
-            Role::Assistant => ("Агент", Color::Cyan),
-            Role::System => ("Система", Color::Yellow),
-        };
-        let mut header = vec![Span::styled(
-            format!("● {label}"),
-            Style::default().fg(color).add_modifier(Modifier::BOLD),
-        )];
-        if let Some(stats) = entry.meta.as_ref().map(meta_summary).filter(|s| !s.is_empty()) {
-            header.push(Span::styled(
-                format!("  {stats}"),
-                Style::default().fg(Color::DarkGray),
-            ));
-        }
-        lines.push(Line::from(header));
-        if let Some(reasoning) = entry.reasoning.as_ref() {
-            if show_reasoning {
-                lines.push(Line::from(Span::styled(
-                    "  ┌ Рассуждение",
-                    Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD),
-                )));
-                for reasoning_line in reasoning.lines() {
-                    lines.push(Line::from(Span::styled(
-                        format!("  │ {reasoning_line}"),
-                        Style::default()
-                            .fg(Color::Magenta)
-                            .add_modifier(Modifier::DIM | Modifier::ITALIC),
-                    )));
-                }
-                lines.push(Line::from(Span::styled(
-                    "  └",
-                    Style::default().fg(Color::Magenta),
-                )));
-            } else {
-                let count = reasoning.lines().count();
-                lines.push(Line::from(Span::styled(
-                    format!("  ▸ Рассуждение скрыто ({count} стр.) — Ctrl+R"),
-                    Style::default().fg(Color::Magenta).add_modifier(Modifier::DIM),
-                )));
-            }
-        }
-        let rendered = agent_skin().term_text(&entry.content).to_string();
-        match rendered.into_text() {
-            Ok(text) => lines.extend(text.lines),
-            Err(_) => lines.push(Line::raw(entry.content.clone())),
-        }
-        lines.push(Line::raw(""));
-    }
+
+    // Подвал истории: предупреждение о несохранённом обмене и индикатор
+    // ожидания ответа. Таймер обновляется каждый тик, кешировать нечего.
+    let mut tail: Vec<Line<'static>> = Vec::new();
     if let Some(reason) = &unsaved {
-        lines.push(Line::from(Span::styled(
+        tail.push(Line::from(Span::styled(
             format!(" ⚠ Обмен не сохранён в сервисе: {reason}. Ctrl+U — повторить"),
             Style::default().fg(Color::Yellow),
         )));
-        lines.push(Line::raw(""));
+        tail.push(Line::raw(""));
     }
     if pending {
         let elapsed = pending_since
             .map(|since| format!(" {:.1} с", since.elapsed().as_secs_f64()))
             .unwrap_or_default();
-        lines.push(Line::from(Span::styled(
+        tail.push(Line::from(Span::styled(
             format!(
                 "{} Агент думает...{elapsed}",
                 SPINNER_FRAMES[state.spinner_frame]
@@ -4920,27 +5150,58 @@ fn render_history(
         )));
     }
 
-    // Ширина/высота содержимого внутри рамки.
-    let inner_width = area.width.saturating_sub(2);
-    let visible = area.height.saturating_sub(2);
+    // Обновляем кеш отрисованных сообщений: заново собираются только те,
+    // у которых изменился отпечаток, — обычно это последняя реплика.
+    {
+        let messages = &state.chats[chat_index].messages;
+        let ui = state.chat_ui.entry(chat_id.to_string()).or_default();
+        ui.rendered.truncate(messages.len());
+        for (i, entry) in messages.iter().enumerate() {
+            let selected = selected_message == Some(i);
+            let fingerprint = message_fingerprint(entry, show_reasoning, selected);
+            if ui.rendered.get(i).map(|cached| cached.fingerprint) == Some(fingerprint) {
+                continue;
+            }
+            let item = RenderedMessage {
+                fingerprint,
+                lines: render_message_lines(entry, show_reasoning, selected),
+                wrapped: None,
+            };
+            match ui.rendered.get_mut(i) {
+                Some(slot) => *slot = item,
+                None => ui.rendered.push(item),
+            }
+        }
+        // Высота блока после переноса строк тоже кешируется: считать её по
+        // всей истории на каждый кадр — второй проход той же стоимости.
+        for item in ui.rendered.iter_mut() {
+            if item.wrapped.map(|(width, _)| width) != Some(inner_width) {
+                item.wrapped = Some((inner_width, wrapped_line_count(&item.lines, inner_width)));
+            }
+        }
+    }
+
+    let ui = state.chat_ui.entry(chat_id.to_string()).or_default();
 
     // Смещение прокрутки у Paragraph считается по строкам ПОСЛЕ переноса,
     // поэтому длину истории тоже надо мерить с учётом Wrap, иначе низ
-    // длинных сообщений становится недостижим.
-    let target_offset = target_line.map(|idx| {
-        wrapped_line_count(Text::from(lines[..idx].to_vec()), inner_width)
-    });
-    let history_widget = Paragraph::new(Text::from(lines))
-        .block(Block::default().borders(Borders::ALL).title(" История "))
-        .wrap(Wrap { trim: false });
-    let total_lines = if inner_width == 0 {
-        0
-    } else {
-        clamp_u16(history_widget.line_count(inner_width))
-    };
-    let max_scroll = total_lines.saturating_sub(visible);
+    // длинных сообщений становится недостижим. Складываем высоты блоков:
+    // они уже посчитаны для текущей ширины.
+    let head_height = wrapped_line_count(&head, inner_width);
+    let tail_height = wrapped_line_count(&tail, inner_width);
+    let mut total_lines = head_height + tail_height;
+    let mut target_offset: Option<usize> = None;
+    let mut offset = head_height;
+    for (i, item) in ui.rendered.iter().enumerate() {
+        if scroll_to_message == Some(i) {
+            target_offset = Some(offset);
+        }
+        let height = item.wrapped.map(|(_, height)| height).unwrap_or(0);
+        offset += height;
+        total_lines += height;
+    }
 
-    let ui = state.chat_ui.entry(chat_id.to_string()).or_default();
+    let max_scroll = clamp_u16(total_lines).saturating_sub(visible);
     ui.max_scroll = max_scroll;
     if ui.auto_scroll {
         ui.scroll = max_scroll;
@@ -4950,20 +5211,173 @@ fn render_history(
     } else {
         ui.scroll = ui.scroll.min(max_scroll);
     }
-    let scroll = ui.scroll;
+    let scroll = ui.scroll as usize;
 
-    f.render_widget(history_widget.scroll((scroll, 0)), area);
+    // Виджету отдаём только те блоки, что попадают в окно просмотра:
+    // Paragraph переносит строки от начала текста до смещения, и на длинной
+    // истории этот проход и есть основной тормоз кадра.
+    let blocks = std::iter::once((head.as_slice(), head_height))
+        .chain(ui.rendered.iter().map(|item| {
+            (
+                item.lines.as_slice(),
+                item.wrapped.map(|(_, height)| height).unwrap_or(0),
+            )
+        }))
+        .chain(std::iter::once((tail.as_slice(), tail_height)));
+    let (lines, inner_offset) = visible_window(blocks, scroll, visible as usize);
+
+    let history_widget = Paragraph::new(Text::from(lines))
+        .block(Block::default().borders(Borders::ALL).title(" История "))
+        .wrap(Wrap { trim: false })
+        .scroll((inner_offset, 0));
+
+    f.render_widget(history_widget, area);
+}
+
+/// Отбирает блоки истории, попадающие в окно просмотра, и остаточное
+/// смещение внутри первого из них.
+///
+/// Блоки идут подряд, их высоты уже посчитаны с учётом переноса строк, так
+/// что смещение внутри первого видимого блока совпадает с тем, что отсчитал
+/// бы Paragraph по всей истории.
+fn visible_window<'a, I>(blocks: I, scroll: usize, visible: usize) -> (Vec<Line<'a>>, u16)
+where
+    I: IntoIterator<Item = (&'a [Line<'a>], usize)>,
+{
+    let window_end = scroll + visible;
+    let mut lines: Vec<Line<'a>> = Vec::new();
+    let mut inner_offset = 0u16;
+    let mut first_visible = true;
+    let mut cursor = 0usize;
+    for (block, height) in blocks {
+        let block_end = cursor + height;
+        if block_end <= scroll {
+            cursor = block_end;
+            continue;
+        }
+        if cursor >= window_end {
+            break;
+        }
+        if first_visible {
+            first_visible = false;
+            inner_offset = clamp_u16(scroll - cursor);
+        }
+        lines.extend(block.iter().cloned());
+        cursor = block_end;
+    }
+    (lines, inner_offset)
+}
+
+/// Заставка пустого чата: ANSI-картинка разбирается один раз.
+fn billy_art() -> &'static [Line<'static>] {
+    static ART: std::sync::OnceLock<Vec<Line<'static>>> = std::sync::OnceLock::new();
+    ART.get_or_init(|| {
+        BILLY_ART
+            .into_text()
+            .map(|text| text.lines)
+            .unwrap_or_default()
+    })
+}
+
+/// Отпечаток сообщения для кеша отрисовки: всё, от чего зависят его строки.
+fn message_fingerprint(entry: &Message, show_reasoning: bool, selected: bool) -> u64 {
+    use std::hash::{Hash, Hasher};
+
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    entry.content.hash(&mut hasher);
+    entry.reasoning.hash(&mut hasher);
+    show_reasoning.hash(&mut hasher);
+    selected.hash(&mut hasher);
+    // Из телеметрии в строках видны только модель и время в заголовке.
+    if let Some(meta) = entry.meta.as_ref() {
+        meta.model.hash(&mut hasher);
+        meta.received_at.hash(&mut hasher);
+        meta.sent_at.hash(&mut hasher);
+    }
+    hasher.finish()
+}
+
+/// Строки одного сообщения истории: заголовок, рассуждение и markdown тела.
+fn render_message_lines(
+    entry: &Message,
+    show_reasoning: bool,
+    selected: bool,
+) -> Vec<Line<'static>> {
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    let (label, color) = match entry.role {
+        Role::User => ("Вы", Color::Green),
+        Role::Assistant => ("Агент", Color::Cyan),
+        Role::System => ("Система", Color::Yellow),
+    };
+    // Подсвечиваем строку заголовка, а не весь блок: перекрашивать
+    // многострочный отрисованный markdown значило бы потерять его разметку.
+    let mut header_style = Style::default().fg(color).add_modifier(Modifier::BOLD);
+    if selected {
+        header_style = header_style.add_modifier(Modifier::REVERSED);
+    }
+    let mut header = vec![Span::styled(format!("● {label}"), header_style)];
+    if let Some(stats) = entry.meta.as_ref().map(meta_summary).filter(|s| !s.is_empty()) {
+        header.push(Span::styled(
+            format!("  {stats}"),
+            Style::default().fg(Color::DarkGray),
+        ));
+    }
+    lines.push(Line::from(header));
+    if let Some(reasoning) = entry.reasoning.as_ref() {
+        if show_reasoning {
+            lines.push(Line::from(Span::styled(
+                "  ┌ Рассуждение",
+                Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD),
+            )));
+            for reasoning_line in reasoning.lines() {
+                lines.push(Line::from(Span::styled(
+                    format!("  │ {reasoning_line}"),
+                    Style::default()
+                        .fg(Color::Magenta)
+                        .add_modifier(Modifier::DIM | Modifier::ITALIC),
+                )));
+            }
+            lines.push(Line::from(Span::styled(
+                "  └",
+                Style::default().fg(Color::Magenta),
+            )));
+        } else {
+            let count = reasoning.lines().count();
+            lines.push(Line::from(Span::styled(
+                format!("  ▸ Рассуждение скрыто ({count} стр.) — Ctrl+R"),
+                Style::default().fg(Color::Magenta).add_modifier(Modifier::DIM),
+            )));
+        }
+    }
+    let rendered = agent_skin().term_text(&entry.content).to_string();
+    match rendered.into_text() {
+        Ok(text) => lines.extend(text.lines),
+        Err(_) => lines.push(Line::raw(entry.content.clone())),
+    }
+    lines.push(Line::raw(""));
+    lines
 }
 
 fn clamp_u16(value: usize) -> u16 {
     u16::try_from(value).unwrap_or(u16::MAX)
 }
 
-fn wrapped_line_count(text: Text<'_>, width: u16) -> usize {
+/// Высота текста после переноса на заданной ширине.
+fn wrapped_text_line_count(text: Text<'_>, width: u16) -> usize {
     if width == 0 {
         return 0;
     }
     Paragraph::new(text)
+        .wrap(Wrap { trim: false })
+        .line_count(width)
+}
+
+/// Высота набора строк после переноса на заданной ширине.
+fn wrapped_line_count(lines: &[Line<'static>], width: u16) -> usize {
+    if width == 0 || lines.is_empty() {
+        return 0;
+    }
+    Paragraph::new(Text::from(lines.to_vec()))
         .wrap(Wrap { trim: false })
         .line_count(width)
 }
@@ -4996,8 +5410,14 @@ fn render_input(f: &mut Frame, state: &AppState, chat_id: &str, is_active_pane: 
 fn render_help(f: &mut Frame, state: &AppState, area: Rect) {
     let (text, color) = match state.active_notice() {
         Some(notice) => (notice, Color::Green),
+        // В режиме выбора клавиши другие, и у Ctrl+Y другой смысл: подсказка
+        // показывает именно их, пока режим открыт.
+        None if state.focus == Focus::MessageSelect => (
+            "↑/↓ — сообщение · Ctrl+Y — копировать текст · Enter — копировать и выйти · Esc — выйти из режима выбора",
+            Color::DarkGray,
+        ),
         None => (
-            "Tab — панель · ←/→ — окно · Ctrl+W — закрыть · Ctrl+P — настройки · Ctrl+O — импорт контекста · Ctrl+N — новый чат · Ctrl+E — обновить список · Ctrl+U — повторить запись · Ctrl+Y — копировать ввод · Ctrl+R — рассуждение · Esc/Ctrl+C — выход",
+            "Tab — панель · ←/→ — окно · колесо/PageUp/PageDown — история · Ctrl+W — закрыть · Ctrl+P — настройки · Ctrl+O — импорт контекста · Ctrl+N — новый чат · Ctrl+E — обновить список · Ctrl+U — повторить запись · Ctrl+Y — копировать ввод · Ctrl+G — выбрать сообщение · Ctrl+R — рассуждение · Esc/Ctrl+C — выход",
             Color::DarkGray,
         ),
     };
@@ -5032,7 +5452,7 @@ fn render_settings_popup(f: &mut Frame, editor: &SettingsEditor) {
     // не должны отъедать место у списка полей, а длинные — не должны обрезаться.
     let description_text = settings_description_text(editor);
     let description_width = inner.width.saturating_sub(2).max(1);
-    let description_lines = wrapped_line_count(description_text.into(), description_width);
+    let description_lines = wrapped_text_line_count(description_text.into(), description_width);
     let description_height =
         (clamp_u16(description_lines) + 2).clamp(4, inner.height.saturating_sub(6).max(4));
 
@@ -5884,6 +6304,7 @@ mod tests {
             ollama_models: Vec::new(),
             model_choices: Vec::new(),
             profile_choices: Vec::new(),
+            history_areas: Vec::new(),
         }
     }
 
@@ -6725,5 +7146,153 @@ mod tests {
             !state.chats[0].history_loaded,
             "переключение ветки должно потребовать повторной загрузки истории"
         );
+    }
+
+    // --- 2.3/2.5 Режим выбора сообщения ---
+
+    #[test]
+    fn shift_selection_stops_at_history_bounds() {
+        assert_eq!(shift_selection(2, 5, true), 3);
+        assert_eq!(shift_selection(2, 5, false), 1);
+        // на краях выбор остаётся на месте, а не идёт по кругу
+        assert_eq!(shift_selection(4, 5, true), 4);
+        assert_eq!(shift_selection(0, 5, false), 0);
+        assert_eq!(shift_selection(0, 0, true), 0);
+    }
+
+    #[test]
+    fn normalize_selection_clamps_to_history_length() {
+        assert_eq!(normalize_selection(Some(7), 3), Some(2));
+        assert_eq!(normalize_selection(Some(1), 3), Some(1));
+        assert_eq!(normalize_selection(Some(0), 0), None);
+        assert_eq!(normalize_selection(None, 3), None);
+    }
+
+    #[tokio::test]
+    async fn reloaded_shorter_history_clamps_selected_message() {
+        let mut state = test_state();
+        handle_chats_loaded(Ok(vec![summary("chat-1", "Чат", 1)]), &mut state, &channel());
+        state.chat_ui.entry("chat-1".to_string()).or_default().selected_message = Some(5);
+
+        handle_history_loaded(
+            "chat-1".to_string(),
+            Ok(ChatHistory {
+                chat: summary("chat-1", "Чат", 1),
+                branch_id: None,
+                messages: vec![StoredMessage {
+                    seq: 1,
+                    created_at: 1001,
+                    message: Message::user("вопрос"),
+                }],
+            }),
+            &mut state,
+        );
+
+        assert_eq!(
+            state.chat_ui["chat-1"].selected_message,
+            Some(0),
+            "выбор должен упереться в последнее сообщение перезагруженной истории"
+        );
+    }
+
+    #[tokio::test]
+    async fn reloaded_empty_history_drops_selected_message() {
+        let mut state = test_state();
+        handle_chats_loaded(Ok(vec![summary("chat-1", "Чат", 0)]), &mut state, &channel());
+        state.chat_ui.entry("chat-1".to_string()).or_default().selected_message = Some(2);
+
+        handle_history_loaded(
+            "chat-1".to_string(),
+            Ok(ChatHistory {
+                chat: summary("chat-1", "Чат", 0),
+                branch_id: None,
+                messages: Vec::new(),
+            }),
+            &mut state,
+        );
+
+        assert_eq!(state.chat_ui["chat-1"].selected_message, None);
+    }
+
+    fn block(text: &str, height: usize) -> (Vec<Line<'static>>, usize) {
+        ((0..height).map(|_| Line::raw(text.to_string())).collect(), height)
+    }
+
+    fn window(
+        blocks: &[(Vec<Line<'static>>, usize)],
+        scroll: usize,
+        visible: usize,
+    ) -> (Vec<String>, u16) {
+        let (lines, offset) = visible_window(
+            blocks.iter().map(|(lines, height)| (lines.as_slice(), *height)),
+            scroll,
+            visible,
+        );
+        let texts = lines
+            .iter()
+            .map(|line| line.spans.iter().map(|span| span.content.as_ref()).collect())
+            .collect();
+        (texts, offset)
+    }
+
+    #[test]
+    fn wheel_finds_chat_under_cursor() {
+        let areas = vec![
+            ("left".to_string(), Rect::new(0, 1, 20, 10)),
+            ("right".to_string(), Rect::new(20, 1, 20, 10)),
+        ];
+        assert_eq!(chat_at_position(&areas, 5, 5), Some("left"));
+        assert_eq!(chat_at_position(&areas, 25, 5), Some("right"));
+        // Левый верхний угол принадлежит области, правый нижний — уже нет.
+        assert_eq!(chat_at_position(&areas, 0, 1), Some("left"));
+        assert_eq!(chat_at_position(&areas, 20, 11), None);
+        // Над боковой панелью и строкой подсказки истории нет.
+        assert_eq!(chat_at_position(&areas, 5, 0), None);
+        assert_eq!(chat_at_position(&[], 5, 5), None);
+    }
+
+    #[test]
+    fn window_keeps_everything_when_history_fits() {
+        let blocks = [block("a", 2), block("b", 3)];
+        let (lines, offset) = window(&blocks, 0, 10);
+        assert_eq!(offset, 0);
+        assert_eq!(lines.len(), 5);
+    }
+
+    #[test]
+    fn window_skips_blocks_above_scroll() {
+        let blocks = [block("a", 4), block("b", 4), block("c", 4)];
+        // Прокрутка ровно на границе блока: первый выпадает целиком.
+        let (lines, offset) = window(&blocks, 4, 4);
+        assert_eq!(offset, 0);
+        assert_eq!(lines.first().map(String::as_str), Some("b"));
+        assert!(lines.iter().all(|line| line != "a"));
+    }
+
+    #[test]
+    fn window_offsets_inside_first_visible_block() {
+        let blocks = [block("a", 4), block("b", 4)];
+        // Прокрутка внутрь первого блока: он остаётся, но со смещением.
+        let (lines, offset) = window(&blocks, 2, 4);
+        assert_eq!(offset, 2);
+        assert_eq!(lines.first().map(String::as_str), Some("a"));
+        // Видимое окно (2..6) задевает оба блока.
+        assert!(lines.iter().any(|line| line == "b"));
+    }
+
+    #[test]
+    fn window_stops_below_viewport() {
+        let blocks = [block("a", 4), block("b", 4), block("c", 4)];
+        let (lines, _) = window(&blocks, 0, 5);
+        // Третий блок начинается за нижней границей окна и не собирается.
+        assert!(lines.iter().all(|line| line != "c"));
+    }
+
+    #[test]
+    fn window_ignores_empty_blocks() {
+        let blocks = [block("a", 0), block("b", 3)];
+        let (lines, offset) = window(&blocks, 1, 2);
+        assert_eq!(offset, 1);
+        assert_eq!(lines.first().map(String::as_str), Some("b"));
     }
 }
