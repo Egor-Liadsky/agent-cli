@@ -167,6 +167,12 @@ pub enum ConfigAction {
         #[command(subcommand)]
         action: SummaryAction,
     },
+    /// Умолчания git-инструментов (mcp-server-git) для НОВЫХ чатов и для
+    /// `agentcli ask`; настройки уже созданного чата меняются в TUI (Ctrl+P)
+    GitTools {
+        #[command(subcommand)]
+        action: GitToolsAction,
+    },
     /// Задать путь к файлу инвариантов (`invariants.toml`)
     SetInvariantsPath {
         /// Путь к файлу; пустая строка снимает умолчание
@@ -175,6 +181,29 @@ pub enum ConfigAction {
     /// Показать активные инварианты из настроенного файла (источник —
     /// конфигурация, не диалог)
     Invariants,
+}
+
+#[derive(Subcommand)]
+pub enum GitToolsAction {
+    /// Включить или выключить git-инструменты и задать их параметры
+    Set {
+        /// true/false, on/off, yes/no
+        enabled: Option<String>,
+        /// Путь к git-репозиторию на этой машине
+        #[arg(long)]
+        repository: Option<String>,
+        /// Разрешённые пишущие инструменты через запятую, например
+        /// "git_add,git_commit"; пустая строка — только читающие
+        #[arg(long = "allowed-tools")]
+        allowed_tools: Option<String>,
+        /// Лимит итераций цикла инструментов (1–32, по умолчанию 8)
+        #[arg(long = "max-iterations")]
+        max_iterations: Option<u32>,
+    },
+    /// Снять все умолчания git-инструментов: новые чаты создаются без них
+    Clear,
+    /// Показать текущие умолчания
+    Show,
 }
 
 #[derive(Subcommand)]

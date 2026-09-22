@@ -5,7 +5,7 @@
 //! облачной модели, не зная ключа провайдера: ключ принадлежит сервису.
 
 use agentcore::agent::{
-    transport_error, Agent, AgentError, AgentReply, Message, MessageMeta, Role,
+    transport_error, Agent, AgentError, AgentReply, Message, MessageMeta, Role, ToolCall, ToolSpec,
 };
 use agentcore::config::{ChatSettings, ContextStrategy, ReasoningMode, ThinkingMode};
 use agentcore::pipeline::PolicyLog;
@@ -115,11 +115,32 @@ struct ChatRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     messages: Option<Vec<ChatMessage>>,
     settings: ChatSettingsPayload,
+    /// Инструменты этого вызова. Пустой список не отправляется: старый
+    /// сервис поле не знает, а без инструментов оно не нужно.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    tools: Vec<ToolSpec>,
+    /// Результаты вызовов — продолжение хода в чате вместо `prompt`.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    tool_results: Vec<ToolResultPayload>,
 }
 
 #[derive(Serialize)]
 struct ChatMessage {
     role: &'static str,
+    content: String,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    tool_calls: Vec<ToolCall>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_call_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_name: Option<String>,
+}
+
+#[derive(Serialize)]
+struct ToolResultPayload {
+    tool_call_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    name: Option<String>,
     content: String,
 }
 
@@ -218,6 +239,10 @@ struct ChatResponse {
     /// без чата, компактизации/стратегии не подлежит.
     #[serde(default)]
     context: Option<ContextPayload>,
+    /// Вызовы инструментов. Старый сервис поля не присылает — это то же
+    /// самое, что пустой список: ответ окончательный.
+    #[serde(default)]
+    tool_calls: Vec<ToolCall>,
 }
 
 /// Блок наблюдаемости `context` ответа `POST /v1/chat`. Поля, не имеющие
@@ -369,6 +394,11 @@ pub(crate) fn parse_service_error(
             hint: unauthorized_hint,
             request_id,
         },
+        // Причина различается машинным кодом конверта, а не текстом.
+        400 if code == "tools_unsupported" => AgentError::ToolsUnsupported {
+            model: None,
+            request_id,
+        },
         400 | 413 => AgentError::InvalidRequest {
             message,
             request_id,
@@ -405,10 +435,10 @@ pub(crate) fn header_request_id(response: &reqwest::Response) -> Option<String> 
 }
 
 impl ServerAgent {
-    fn build_request(&self, history: &[Message], settings: &ChatSettings) -> ChatRequest {
+    fn build_request(&self, history: &[Message], settings: &ChatSettings, tools: &[ToolSpec]) -> ChatRequest {
         // Системное сообщение клиент не отправляет: контракт `/v1` знает
-        // только роли `user` и `assistant`, а системный промпт сервис
-        // собирает сам из полученных настроек чата.
+        // только роли `user`, `assistant` и `tool`, а системный промпт
+        // сервис собирает сам из полученных настроек чата.
         let mut messages = Vec::with_capacity(history.len());
         messages.extend(history.iter().map(|m| ChatMessage {
             role: match m.role {
@@ -418,8 +448,13 @@ impl ServerAgent {
                 Role::Tool => "tool",
             },
             content: m.content.clone(),
+            tool_calls: m.tool_calls.clone(),
+            tool_call_id: m.tool_call_id.clone(),
+            tool_name: m.tool_name.clone(),
         }));
-        self.build_body(None, None, Some(messages), settings)
+        let mut body = self.build_body(None, None, Some(messages), settings);
+        body.tools = tools.to_vec();
+        body
     }
 
     fn build_body(
@@ -434,6 +469,8 @@ impl ServerAgent {
             chat_id,
             prompt,
             messages,
+            tools: Vec::new(),
+            tool_results: Vec::new(),
             settings: ChatSettingsPayload {
                 provider: "cloud",
                 model: self.model_for(settings),
@@ -472,18 +509,46 @@ impl ServerAgent {
     /// записывает одной транзакцией после ответа модели. Клиент отправляет
     /// только новую реплику (specs/client-chat-storage, «Реплики чата
     /// попадают в сервис»).
+    ///
+    /// `tools` — инструменты этого хода; ответ с непустым `tool_calls`
+    /// продолжается [`ServerAgent::continue_in_chat`].
     pub async fn ask_in_chat(
         &self,
         chat_id: &str,
         prompt: &str,
         settings: &ChatSettings,
+        tools: &[ToolSpec],
     ) -> Result<AgentReply> {
-        let body = self.build_body(
+        let mut body = self.build_body(
             Some(chat_id.to_string()),
             Some(prompt.to_string()),
             None,
             settings,
         );
+        body.tools = tools.to_vec();
+        self.exchange(body).await
+    }
+
+    /// Продолжение хода с инструментами: результаты вызовов (сообщения роли
+    /// `tool`) вместо новой реплики. Сервис сверяет их с вызовами последнего
+    /// ответа модели и сам дописывает в чат.
+    pub async fn continue_in_chat(
+        &self,
+        chat_id: &str,
+        tool_results: &[Message],
+        settings: &ChatSettings,
+        tools: &[ToolSpec],
+    ) -> Result<AgentReply> {
+        let mut body = self.build_body(Some(chat_id.to_string()), None, None, settings);
+        body.tools = tools.to_vec();
+        body.tool_results = tool_results
+            .iter()
+            .map(|result| ToolResultPayload {
+                tool_call_id: result.tool_call_id.clone().unwrap_or_default(),
+                name: result.tool_name.clone(),
+                content: result.content.clone(),
+            })
+            .collect();
         self.exchange(body).await
     }
 }
@@ -491,7 +556,16 @@ impl ServerAgent {
 #[async_trait]
 impl Agent for ServerAgent {
     async fn ask(&self, history: &[Message], settings: &ChatSettings) -> Result<AgentReply> {
-        let request_body = self.build_request(history, settings);
+        self.ask_with_tools(history, settings, &[]).await
+    }
+
+    async fn ask_with_tools(
+        &self,
+        history: &[Message],
+        settings: &ChatSettings,
+        tools: &[ToolSpec],
+    ) -> Result<AgentReply> {
+        let request_body = self.build_request(history, settings, tools);
         self.exchange(request_body).await
     }
 }
@@ -575,7 +649,7 @@ impl ServerAgent {
             model: parsed.model.filter(|m| !m.trim().is_empty()),
             policy: parsed.policy,
             context: parsed.context.map(Into::into),
-            tool_calls: Vec::new(),
+            tool_calls: parsed.tool_calls,
         })
     }
 }

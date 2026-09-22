@@ -7,7 +7,7 @@
 //! провайдера клиенту недоступен — крейта с ним нет в его зависимостях.
 
 use agentclient::ServerAgent;
-use agentcore::agent::{Agent, AgentReply, Message, OllamaAgent};
+use agentcore::agent::{Agent, AgentReply, Message, OllamaAgent, ToolSpec};
 use agentcore::config::{ChatSettings, Config, Provider};
 use agentcore::logging::ExchangeLog;
 use anyhow::Result;
@@ -36,6 +36,12 @@ impl CliAgent {
         self.server = self.server.with_unauthorized_hint(hint);
         self
     }
+
+    /// Клиент сервиса: облачный ход с инструментами идёт через него
+    /// напрямую (`ask_in_chat` и `continue_in_chat`).
+    pub fn server(&self) -> &ServerAgent {
+        &self.server
+    }
 }
 
 impl CliAgent {
@@ -51,7 +57,7 @@ impl CliAgent {
         settings: &ChatSettings,
     ) -> Result<AgentReply> {
         match settings.provider {
-            Provider::Cloud => self.server.ask_in_chat(chat_id, prompt, settings).await,
+            Provider::Cloud => self.server.ask_in_chat(chat_id, prompt, settings, &[]).await,
             Provider::Ollama => self.local.ask(history, settings).await,
         }
     }
@@ -63,6 +69,18 @@ impl Agent for CliAgent {
         match settings.provider {
             Provider::Cloud => self.server.ask(history, settings).await,
             Provider::Ollama => self.local.ask(history, settings).await,
+        }
+    }
+
+    async fn ask_with_tools(
+        &self,
+        history: &[Message],
+        settings: &ChatSettings,
+        tools: &[ToolSpec],
+    ) -> Result<AgentReply> {
+        match settings.provider {
+            Provider::Cloud => self.server.ask_with_tools(history, settings, tools).await,
+            Provider::Ollama => self.local.ask_with_tools(history, settings, tools).await,
         }
     }
 }

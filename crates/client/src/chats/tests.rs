@@ -954,3 +954,91 @@ async fn create_chat_sends_task_state_settings() {
     assert_eq!(bodies[0]["settings"]["task_state_enabled"], true);
     assert_eq!(bodies[0]["settings"]["task_state_auto_enabled"], false);
 }
+
+// --- Вызов инструментов ---
+
+#[tokio::test]
+async fn tool_messages_keep_their_role_and_links_on_load() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v1/chats/chat-1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": "chat-1",
+            "title": "Чат",
+            "settings": { "provider": "cloud", "model": "model-a", "git_tools_enabled": true, "git_repository": "/tmp/r" },
+            "created_at": 1000,
+            "updated_at": 2000,
+            "message_count": 3,
+            "messages": [
+                { "seq": 1, "role": "user", "content": "статус?", "created_at": 1001 },
+                { "seq": 2, "role": "assistant", "content": "", "created_at": 1002,
+                  "tool_calls": [{ "id": "call_0", "name": "git_status", "arguments": {} }] },
+                { "seq": 3, "role": "tool", "content": "clean", "created_at": 1003,
+                  "tool_call_id": "call_0", "tool_name": "git_status" }
+            ],
+            "next_after": null
+        })))
+        .mount(&server)
+        .await;
+
+    let history = chats(&server, "token-a").load("chat-1").await.expect("история");
+    assert_eq!(history.chat.settings.git_tools_enabled, Some(true));
+    assert_eq!(history.chat.settings.git_repository.as_deref(), Some("/tmp/r"));
+    let call = &history.messages[1].message;
+    assert_eq!(call.tool_calls.len(), 1);
+    assert_eq!(call.tool_calls[0].name, "git_status");
+    let result = &history.messages[2].message;
+    assert!(matches!(result.role, Role::Tool));
+    assert_eq!(result.tool_call_id.as_deref(), Some("call_0"));
+    assert_eq!(result.tool_name.as_deref(), Some("git_status"));
+}
+
+#[tokio::test]
+async fn settings_payload_carries_git_tool_fields() {
+    let settings = ChatSettings {
+        git_tools_enabled: Some(true),
+        git_repository: Some("/tmp/r".into()),
+        git_allowed_tools: Some(vec!["git_add".into()]),
+        tool_max_iterations: Some(4),
+        ..ChatSettings::default()
+    };
+    let payload = settings_payload(&settings);
+    assert_eq!(payload["git_tools_enabled"], true);
+    assert_eq!(payload["git_repository"], "/tmp/r");
+    assert_eq!(payload["git_allowed_tools"], json!(["git_add"]));
+    assert_eq!(payload["tool_max_iterations"], 4);
+
+    // Снятое значение уходит явным null: сервис его снимает.
+    let cleared = settings_payload(&ChatSettings::default());
+    assert!(cleared["git_repository"].is_null());
+    assert!(cleared.get("git_repository").is_some());
+}
+
+#[tokio::test]
+async fn append_sends_tool_turn_with_links() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chats/chat-1/messages"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(json!({ "seqs": [1, 2, 3] })))
+        .mount(&server)
+        .await;
+    let turn = vec![
+        Message::user("статус?"),
+        Message::assistant_with_tool_calls(
+            "",
+            vec![agentcore::agent::ToolCall {
+                id: "call_0".into(),
+                name: "git_status".into(),
+                arguments: json!({}),
+            }],
+        ),
+        Message::tool_result("call_0", "git_status", "clean"),
+    ];
+    chats(&server, "t").append("chat-1", &turn).await.expect("дозапись");
+    let bodies = received_bodies(&server).await;
+    let messages = bodies[0]["messages"].as_array().unwrap();
+    assert_eq!(messages[1]["tool_calls"][0]["name"], "git_status");
+    assert_eq!(messages[2]["role"], "tool");
+    assert_eq!(messages[2]["tool_call_id"], "call_0");
+    assert_eq!(messages[2]["tool_name"], "git_status");
+}

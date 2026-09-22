@@ -361,7 +361,7 @@ async fn max_context_tokens_is_sent_in_ask_in_chat_when_configured() {
     mount_chat(&server, 200, success_body()).await;
 
     agent(&server, "token")
-        .ask_in_chat("chat-1", "привет", &cloud_settings_with_context_limit(4000))
+        .ask_in_chat("chat-1", "привет", &cloud_settings_with_context_limit(4000), &[])
         .await
         .expect("ответ сервиса");
 
@@ -477,7 +477,7 @@ async fn ask_in_chat_sends_chat_id_and_prompt_only() {
     mount_chat(&server, 200, success_body()).await;
 
     let reply = agent(&server, "token")
-        .ask_in_chat("chat-1", "привет", &cloud_settings())
+        .ask_in_chat("chat-1", "привет", &cloud_settings(), &[])
         .await
         .expect("ответ сервиса");
     assert_eq!(reply.content, "ответ");
@@ -507,4 +507,125 @@ async fn ask_without_chat_id_still_sends_history() {
     let body: serde_json::Value = serde_json::from_slice(&requests[0].body).expect("тело");
     assert!(body.get("chat_id").is_none(), "разовый запрос без чата: {body}");
     assert_eq!(body["messages"][0]["content"], "привет");
+}
+
+// --- Вызов инструментов ---
+
+fn git_status_spec() -> ToolSpec {
+    ToolSpec {
+        name: "git_status".into(),
+        description: Some("Shows the working tree status".into()),
+        parameters: json!({ "type": "object", "properties": {} }),
+    }
+}
+
+fn tool_calls_body() -> serde_json::Value {
+    let mut body = success_body();
+    body["content"] = json!("");
+    body["tool_calls"] = json!([{ "id": "call_0", "name": "git_status", "arguments": {} }]);
+    body
+}
+
+#[tokio::test]
+async fn ask_in_chat_sends_tools_and_parses_tool_calls() {
+    let server = MockServer::start().await;
+    mount_chat(&server, 200, tool_calls_body()).await;
+
+    let reply = agent(&server, "token")
+        .ask_in_chat("chat-1", "статус?", &cloud_settings(), &[git_status_spec()])
+        .await
+        .expect("ответ сервиса");
+    assert_eq!(reply.content, "");
+    assert_eq!(reply.tool_calls.len(), 1);
+    assert_eq!(reply.tool_calls[0].id, "call_0");
+    assert_eq!(reply.tool_calls[0].name, "git_status");
+
+    let requests = server.received_requests().await.expect("записанные запросы");
+    let body: serde_json::Value = serde_json::from_slice(&requests[0].body).expect("тело");
+    assert_eq!(body["tools"][0]["name"], "git_status");
+    assert_eq!(body["tools"][0]["parameters"]["type"], "object");
+    assert!(body.get("tool_results").is_none());
+}
+
+#[tokio::test]
+async fn continue_in_chat_sends_tool_results_instead_of_prompt() {
+    let server = MockServer::start().await;
+    mount_chat(&server, 200, success_body()).await;
+
+    let results = [Message::tool_result("call_0", "git_status", "clean")];
+    let reply = agent(&server, "token")
+        .continue_in_chat("chat-1", &results, &cloud_settings(), &[git_status_spec()])
+        .await
+        .expect("ответ сервиса");
+    assert!(reply.tool_calls.is_empty(), "старый ответ без поля — окончательный");
+
+    let requests = server.received_requests().await.expect("записанные запросы");
+    let body: serde_json::Value = serde_json::from_slice(&requests[0].body).expect("тело");
+    assert_eq!(body["chat_id"], "chat-1");
+    assert!(body.get("prompt").is_none(), "тело: {body}");
+    assert_eq!(
+        body["tool_results"],
+        json!([{ "tool_call_id": "call_0", "name": "git_status", "content": "clean" }])
+    );
+    assert_eq!(body["tools"][0]["name"], "git_status");
+}
+
+#[tokio::test]
+async fn request_without_tools_has_no_tool_fields() {
+    let server = MockServer::start().await;
+    mount_chat(&server, 200, success_body()).await;
+    agent(&server, "token")
+        .ask(&history(), &cloud_settings())
+        .await
+        .expect("ответ сервиса");
+    let requests = server.received_requests().await.expect("записанные запросы");
+    let body: serde_json::Value = serde_json::from_slice(&requests[0].body).expect("тело");
+    assert!(body.get("tools").is_none());
+    assert!(body.get("tool_results").is_none());
+    assert!(body["messages"][0].get("tool_calls").is_none());
+}
+
+#[tokio::test]
+async fn history_with_tool_messages_is_sent_with_links() {
+    let server = MockServer::start().await;
+    mount_chat(&server, 200, success_body()).await;
+    let history = vec![
+        Message::user("статус?"),
+        Message::assistant_with_tool_calls(
+            "",
+            vec![ToolCall {
+                id: "call_0".into(),
+                name: "git_status".into(),
+                arguments: json!({}),
+            }],
+        ),
+        Message::tool_result("call_0", "git_status", "clean"),
+    ];
+    agent(&server, "token")
+        .ask_with_tools(&history, &cloud_settings(), &[git_status_spec()])
+        .await
+        .expect("ответ сервиса");
+    let requests = server.received_requests().await.expect("записанные запросы");
+    let body: serde_json::Value = serde_json::from_slice(&requests[0].body).expect("тело");
+    assert_eq!(body["messages"][1]["tool_calls"][0]["id"], "call_0");
+    assert_eq!(body["messages"][2]["role"], "tool");
+    assert_eq!(body["messages"][2]["tool_call_id"], "call_0");
+    assert_eq!(body["messages"][2]["tool_name"], "git_status");
+}
+
+#[tokio::test]
+async fn tools_unsupported_code_is_typed() {
+    let err = ask_error(400, error_body("tools_unsupported", "модель не поддерживает вызов инструментов")).await;
+    match err.downcast_ref::<AgentError>() {
+        Some(AgentError::ToolsUnsupported { request_id, .. }) => {
+            assert_eq!(request_id.as_deref(), Some("req-1"));
+        }
+        other => panic!("ожидался ToolsUnsupported, получено: {other:?}"),
+    }
+    // Прочие 400 остаются неверным запросом.
+    let err = ask_error(400, error_body("tools_invalid", "плохое имя")).await;
+    assert!(matches!(
+        err.downcast_ref::<AgentError>(),
+        Some(AgentError::InvalidRequest { .. })
+    ));
 }

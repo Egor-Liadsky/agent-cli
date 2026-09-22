@@ -7,7 +7,7 @@
 //! различает причины через `downcast_ref::<AgentError>`, а не по тексту.
 
 use crate::{header_request_id, parse_service_error, ResponseFormatPayload};
-use agentcore::agent::{transport_error, AgentError, Message, MessageMeta, Role};
+use agentcore::agent::{transport_error, AgentError, Message, MessageMeta, Role, ToolCall};
 use agentcore::config::{ChatSettings, ContextStrategy, Provider, ReasoningMode, ThinkingMode};
 use agentcore::logging::{request_id, unix_timestamp, ExchangeLog, RequestLogEntry, ResponseLogEntry};
 use anyhow::Result;
@@ -666,6 +666,10 @@ fn settings_payload(settings: &ChatSettings) -> serde_json::Value {
         profile_id: settings.profile_id.clone(),
         task_state_enabled: settings.task_state_enabled,
         task_state_auto_enabled: settings.task_state_auto_enabled,
+        git_tools_enabled: settings.git_tools_enabled,
+        git_repository: settings.git_repository.clone(),
+        git_allowed_tools: settings.git_allowed_tools.clone(),
+        tool_max_iterations: settings.tool_max_iterations,
     };
     serde_json::to_value(payload).unwrap_or(serde_json::Value::Null)
 }
@@ -702,6 +706,12 @@ struct ChatSettingsUpdate {
     profile_id: Option<String>,
     task_state_enabled: Option<bool>,
     task_state_auto_enabled: Option<bool>,
+    /// Настройки git-инструментов: сервис их только хранит, запускает
+    /// инструменты клиент.
+    git_tools_enabled: Option<bool>,
+    git_repository: Option<String>,
+    git_allowed_tools: Option<Vec<String>>,
+    tool_max_iterations: Option<u32>,
 }
 
 #[derive(Serialize)]
@@ -716,6 +726,12 @@ struct NewMessagePayload {
     usage: Option<UsagePayload>,
     #[serde(skip_serializing_if = "Option::is_none")]
     timing: Option<TimingPayload>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    tool_calls: Vec<ToolCall>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_call_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_name: Option<String>,
 }
 
 impl From<&Message> for NewMessagePayload {
@@ -755,6 +771,9 @@ impl From<&Message> for NewMessagePayload {
             model,
             usage,
             timing,
+            tool_calls: message.tool_calls.clone(),
+            tool_call_id: message.tool_call_id.clone(),
+            tool_name: message.tool_name.clone(),
         }
     }
 }
@@ -1053,17 +1072,24 @@ struct MessagePayload {
     usage: Option<UsagePayload>,
     #[serde(default)]
     timing: Option<TimingPayload>,
+    #[serde(default)]
+    tool_calls: Vec<ToolCall>,
+    #[serde(default)]
+    tool_call_id: Option<String>,
+    #[serde(default)]
+    tool_name: Option<String>,
 }
 
 impl From<MessagePayload> for StoredMessage {
     fn from(message: MessagePayload) -> Self {
         // Роль сервиса, отличная от известных, трактуется как ответ модели:
         // терять сообщение из-за незнакомого значения хуже, чем показать его
-        // не с той стороны.
-        let role = if message.role == "user" {
-            Role::User
-        } else {
-            Role::Assistant
+        // не с той стороны. Результат инструмента так показывать нельзя —
+        // у него своя роль.
+        let role = match message.role.as_str() {
+            "user" => Role::User,
+            "tool" => Role::Tool,
+            _ => Role::Assistant,
         };
         let usage = message.usage.unwrap_or_default();
         let timing = message.timing.unwrap_or_default();
@@ -1093,9 +1119,9 @@ impl From<MessagePayload> for StoredMessage {
                 content: message.content,
                 reasoning: message.reasoning,
                 meta: has_telemetry.then_some(meta),
-                tool_calls: Vec::new(),
-                tool_call_id: None,
-                tool_name: None,
+                tool_calls: message.tool_calls,
+                tool_call_id: message.tool_call_id,
+                tool_name: message.tool_name,
             },
         }
     }

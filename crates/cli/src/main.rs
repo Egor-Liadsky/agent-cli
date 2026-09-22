@@ -4,6 +4,8 @@ mod clipboard;
 mod cli;
 mod logging;
 mod markdown;
+mod mcp;
+mod tool_loop;
 mod tui;
 
 use agent::CliAgent;
@@ -12,7 +14,7 @@ use anyhow::Context;
 use clap::Parser;
 use cli::{
     BranchesAction, Cli, Commands, ConfigAction, ContextLimitAction, FactsAction, FormatAction,
-    OllamaAction, ProfilesAction, SamplingAction, SummaryAction,
+    GitToolsAction, OllamaAction, ProfilesAction, SamplingAction, SummaryAction,
 };
 use agentcore::config::{Config, Provider, ReasoningMode, ThinkingMode};
 use console::style;
@@ -159,7 +161,11 @@ async fn run_ask(prompt: String) -> anyhow::Result<()> {
         CliAgent::from_config(&config, exchange_log())?.with_unauthorized_hint(UNAUTHORIZED_HINT);
     let history = vec![Message::user(prompt)];
     let settings = config.default_chat_settings();
-    let reply = ask_with_spinner(&agent, &history, &settings).await?;
+    let reply = if settings.git_tools_active() {
+        ask_with_git_tools(&agent, &history, &settings).await?
+    } else {
+        ask_with_spinner(&agent, &history, &settings).await?
+    };
     if let Some(reasoning) = &reply.reasoning {
         println!("{}", style("Рассуждение:").magenta().bold());
         print_markdown(reasoning);
@@ -242,6 +248,7 @@ fn run_config(action: ConfigAction) -> anyhow::Result<()> {
         } => run_reasoning_action(mode, experts, thinking)?,
         ConfigAction::ContextLimit { action } => run_context_limit_action(action)?,
         ConfigAction::Summary { action } => run_summary_action(action)?,
+        ConfigAction::GitTools { action } => run_git_tools_action(action)?,
         ConfigAction::SetInvariantsPath { path } => {
             let mut config = load_config()?;
             config.invariants_path = if path.trim().is_empty() { None } else { Some(path) };
@@ -395,6 +402,109 @@ fn run_summary_action(action: SummaryAction) -> anyhow::Result<()> {
         }
     }
     Ok(())
+}
+
+fn run_git_tools_action(action: GitToolsAction) -> anyhow::Result<()> {
+    match action {
+        GitToolsAction::Set {
+            enabled,
+            repository,
+            allowed_tools,
+            max_iterations,
+        } => {
+            if enabled.is_none() && repository.is_none() && allowed_tools.is_none() && max_iterations.is_none() {
+                anyhow::bail!(
+                    "укажите хотя бы одно значение: enabled, --repository, --allowed-tools или --max-iterations"
+                );
+            }
+            if let Some(iterations) = max_iterations
+                && (iterations == 0 || iterations > agentcore::config::MAX_TOOL_ITERATIONS)
+            {
+                anyhow::bail!(
+                    "--max-iterations должен быть от 1 до {}",
+                    agentcore::config::MAX_TOOL_ITERATIONS
+                );
+            }
+            let mut config = load_config()?;
+            if let Some(enabled) = enabled {
+                config.git_tools_enabled = Some(parse_bool_flag(&enabled)?);
+            }
+            if let Some(repository) = repository {
+                config.git_repository = Some(repository).filter(|path| !path.trim().is_empty());
+            }
+            if let Some(allowed) = allowed_tools {
+                config.git_allowed_tools = Some(parse_tool_list(&allowed)).filter(|list| !list.is_empty());
+            }
+            if max_iterations.is_some() {
+                config.tool_max_iterations = max_iterations;
+            }
+            config.save()?;
+            println!(
+                "{}",
+                style("Умолчания git-инструментов сохранены.").green().bold()
+            );
+            print_git_tools(&config);
+        }
+        GitToolsAction::Clear => {
+            let mut config = load_config()?;
+            config.git_tools_enabled = None;
+            config.git_repository = None;
+            config.git_allowed_tools = None;
+            config.tool_max_iterations = None;
+            config.save()?;
+            println!("{}", style("Умолчания git-инструментов сняты.").green().bold());
+        }
+        GitToolsAction::Show => {
+            let config = load_config()?;
+            print_git_tools(&config);
+        }
+    }
+    Ok(())
+}
+
+/// Список инструментов через запятую, без пустых элементов.
+fn parse_tool_list(value: &str) -> Vec<String> {
+    value
+        .split(',')
+        .map(|item| item.trim().to_string())
+        .filter(|item| !item.is_empty())
+        .collect()
+}
+
+fn print_git_tools(config: &Config) {
+    println!(
+        "{} {}",
+        style("git-инструменты (mcp-server-git):").cyan().bold(),
+        if config.git_tools_enabled == Some(true) {
+            "включены"
+        } else {
+            "выключены"
+        }
+    );
+    println!(
+        "{} {}",
+        style("репозиторий:").cyan().bold(),
+        config
+            .git_repository
+            .clone()
+            .unwrap_or_else(|| "<не задан>".to_string())
+    );
+    println!(
+        "{} {}",
+        style("разрешённые пишущие инструменты:").cyan().bold(),
+        match &config.git_allowed_tools {
+            Some(list) if !list.is_empty() => list.join(", "),
+            _ => "<нет: только читающие>".to_string(),
+        }
+    );
+    println!(
+        "{} {}",
+        style("лимит итераций:").cyan().bold(),
+        config
+            .tool_max_iterations
+            .map(|v| v.to_string())
+            .unwrap_or_else(|| format!("{} (по умолчанию)", agentcore::config::DEFAULT_TOOL_MAX_ITERATIONS))
+    );
 }
 
 fn parse_bool_flag(value: &str) -> anyhow::Result<bool> {
@@ -552,6 +662,7 @@ fn show_config() -> anyhow::Result<()> {
     print_sampling_params(&config.sampling);
     print_context_limit(&config);
     print_summary(&config);
+    print_git_tools(&config);
     print_invariants_path(&config);
     Ok(())
 }
@@ -871,3 +982,82 @@ async fn ask_with_spinner(
     spinner.finish_and_clear();
     result
 }
+
+/// `ask` отказывает каждому пишущему вызову: команда работает в скриптах и
+/// конвейерах, и вопрос в stdin повесил бы их. Флага «разрешить запись без
+/// подтверждения» нет намеренно.
+struct DenyWrites;
+
+const ASK_WRITE_REFUSAL: &str =
+    "пишущие инструменты в режиме ask не выполняются: используйте agentcli chat";
+
+#[async_trait::async_trait]
+impl tool_loop::ToolApprover for DenyWrites {
+    async fn approve(&self, call: &agentcore::agent::ToolCall) -> bool {
+        eprintln!(
+            "{} {}",
+            style("Внимание:").yellow().bold(),
+            style(format!(
+                "модель запросила пишущий инструмент {}; в режиме ask запись не выполняется",
+                call.name
+            ))
+            .yellow()
+        );
+        false
+    }
+
+    fn refusal(&self) -> &str {
+        ASK_WRITE_REFUSAL
+    }
+}
+
+/// Строка ожидания показывает текущий инструмент.
+struct SpinnerObserver(ProgressBar);
+
+impl tool_loop::TurnObserver for SpinnerObserver {
+    fn running(&self, call: &agentcore::agent::ToolCall) {
+        self.0
+            .set_message(style(format!("Инструмент {}...", call.name)).magenta().to_string());
+    }
+}
+
+/// Разовый вопрос с git-инструментами: сервер запускается на время команды.
+async fn ask_with_git_tools(
+    agent: &CliAgent,
+    history: &[Message],
+    settings: &agentcore::config::ChatSettings,
+) -> anyhow::Result<AgentReply> {
+    let repository = settings.git_repository.clone().unwrap_or_default();
+    let server = mcp::GitToolServer::start(&repository, exchange_log()).await?;
+    let tools = mcp::GitTools {
+        server: server.clone(),
+        allowed_writes: settings.git_allowed_tools.clone(),
+    };
+    let spinner = ProgressBar::new_spinner();
+    spinner.set_style(
+        ProgressStyle::with_template("{spinner:.cyan} {msg}")
+            .unwrap()
+            .tick_strings(&["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]),
+    );
+    spinner.set_message(style("Агент думает...").magenta().to_string());
+    spinner.enable_steady_tick(Duration::from_millis(80));
+
+    let mut backend = tool_loop::HistoryTurn {
+        agent,
+        history,
+        settings,
+    };
+    let observer = SpinnerObserver(spinner.clone());
+    let result = tool_loop::run_tool_loop(
+        &mut backend,
+        &tools,
+        &DenyWrites,
+        settings.effective_tool_max_iterations(),
+        &observer,
+    )
+    .await;
+    spinner.finish_and_clear();
+    server.shutdown().await;
+    result.map_err(|err| err.error)
+}
+

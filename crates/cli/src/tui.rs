@@ -1,5 +1,7 @@
 use crate::agent::CliAgent;
-use agentcore::agent::{AgentReply, Message, MessageMeta, Role};
+use crate::mcp::{GitToolServer, GitTools};
+use crate::tool_loop::{self, ToolApprover, TurnObserver};
+use agentcore::agent::{AgentReply, Message, MessageMeta, Role, ToolCall};
 use crate::chats::{self, ChatSession};
 use agentclient::{
     Branch, ChatHistory, ChatSummary, ChatsClient, Fact, LongTermMemoryEntry, ProfileChoice, StoredMessage,
@@ -28,8 +30,9 @@ use ratatui::{
     widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap},
     Frame, Terminal,
 };
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::io;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
@@ -51,6 +54,27 @@ enum ChatsLoad {
 
 enum ChatEvent {
     Response(String, anyhow::Result<AgentReply>),
+    /// Промежуточные сообщения хода с инструментами (ответ модели с
+    /// вызовами, результаты): показываются по мере прихода.
+    ToolTurnMessages(String, Vec<Message>),
+    /// Сейчас выполняется этот инструмент — для строки ожидания.
+    ToolRunning(String, String),
+    /// Модель просит пишущий инструмент: нужен ответ человека.
+    ToolApproval {
+        chat_title: String,
+        call: ToolCall,
+        reply: tokio::sync::oneshot::Sender<bool>,
+    },
+    /// Сервер инструментов не запустился: ход не выполнялся, реплика
+    /// возвращается в поле ввода.
+    ToolServerFailed {
+        chat_id: String,
+        line: String,
+        error: String,
+    },
+    /// Ход с инструментами прервался ошибкой после стольких выполненных
+    /// вызовов.
+    ToolTurnFailed(String, anyhow::Error, usize),
     /// Список локальных моделей Ollama: пришёл фоновой задачей.
     OllamaModels(Result<Vec<String>, String>),
     /// Список облачных моделей сервиса: пришёл фоновой задачей.
@@ -124,6 +148,19 @@ enum Focus {
     Memory,
     Task,
 }
+
+/// Запрос подтверждения пишущего вызова инструмента. Ответ уходит циклу
+/// инструментов через `reply`; уничтожение отправителя (выход из TUI)
+/// цикл читает как отказ.
+struct ToolApprovalRequest {
+    chat_title: String,
+    call: ToolCall,
+    reply: tokio::sync::oneshot::Sender<bool>,
+}
+
+/// Процессы `mcp-server-git` по каноническому пути репозитория: чаты с одним
+/// репозиторием делят процесс.
+type ToolServers = Arc<tokio::sync::Mutex<HashMap<PathBuf, Arc<GitToolServer>>>>;
 
 /// Запрос подтверждения на удаление чата.
 struct DeleteConfirm {
@@ -418,6 +455,10 @@ enum FormatField {
     MemoryLongTermMaxEntries,
     TaskStateEnabled,
     TaskStateAutoEnabled,
+    GitToolsEnabled,
+    GitRepository,
+    GitAllowedTools,
+    ToolMaxIterations,
     Mode,
     Reasoning,
     Thinking,
@@ -440,17 +481,19 @@ enum SettingsSection {
     Context,
     Memory,
     Profile,
+    Tools,
     Format,
     Reasoning,
     Sampling,
 }
 
 impl SettingsSection {
-    const ALL: [SettingsSection; 7] = [
+    const ALL: [SettingsSection; 8] = [
         SettingsSection::Connection,
         SettingsSection::Context,
         SettingsSection::Memory,
         SettingsSection::Profile,
+        SettingsSection::Tools,
         SettingsSection::Format,
         SettingsSection::Reasoning,
         SettingsSection::Sampling,
@@ -462,6 +505,7 @@ impl SettingsSection {
             SettingsSection::Context => "Контекст",
             SettingsSection::Memory => "Память",
             SettingsSection::Profile => "Профиль",
+            SettingsSection::Tools => "Инструменты",
             SettingsSection::Format => "Формат ответа",
             SettingsSection::Reasoning => "Рассуждение",
             SettingsSection::Sampling => "Сэмплинг",
@@ -483,6 +527,9 @@ impl SettingsSection {
             }
             SettingsSection::Profile => {
                 "Профиль владельца: роль, стиль, формат и ограничения ответа, заданные сервисом."
+            }
+            SettingsSection::Tools => {
+                "Git-инструменты (mcp-server-git): модель читает репозиторий сама, а пишущие вызовы выполняются только после подтверждения."
             }
             SettingsSection::Format => "Формат ответа: кастомный режим, длина, стоп-условия.",
             SettingsSection::Reasoning => {
@@ -520,6 +567,12 @@ impl SettingsSection {
                 FormatField::TaskStateAutoEnabled,
             ],
             SettingsSection::Profile => &[FormatField::Profile],
+            SettingsSection::Tools => &[
+                FormatField::GitToolsEnabled,
+                FormatField::GitRepository,
+                FormatField::GitAllowedTools,
+                FormatField::ToolMaxIterations,
+            ],
             SettingsSection::Format => &[
                 FormatField::Mode,
                 FormatField::Description,
@@ -632,6 +685,10 @@ impl FormatField {
             FormatField::MemoryLongTermMaxEntries => "Лимит записей долговременной памяти",
             FormatField::TaskStateEnabled => "Состояние задачи",
             FormatField::TaskStateAutoEnabled => "Автотрекер состояния задачи",
+            FormatField::GitToolsEnabled => "Git-инструменты",
+            FormatField::GitRepository => "Репозиторий",
+            FormatField::GitAllowedTools => "Разрешённые пишущие",
+            FormatField::ToolMaxIterations => "Лимит итераций",
             FormatField::Mode => "Режим",
             FormatField::Reasoning => "Стратегия рассуждения",
             FormatField::Thinking => "Режим thinking у модели",
@@ -736,6 +793,23 @@ AGENTD_TASK_STATE_ENABLED (по умолчанию выключено)."
 ответа предлагает переход состояния задачи. «Умолчание сервиса» — решает AGENTD_TASK_STATE_AUTO_ENABLED. Имеет \
 смысл только при включённом состоянии задачи."
             }
+            FormatField::GitToolsEnabled => {
+                "◀/▶ или Space — переключить. Подключает к ходам этого чата git-инструменты: клиент при первом ходе \
+запускает uvx mcp-server-git для репозитория ниже. Читающие инструменты (статус, диффы, лог, show, ветки) \
+выполняются сразу, пишущие — только после подтверждения в отдельном окне. Нужен установленный uv."
+            }
+            FormatField::GitRepository => {
+                "Путь к git-репозиторию на этой машине. Модель работает только с ним: путь подставляет клиент, \
+а не модель."
+            }
+            FormatField::GitAllowedTools => {
+                "Пишущие инструменты, которые модели разрешено запрашивать, через запятую: git_add, git_commit, \
+git_reset, git_create_branch, git_checkout. Пусто — только читающие. Каждый пишущий вызов всё равно подтверждается."
+            }
+            FormatField::ToolMaxIterations => {
+                "Сколько раз за ход модель может запросить инструменты (1–32). После лимита она получает один \
+запрос без инструментов и отвечает по собранным данным. Пусто — 8."
+            }
             FormatField::Mode => {
                 "◀/▶ или Space — переключить. Кастомный режим задаёт свой формат ответа вместо формата по умолчанию."
             }
@@ -781,6 +855,7 @@ AGENTD_TASK_STATE_ENABLED (по умолчанию выключено)."
                 | FormatField::MemoryRouterEnabled
                 | FormatField::TaskStateEnabled
                 | FormatField::TaskStateAutoEnabled
+                | FormatField::GitToolsEnabled
         )
     }
 
@@ -806,6 +881,10 @@ AGENTD_TASK_STATE_ENABLED (по умолчанию выключено)."
                 | FormatField::MemoryLongTermMaxEntries
                 | FormatField::TaskStateEnabled
                 | FormatField::TaskStateAutoEnabled
+                | FormatField::GitToolsEnabled
+                | FormatField::GitRepository
+                | FormatField::GitAllowedTools
+                | FormatField::ToolMaxIterations
         )
     }
 
@@ -884,6 +963,14 @@ struct SettingsEditor {
     /// умолчание сервиса, "on"/"off" — явное включение/выключение. Имеет
     /// смысл только при включённом состоянии задачи.
     task_state_auto_enabled: String,
+    /// Git-инструменты этого чата: включены или нет.
+    git_tools_enabled: bool,
+    /// Путь к репозиторию на этой машине.
+    git_repository: String,
+    /// Разрешённые пишущие инструменты через запятую.
+    git_allowed_tools: String,
+    /// Лимит итераций цикла инструментов. Пусто — умолчание клиента.
+    tool_max_iterations: String,
     /// Облачные модели для переключения стрелками в поле «Модель».
     model_choices: Vec<String>,
     /// Локально скачанные модели Ollama, полученные с `/api/tags`.
@@ -992,6 +1079,13 @@ impl SettingsEditor {
                 Some(true) => "on".to_string(),
                 Some(false) => "off".to_string(),
             },
+            git_tools_enabled: settings.git_tools_active(),
+            git_repository: settings.git_repository.clone().unwrap_or_default(),
+            git_allowed_tools: settings.git_allowed_tools.clone().unwrap_or_default().join(", "),
+            tool_max_iterations: settings
+                .tool_max_iterations
+                .map(|v| v.to_string())
+                .unwrap_or_default(),
             // приходит из AppState.model_choices: список сервиса, если фоновый
             // запрос уже ответил, иначе — встроенный/конфигурный список
             model_choices: model_choices.to_vec(),
@@ -1054,6 +1148,10 @@ impl SettingsEditor {
                 | FormatField::MemoryLongTermMaxEntries => self.memory_layers_enabled == "on",
                 // автотрекер имеет смысл только при включённом состоянии задачи
                 FormatField::TaskStateAutoEnabled => self.task_state_enabled == "on",
+                // параметры инструментов видны при включённом переключателе
+                FormatField::GitRepository | FormatField::GitAllowedTools | FormatField::ToolMaxIterations => {
+                    self.git_tools_enabled
+                }
                 _ => true,
             })
             .collect()
@@ -1281,6 +1379,7 @@ impl SettingsEditor {
             Some(FormatField::MemoryRouterEnabled) => self.memory_router_enabled.clear(),
             Some(FormatField::TaskStateEnabled) => self.task_state_enabled.clear(),
             Some(FormatField::TaskStateAutoEnabled) => self.task_state_auto_enabled.clear(),
+            Some(FormatField::GitToolsEnabled) => self.toggle_git_tools(false),
             _ => {
                 if let Some(value) = self.field_value_mut() {
                     value.clear();
@@ -1300,7 +1399,11 @@ impl SettingsEditor {
             | FormatField::MemoryLayersEnabled
             | FormatField::MemoryRouterEnabled
             | FormatField::TaskStateEnabled
-            | FormatField::TaskStateAutoEnabled => None,
+            | FormatField::TaskStateAutoEnabled
+            | FormatField::GitToolsEnabled => None,
+            FormatField::GitRepository => Some(&mut self.git_repository),
+            FormatField::GitAllowedTools => Some(&mut self.git_allowed_tools),
+            FormatField::ToolMaxIterations => Some(&mut self.tool_max_iterations),
             FormatField::Model => Some(&mut self.model),
             FormatField::ServerUrl => Some(&mut self.server_url),
             FormatField::ClientToken => Some(&mut self.client_token),
@@ -1501,6 +1604,38 @@ impl SettingsEditor {
         }
     }
 
+    /// Включение и выключение git-инструментов; поля параметров появляются
+    /// и исчезают вместе с переключателем.
+    fn toggle_git_tools(&mut self, enabled: bool) {
+        self.git_tools_enabled = enabled;
+        let len = self.visible_fields().len();
+        self.field = self.field.min(len.saturating_sub(1));
+    }
+
+    fn build_git_tools_enabled(&self) -> Option<bool> {
+        self.git_tools_enabled.then_some(true)
+    }
+
+    fn build_git_repository(&self) -> Option<String> {
+        non_empty(&self.git_repository)
+    }
+
+    fn build_git_allowed_tools(&self) -> Option<Vec<String>> {
+        Some(split_list(&self.git_allowed_tools)).filter(|list| !list.is_empty())
+    }
+
+    fn build_tool_max_iterations(&self) -> Result<Option<u32>, String> {
+        let value = self.tool_max_iterations.trim();
+        if value.is_empty() {
+            return Ok(None);
+        }
+        let max = agentcore::config::MAX_TOOL_ITERATIONS;
+        match value.parse::<u32>() {
+            Ok(parsed) if (1..=max).contains(&parsed) => Ok(Some(parsed)),
+            _ => Err(format!("Лимит итераций должен быть целым числом от 1 до {max}")),
+        }
+    }
+
     fn build_memory_working_max_entries(&self) -> Result<Option<u32>, String> {
         Self::build_summary_count(
             &self.memory_working_max_entries,
@@ -1600,6 +1735,8 @@ struct ChatUi {
     /// Кеш отрисованных сообщений истории, по одному элементу на сообщение
     /// в том же порядке.
     rendered: Vec<RenderedMessage>,
+    /// Инструмент, который выполняется в текущем ходе.
+    tool_running: Option<String>,
 }
 
 /// Одно сообщение истории, уже разобранное в строки терминала.
@@ -1639,6 +1776,7 @@ impl Default for ChatUi {
             unsaved: None,
             last_context: None,
             rendered: Vec::new(),
+            tool_running: None,
         }
     }
 }
@@ -1693,6 +1831,12 @@ struct AppState {
     /// Области истории каждой открытой панели с прошлого кадра: по ним
     /// колесо мыши находит чат под курсором.
     history_areas: Vec<(String, Rect)>,
+    /// Запущенные серверы git-инструментов. Запускаются лениво, при первом
+    /// ходе чата с включёнными инструментами.
+    tool_servers: ToolServers,
+    /// Запросы подтверждения пишущих вызовов: из разных чатов встают в
+    /// очередь и показываются по одному, поверх любого окна.
+    tool_approvals: VecDeque<ToolApprovalRequest>,
 }
 
 impl AppState {
@@ -1830,6 +1974,8 @@ async fn run_app(
         model_choices,
         profile_choices: Vec::new(),
         history_areas: Vec::new(),
+        tool_servers: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+        tool_approvals: VecDeque::new(),
     };
 
     let (tx, mut rx) = mpsc::unbounded_channel::<ChatEvent>();
@@ -1902,7 +2048,45 @@ async fn run_app(
         }
     }
 
+    // Открытые запросы подтверждения отклоняются уничтожением отправителей,
+    // и серверы инструментов останавливаются общим порядком.
+    state.tool_approvals.clear();
+    stop_tool_servers(&state.tool_servers, |_| true).await;
     Ok(())
+}
+
+/// Останавливает серверы инструментов, репозиторий которых подходит под
+/// условие.
+async fn stop_tool_servers(servers: &ToolServers, should_stop: impl Fn(&PathBuf) -> bool) {
+    let stopped: Vec<Arc<GitToolServer>> = {
+        let mut servers = servers.lock().await;
+        let keys: Vec<PathBuf> = servers.keys().filter(|key| should_stop(key)).cloned().collect();
+        keys.into_iter().filter_map(|key| servers.remove(&key)).collect()
+    };
+    for server in stopped {
+        server.shutdown().await;
+    }
+}
+
+/// Останавливает серверы репозиториев, которые больше не нужны ни одному
+/// чату: после выключения инструментов или смены пути в настройках.
+fn release_unused_tool_servers(state: &AppState) {
+    // Серверов нет — и останавливать нечего: обычный случай, когда
+    // инструментами не пользуются.
+    if state.tool_servers.try_lock().is_ok_and(|servers| servers.is_empty()) {
+        return;
+    }
+    let used: Vec<PathBuf> = state
+        .chats
+        .iter()
+        .filter(|chat| chat.settings.git_tools_active())
+        .filter_map(|chat| chat.settings.git_repository.as_deref())
+        .filter_map(|path| crate::mcp::validate_repository(path).ok())
+        .collect();
+    let servers = state.tool_servers.clone();
+    tokio::spawn(async move {
+        stop_tool_servers(&servers, |key| !used.contains(key)).await;
+    });
 }
 
 /// Обработка одного события терминала. Вынесена из цикла, чтобы события
@@ -2091,6 +2275,14 @@ fn handle_key(
     agent: &Arc<CliAgent>,
     tx: &mpsc::UnboundedSender<ChatEvent>,
 ) -> LoopControl {
+    // Запрос подтверждения важнее любого окна: цикл инструментов стоит и
+    // ждёт ответа. Ctrl+C по-прежнему выходит — это отказ.
+    if !state.tool_approvals.is_empty()
+        && !(key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL))
+    {
+        handle_tool_approval_key(key, state);
+        return LoopControl::Continue;
+    }
     if let Some(control) = handle_global_key(key, state, tx) {
         return control;
     }
@@ -2240,6 +2432,13 @@ fn handle_settings_key(
             state.focus = Focus::Input;
         }
         KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            let tool_max_iterations = match editor.build_tool_max_iterations() {
+                Ok(value) => value,
+                Err(err) => {
+                    editor.error = Some(err);
+                    return LoopControl::Continue;
+                }
+            };
             match editor
                 .build()
                 .and_then(|format| editor.build_sampling().map(|sampling| (format, sampling)))
@@ -2346,6 +2545,9 @@ fn handle_settings_key(
                     let memory_router_enabled = editor.build_memory_router_enabled();
                     let task_state_enabled = editor.build_task_state_enabled();
                     let task_state_auto_enabled = editor.build_task_state_auto_enabled();
+                    let git_tools_enabled = editor.build_git_tools_enabled();
+                    let git_repository = editor.build_git_repository();
+                    let git_allowed_tools = editor.build_git_allowed_tools();
                     let reasoning = editor.reasoning;
                     let thinking = editor.thinking;
                     // состав сохраняем всегда: при возврате к «Группе экспертов»
@@ -2359,8 +2561,7 @@ fn handle_settings_key(
                     let ollama_url = non_empty(&editor.ollama_url);
                     state.settings = None;
                     state.focus = Focus::Input;
-                    if let Some(index) = state.chat_index(&chat_id) {
-                        let current = &state.chats[index].settings;
+                    if state.chat_index(&chat_id).is_some() {
                         let settings = ChatSettings {
                             provider,
                             model,
@@ -2383,10 +2584,10 @@ fn handle_settings_key(
                             profile_id,
                             task_state_enabled,
                             task_state_auto_enabled,
-                            git_tools_enabled: current.git_tools_enabled,
-                            git_repository: current.git_repository.clone(),
-                            git_allowed_tools: current.git_allowed_tools.clone(),
-                            tool_max_iterations: current.tool_max_iterations,
+                            git_tools_enabled,
+                            git_repository,
+                            git_allowed_tools,
+                            tool_max_iterations,
                         };
                         // Настройки чата хранит сервис: локально они
                         // применяются ответом на PATCH, а не сразу.
@@ -2565,6 +2766,13 @@ fn handle_settings_key(
                 && editor.current_field() == Some(FormatField::TaskStateAutoEnabled) =>
         {
             editor.cycle_task_state_auto_enabled(1);
+        }
+        KeyCode::Left | KeyCode::Right | KeyCode::Char(' ')
+            if editor.pane == SettingsPane::Fields
+                && editor.current_field() == Some(FormatField::GitToolsEnabled) =>
+        {
+            let enabled = !editor.git_tools_enabled;
+            editor.toggle_git_tools(enabled);
         }
         KeyCode::Left => {
             // из полей — обратно к списку разделов
@@ -3117,6 +3325,34 @@ fn handle_task_key(
     LoopControl::Continue
 }
 
+/// Решение по вызову из очереди подтверждений. Режима «разрешить всё до
+/// конца хода» нет намеренно: каждый пишущий вызов виден отдельно.
+fn tool_approval_decision(code: KeyCode) -> Option<bool> {
+    match code {
+        KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Char('д') | KeyCode::Char('Д') | KeyCode::Enter => {
+            Some(true)
+        }
+        KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Char('н') | KeyCode::Char('Н') | KeyCode::Esc => {
+            Some(false)
+        }
+        _ => None,
+    }
+}
+
+fn handle_tool_approval_key(key: crossterm::event::KeyEvent, state: &mut AppState) {
+    let Some(decision) = tool_approval_decision(key.code) else {
+        return;
+    };
+    if let Some(request) = state.tool_approvals.pop_front() {
+        let _ = request.reply.send(decision);
+        state.notify(if decision {
+            format!("Вызов {} разрешён", request.call.name)
+        } else {
+            format!("Вызов {} отклонён", request.call.name)
+        });
+    }
+}
+
 fn handle_confirm_key(
     key: crossterm::event::KeyEvent,
     state: &mut AppState,
@@ -3202,6 +3438,21 @@ fn handle_input_key(
                 state.notify("История чата ещё загружается: сообщение не отправлено");
                 return LoopControl::Continue;
             }
+            // Путь проверяется до отправки: с неверным путём ход не
+            // начинается, а реплика остаётся в поле ввода.
+            let tool_repository = if state.chats[chat_index].settings.git_tools_active() {
+                let path = state.chats[chat_index].settings.git_repository.clone().unwrap_or_default();
+                match crate::mcp::validate_repository(&path) {
+                    Ok(repository) => Some(repository),
+                    Err(err) => {
+                        state.chat_ui.entry(chat_id.clone()).or_default().input = line;
+                        state.notify(format!("Сообщение не отправлено: {err}"));
+                        return LoopControl::Continue;
+                    }
+                }
+            } else {
+                None
+            };
             state.chats[chat_index].messages.push(Message::user(line.clone()));
             state.chats[chat_index].touch_quietly();
             // Заголовок нового чата придумывает сервис после первого обмена
@@ -3222,6 +3473,20 @@ fn handle_input_key(
             let tx_response = tx.clone();
             let event_chat_id = chat_id.clone();
             let request_chat_id = chat_id.clone();
+            if let Some(repository) = tool_repository {
+                spawn_tool_turn(ToolTurnRequest {
+                    agent,
+                    servers: state.tool_servers.clone(),
+                    repository,
+                    chat_id,
+                    chat_title: state.chats[chat_index].title.clone(),
+                    line,
+                    history: hist,
+                    settings,
+                    tx: tx.clone(),
+                });
+                return LoopControl::Continue;
+            }
             tokio::spawn(async move {
                 let result = agent
                     .ask_in_chat(&request_chat_id, &line, &hist, &settings)
@@ -3251,6 +3516,145 @@ fn handle_input_key(
         _ => {}
     }
     LoopControl::Continue
+}
+
+/// Всё, что нужно фоновой задаче хода с инструментами.
+struct ToolTurnRequest {
+    agent: Arc<CliAgent>,
+    servers: ToolServers,
+    repository: PathBuf,
+    chat_id: String,
+    chat_title: String,
+    line: String,
+    /// История чата вместе с новой репликой пользователя.
+    history: Vec<Message>,
+    settings: ChatSettings,
+    tx: mpsc::UnboundedSender<ChatEvent>,
+}
+
+/// Подтверждение через попап TUI: запрос уходит в главный цикл событием, и
+/// цикл инструментов ждёт ответа человека.
+struct TuiApprover {
+    chat_title: String,
+    tx: mpsc::UnboundedSender<ChatEvent>,
+}
+
+#[async_trait::async_trait]
+impl ToolApprover for TuiApprover {
+    async fn approve(&self, call: &ToolCall) -> bool {
+        let (reply, answer) = tokio::sync::oneshot::channel();
+        let request = ChatEvent::ToolApproval {
+            chat_title: self.chat_title.clone(),
+            call: call.clone(),
+            reply,
+        };
+        if self.tx.send(request).is_err() {
+            return false;
+        }
+        // Отправитель уничтожен (выход из TUI) — это отказ.
+        answer.await.unwrap_or(false)
+    }
+}
+
+/// Промежуточные сообщения и текущий инструмент — в главный цикл.
+struct TuiObserver {
+    chat_id: String,
+    tx: mpsc::UnboundedSender<ChatEvent>,
+}
+
+impl TurnObserver for TuiObserver {
+    fn messages(&self, messages: &[Message]) {
+        let _ = self
+            .tx
+            .send(ChatEvent::ToolTurnMessages(self.chat_id.clone(), messages.to_vec()));
+    }
+
+    fn running(&self, call: &ToolCall) {
+        let _ = self
+            .tx
+            .send(ChatEvent::ToolRunning(self.chat_id.clone(), call.name.clone()));
+    }
+}
+
+/// Ход с git-инструментами: сервер репозитория (запуск при первом ходе),
+/// затем цикл инструментов. Облачный чат продолжает ход через сервис, а
+/// локальный собирает историю сам.
+fn spawn_tool_turn(request: ToolTurnRequest) {
+    tokio::spawn(async move {
+        let ToolTurnRequest {
+            agent,
+            servers,
+            repository,
+            chat_id,
+            chat_title,
+            line,
+            history,
+            settings,
+            tx,
+        } = request;
+        let server = {
+            let mut servers = servers.lock().await;
+            match servers.get(&repository) {
+                Some(server) => Ok(server.clone()),
+                None => {
+                    let started =
+                        GitToolServer::start(&repository.to_string_lossy(), crate::logging::exchange_log()).await;
+                    if let Ok(server) = &started {
+                        servers.insert(repository.clone(), server.clone());
+                    }
+                    started
+                }
+            }
+        };
+        let server = match server {
+            Ok(server) => server,
+            Err(err) => {
+                let _ = tx.send(ChatEvent::ToolServerFailed {
+                    chat_id,
+                    line,
+                    error: failure_text(&err),
+                });
+                return;
+            }
+        };
+        let tools = GitTools {
+            server,
+            allowed_writes: settings.git_allowed_tools.clone(),
+        };
+        let approver = TuiApprover {
+            chat_title,
+            tx: tx.clone(),
+        };
+        let observer = TuiObserver {
+            chat_id: chat_id.clone(),
+            tx: tx.clone(),
+        };
+        let max_iterations = settings.effective_tool_max_iterations();
+        let result = match settings.provider {
+            Provider::Cloud => {
+                let mut backend = tool_loop::CloudTurn {
+                    server: agent.server(),
+                    chat_id: &chat_id,
+                    prompt: &line,
+                    settings: &settings,
+                };
+                tool_loop::run_tool_loop(&mut backend, &tools, &approver, max_iterations, &observer).await
+            }
+            Provider::Ollama => {
+                let mut backend = tool_loop::HistoryTurn {
+                    agent: agent.as_ref(),
+                    history: &history,
+                    settings: &settings,
+                };
+                tool_loop::run_tool_loop(&mut backend, &tools, &approver, max_iterations, &observer).await
+            }
+        };
+        let event = match result {
+            Ok(reply) => ChatEvent::Response(chat_id, Ok(reply)),
+            Err(err) => ChatEvent::ToolTurnFailed(chat_id, err.error, err.executed),
+        };
+        let _ = tx.send(event);
+    });
 }
 
 /// Сколько строк истории проматывает один щелчок колеса.
@@ -3951,11 +4355,82 @@ fn handle_chat_event(
             handle_task_transitioned(chat_id, result, state);
             return;
         }
+        ChatEvent::ToolTurnMessages(chat_id, messages) => {
+            handle_tool_turn_messages(chat_id, messages, state);
+            return;
+        }
+        ChatEvent::ToolRunning(chat_id, name) => {
+            state.chat_ui.entry(chat_id).or_default().tool_running = Some(name);
+            return;
+        }
+        ChatEvent::ToolApproval { chat_title, call, reply } => {
+            state.tool_approvals.push_back(ToolApprovalRequest { chat_title, call, reply });
+            return;
+        }
+        ChatEvent::ToolServerFailed { chat_id, line, error } => {
+            handle_tool_server_failed(chat_id, line, error, state);
+            return;
+        }
+        ChatEvent::ToolTurnFailed(chat_id, error, executed) => {
+            handle_response(chat_id, Err(error), executed, state, tx);
+            return;
+        }
         other => other,
     };
     let ChatEvent::Response(chat_id, result) = chat_event else {
         return;
     };
+    handle_response(chat_id, result, 0, state, tx);
+}
+
+/// Промежуточные сообщения хода появляются в истории по мере прихода.
+fn handle_tool_turn_messages(chat_id: String, messages: Vec<Message>, state: &mut AppState) {
+    let Some(chat_index) = state.chat_index(&chat_id) else {
+        return;
+    };
+    state.chats[chat_index].messages.extend(messages);
+    let ui = state.chat_ui.entry(chat_id).or_default();
+    ui.tool_running = None;
+    ui.auto_scroll = true;
+}
+
+/// Сервер не запустился: ход не выполнялся, поэтому реплика убирается из
+/// истории и возвращается в поле ввода.
+fn handle_tool_server_failed(chat_id: String, line: String, error: String, state: &mut AppState) {
+    if let Some(chat_index) = state.chat_index(&chat_id) {
+        let messages = &mut state.chats[chat_index].messages;
+        if messages.last().is_some_and(|m| matches!(m.role, Role::User) && m.content == line) {
+            messages.pop();
+        }
+    }
+    let ui = state.chat_ui.entry(chat_id).or_default();
+    ui.pending = false;
+    ui.pending_since = None;
+    ui.tool_running = None;
+    if ui.input.is_empty() {
+        ui.input = line;
+    }
+    state.notify(format!("Сообщение не отправлено: {error}"));
+}
+
+/// Сообщения текущего хода: от последней реплики пользователя до конца.
+fn current_turn(messages: &[Message]) -> Vec<Message> {
+    let start = messages
+        .iter()
+        .rposition(|message| matches!(message.role, Role::User))
+        .unwrap_or(0);
+    messages[start..].to_vec()
+}
+
+/// Окончательный ответ хода (или ошибка). `executed` — сколько вызовов
+/// инструментов успело выполниться до ошибки.
+fn handle_response(
+    chat_id: String,
+    result: anyhow::Result<AgentReply>,
+    executed: usize,
+    state: &mut AppState,
+    tx: &mpsc::UnboundedSender<ChatEvent>,
+) {
     let failed = result.is_err();
     let mut reply_context = None;
     let mut message = match result {
@@ -3997,15 +4472,18 @@ fn handle_chat_event(
     // обмен локального записывает клиент: ответ дала модель на машине
     // пользователя. Неудачный запрос не записывается: текст ошибки — не
     // реплика модели.
-    if !failed && state.chats[chat_index].settings.provider == Provider::Ollama {
-        let history = &state.chats[chat_index].messages;
-        let exchange: Vec<Message> = history
-            .iter()
-            .rev()
-            .take(2)
-            .rev()
-            .cloned()
-            .collect();
+    //
+    // Ход с инструментами пишется целиком: реплика, вызовы, результаты и
+    // ответ. Если он прервался после хотя бы одного выполненного вызова,
+    // пишется выполненная часть без текста ошибки: побочные эффекты уже
+    // произошли, и история чата обязана их отражать.
+    let is_local = state.chats[chat_index].settings.provider == Provider::Ollama;
+    if is_local && (!failed || executed > 0) {
+        let mut exchange = current_turn(&state.chats[chat_index].messages);
+        if failed {
+            exchange.pop();
+            exchange = agentcore::agent::close_dangling_tool_calls(&exchange);
+        }
         state.chat_ui.entry(chat_id.clone()).or_default().unsaved = Some(UnsavedExchange {
             reason: "запись обмена в сервис ещё не подтверждена".to_string(),
             messages: exchange.clone(),
@@ -4016,6 +4494,7 @@ fn handle_chat_event(
     let ui = state.chat_ui.entry(chat_id).or_default();
     ui.pending = false;
     ui.pending_since = None;
+    ui.tool_running = None;
     ui.auto_scroll = false;
     ui.scroll_to_message = Some(last_index);
 }
@@ -4130,6 +4609,9 @@ fn handle_chat_updated(chat_id: String, result: Result<ChatSummary, String>, sta
                 chat.settings = summary.settings;
                 chat.updated_at = summary.updated_at.max(0) as u64;
             }
+            // Инструменты выключили или сменили репозиторий — процесс,
+            // который больше никому не нужен, останавливается.
+            release_unused_tool_servers(state);
         }
         Err(reason) => state.notify(format!("Изменение чата не сохранено: {reason}")),
     }
@@ -4598,6 +5080,83 @@ fn render_ui(f: &mut Frame, state: &mut AppState) {
     if let Some(picker) = &state.task {
         render_task_popup(f, picker);
     }
+    // Последним: подтверждение перекрывает любое окно.
+    if let Some(request) = state.tool_approvals.front() {
+        render_tool_approval_popup(f, request, state.tool_approvals.len());
+    }
+}
+
+/// Аргументы вызова построчно: полное сообщение коммита, список файлов, имя
+/// ветки — человек должен видеть ровно то, что будет выполнено.
+fn tool_arguments_lines(arguments: &serde_json::Value) -> Vec<String> {
+    let Some(object) = arguments.as_object() else {
+        return vec![format!("аргументы: {arguments}")];
+    };
+    if object.is_empty() {
+        return vec!["без аргументов".to_string()];
+    }
+    let mut lines = Vec::new();
+    for (key, value) in object {
+        match value {
+            serde_json::Value::String(text) if text.contains('\n') => {
+                lines.push(format!("{key}:"));
+                lines.extend(text.lines().map(|line| format!("  {line}")));
+            }
+            serde_json::Value::String(text) => lines.push(format!("{key}: {text}")),
+            serde_json::Value::Array(items) => {
+                lines.push(format!("{key}:"));
+                lines.extend(items.iter().map(|item| match item {
+                    serde_json::Value::String(text) => format!("  • {text}"),
+                    other => format!("  • {other}"),
+                }));
+            }
+            other => lines.push(format!("{key}: {other}")),
+        }
+    }
+    lines
+}
+
+/// Подтверждение пишущего вызова инструмента: имя, аргументы целиком.
+fn render_tool_approval_popup(f: &mut Frame, request: &ToolApprovalRequest, queued: usize) {
+    let argument_lines = tool_arguments_lines(&request.call.arguments);
+    let height = (argument_lines.len() as u16 + 8).min(f.area().height.saturating_sub(2)).max(8);
+    let area = centered_rect(70, height, f.area());
+    f.render_widget(Clear, area);
+
+    let title = if queued > 1 {
+        format!(" Подтвердите вызов инструмента (в очереди ещё {}) ", queued - 1)
+    } else {
+        " Подтвердите вызов инструмента ".to_string()
+    };
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Yellow))
+        .title(title);
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    let mut lines = vec![
+        Line::from(Span::styled(
+            format!(" Чат «{}» просит выполнить {}", request.chat_title, request.call.name),
+            Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+        )),
+        Line::from(Span::styled(
+            " Инструмент изменяет репозиторий.",
+            Style::default().fg(Color::DarkGray),
+        )),
+        Line::raw(""),
+    ];
+    lines.extend(
+        argument_lines
+            .into_iter()
+            .map(|line| Line::from(Span::styled(format!(" {line}"), Style::default().fg(Color::Cyan)))),
+    );
+    lines.push(Line::raw(""));
+    lines.push(Line::from(Span::styled(
+        " y / д / Enter — выполнить · n / н / Esc — отклонить",
+        Style::default().fg(Color::DarkGray),
+    )));
+    f.render_widget(Paragraph::new(Text::from(lines)).wrap(Wrap { trim: false }), inner);
 }
 
 /// Подтверждение удаления чата: удаление необратимо, поэтому спрашиваем явно.
@@ -5146,11 +5705,12 @@ fn render_history(
         let elapsed = pending_since
             .map(|since| format!(" {:.1} с", since.elapsed().as_secs_f64()))
             .unwrap_or_default();
+        let activity = match state.chat_ui.get(chat_id).and_then(|u| u.tool_running.as_deref()) {
+            Some(tool) => format!("Выполняется инструмент {tool}..."),
+            None => "Агент думает...".to_string(),
+        };
         tail.push(Line::from(Span::styled(
-            format!(
-                "{} Агент думает...{elapsed}",
-                SPINNER_FRAMES[state.spinner_frame]
-            ),
+            format!("{} {activity}{elapsed}", SPINNER_FRAMES[state.spinner_frame]),
             Style::default().fg(Color::Magenta),
         )));
     }
@@ -5291,6 +5851,11 @@ fn message_fingerprint(entry: &Message, show_reasoning: bool, selected: bool) ->
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     entry.content.hash(&mut hasher);
     entry.reasoning.hash(&mut hasher);
+    entry.tool_name.hash(&mut hasher);
+    for call in &entry.tool_calls {
+        call.name.hash(&mut hasher);
+        call.arguments.to_string().hash(&mut hasher);
+    }
     show_reasoning.hash(&mut hasher);
     selected.hash(&mut hasher);
     // Из телеметрии в строках видны только модель и время в заголовке.
@@ -5355,10 +5920,42 @@ fn render_message_lines(
             )));
         }
     }
-    let rendered = agent_skin().term_text(&entry.content).to_string();
-    match rendered.into_text() {
-        Ok(text) => lines.extend(text.lines),
-        Err(_) => lines.push(Line::raw(entry.content.clone())),
+    // Вызовы инструментов показываются строками «имя(аргументы)»: у такого
+    // ответа модели текста обычно нет, и без них сообщение было бы пустым.
+    for call in &entry.tool_calls {
+        lines.push(Line::from(Span::styled(
+            format!("  ⚙ {}({})", call.name, call.arguments),
+            Style::default().fg(Color::Magenta),
+        )));
+    }
+    // Результат инструмента свёрнут: вывод `git_diff` занял бы весь экран.
+    // Целиком он виден в режиме выбора сообщения (Ctrl+G), где его же
+    // можно скопировать.
+    if matches!(entry.role, Role::Tool) && !selected {
+        let count = entry.content.lines().count();
+        lines.push(Line::from(Span::styled(
+            format!(
+                "  ▸ {} — {count} стр. результата (Ctrl+G — показать)",
+                entry.tool_name.as_deref().unwrap_or("результат")
+            ),
+            Style::default().fg(Color::Magenta).add_modifier(Modifier::DIM),
+        )));
+        lines.push(Line::raw(""));
+        return lines;
+    }
+    if matches!(entry.role, Role::Tool) {
+        for line in entry.content.lines() {
+            lines.push(Line::raw(format!("  {line}")));
+        }
+        lines.push(Line::raw(""));
+        return lines;
+    }
+    if !entry.content.is_empty() || entry.tool_calls.is_empty() {
+        let rendered = agent_skin().term_text(&entry.content).to_string();
+        match rendered.into_text() {
+            Ok(text) => lines.extend(text.lines),
+            Err(_) => lines.push(Line::raw(entry.content.clone())),
+        }
     }
     lines.push(Line::raw(""));
     lines
@@ -5579,6 +6176,12 @@ fn empty_field_hint(field: FormatField, editor: &SettingsEditor) -> String {
         FormatField::ContextLimit => {
             "не задан — действует операторский лимит сервиса".to_string()
         }
+        FormatField::GitRepository => "не задан — укажите путь к git-репозиторию".to_string(),
+        FormatField::GitAllowedTools => "не заданы — только читающие инструменты".to_string(),
+        FormatField::ToolMaxIterations => format!(
+            "не задан — {}",
+            agentcore::config::DEFAULT_TOOL_MAX_ITERATIONS
+        ),
         FormatField::SummaryKeepMessages
         | FormatField::SummaryStepMessages
         | FormatField::ContextWindowMessages
@@ -5666,6 +6269,12 @@ fn render_settings_fields(f: &mut Frame, editor: &SettingsEditor, area: Rect) {
                 "off" => "Выключен".to_string(),
                 _ => "Умолчание сервиса".to_string(),
             },
+            FormatField::GitToolsEnabled => {
+                if editor.git_tools_enabled { "Включены" } else { "Выключены" }.to_string()
+            }
+            FormatField::GitRepository => editor.git_repository.clone(),
+            FormatField::GitAllowedTools => editor.git_allowed_tools.clone(),
+            FormatField::ToolMaxIterations => editor.tool_max_iterations.clone(),
             FormatField::Mode => {
                 if editor.custom_mode {
                     "Кастомный".to_string()
@@ -6312,6 +6921,8 @@ mod tests {
             model_choices: Vec::new(),
             profile_choices: Vec::new(),
             history_areas: Vec::new(),
+            tool_servers: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            tool_approvals: VecDeque::new(),
         }
     }
 
@@ -7335,4 +7946,245 @@ mod tests {
         assert_eq!(offset, 1);
         assert_eq!(lines.first().map(String::as_str), Some("b"));
     }
+
+    // --- Git-инструменты ---
+
+    fn key(code: KeyCode) -> crossterm::event::KeyEvent {
+        crossterm::event::KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    fn git_call(name: &str) -> ToolCall {
+        ToolCall {
+            id: "call_0".to_string(),
+            name: name.to_string(),
+            arguments: serde_json::json!({ "message": "Первая строка\nвторая строка", "files": ["a.txt", "b.txt"] }),
+        }
+    }
+
+    #[test]
+    fn tool_approval_keys_map_to_decisions() {
+        assert_eq!(tool_approval_decision(KeyCode::Char('y')), Some(true));
+        assert_eq!(tool_approval_decision(KeyCode::Char('д')), Some(true));
+        assert_eq!(tool_approval_decision(KeyCode::Enter), Some(true));
+        assert_eq!(tool_approval_decision(KeyCode::Char('n')), Some(false));
+        assert_eq!(tool_approval_decision(KeyCode::Char('н')), Some(false));
+        assert_eq!(tool_approval_decision(KeyCode::Esc), Some(false));
+        assert_eq!(tool_approval_decision(KeyCode::Char('x')), None);
+    }
+
+    #[test]
+    fn approval_popup_answers_first_request_in_queue() {
+        let mut state = test_state();
+        let (first_reply, first) = tokio::sync::oneshot::channel();
+        let (second_reply, mut second) = tokio::sync::oneshot::channel();
+        for (reply, name) in [(first_reply, "git_add"), (second_reply, "git_commit")] {
+            state.tool_approvals.push_back(ToolApprovalRequest {
+                chat_title: "Чат".to_string(),
+                call: git_call(name),
+                reply,
+            });
+        }
+
+        // Посторонняя клавиша ничего не решает.
+        handle_tool_approval_key(key(KeyCode::Char('x')), &mut state);
+        assert_eq!(state.tool_approvals.len(), 2);
+
+        handle_tool_approval_key(key(KeyCode::Char('y')), &mut state);
+        assert_eq!(first.blocking_recv(), Ok(true));
+        assert_eq!(state.tool_approvals.len(), 1);
+        assert!(second.try_recv().is_err(), "второй запрос ещё ждёт");
+
+        handle_tool_approval_key(key(KeyCode::Esc), &mut state);
+        assert_eq!(second.blocking_recv(), Ok(false));
+        assert!(state.tool_approvals.is_empty());
+    }
+
+    #[test]
+    fn dropped_approval_request_reads_as_refusal() {
+        let mut state = test_state();
+        let (reply, answer) = tokio::sync::oneshot::channel::<bool>();
+        state.tool_approvals.push_back(ToolApprovalRequest {
+            chat_title: "Чат".to_string(),
+            call: git_call("git_add"),
+            reply,
+        });
+        // Выход из TUI очищает очередь: отправитель уничтожен.
+        state.tool_approvals.clear();
+        assert!(answer.blocking_recv().is_err());
+    }
+
+    #[test]
+    fn tool_arguments_are_shown_in_full() {
+        let lines = tool_arguments_lines(&git_call("git_commit").arguments);
+        assert!(lines.contains(&"message:".to_string()));
+        assert!(lines.contains(&"  вторая строка".to_string()));
+        assert!(lines.contains(&"  • b.txt".to_string()));
+        assert_eq!(tool_arguments_lines(&serde_json::json!({})), vec!["без аргументов".to_string()]);
+    }
+
+    fn git_session(settings: ChatSettings) -> ChatSession {
+        ChatSession {
+            id: "chat-1".to_string(),
+            title: "Чат".to_string(),
+            messages: Vec::new(),
+            updated_at: 0,
+            settings,
+            history_loaded: true,
+        }
+    }
+
+    #[test]
+    fn tools_section_keeps_all_four_settings() {
+        let session = git_session(ChatSettings {
+            git_tools_enabled: Some(true),
+            git_repository: Some("/tmp/repo".to_string()),
+            git_allowed_tools: Some(vec!["git_add".to_string(), "git_commit".to_string()]),
+            tool_max_iterations: Some(4),
+            ..ChatSettings::default()
+        });
+        let mut editor = SettingsEditor::from_chat(&session, &Config::default(), &[], &[], &[]);
+        editor.section = SettingsSection::ALL
+            .iter()
+            .position(|s| *s == SettingsSection::Tools)
+            .expect("раздел «Инструменты» существует");
+        assert_eq!(editor.visible_fields().len(), 4);
+        assert_eq!(editor.build_git_tools_enabled(), Some(true));
+        assert_eq!(editor.build_git_repository().as_deref(), Some("/tmp/repo"));
+        assert_eq!(
+            editor.build_git_allowed_tools(),
+            Some(vec!["git_add".to_string(), "git_commit".to_string()])
+        );
+        assert_eq!(editor.build_tool_max_iterations(), Ok(Some(4)));
+
+        editor.tool_max_iterations = "100".to_string();
+        assert!(editor.build_tool_max_iterations().is_err());
+
+        // Выключение прячет параметры и снимает флаг.
+        editor.pane = SettingsPane::Fields;
+        editor.field = 0;
+        editor.toggle_git_tools(false);
+        assert!(editor.visible_fields() == vec![FormatField::GitToolsEnabled]);
+        assert_eq!(editor.build_git_tools_enabled(), None);
+    }
+
+    fn ollama_state_with_turn() -> AppState {
+        let mut state = test_state();
+        let mut summary = summary("chat-1", "Первый", 2);
+        summary.settings.provider = Provider::Ollama;
+        handle_chats_loaded(Ok(vec![summary]), &mut state, &channel());
+        let chat = &mut state.chats[0];
+        chat.history_loaded = true;
+        chat.messages = vec![
+            Message::user("прежний вопрос"),
+            Message::assistant("прежний ответ"),
+            Message::user("покажи статус"),
+            Message::assistant_with_tool_calls("", vec![git_call("git_status")]),
+            Message::tool_result("call_0", "git_status", "clean"),
+        ];
+        state.chat_ui.entry("chat-1".to_string()).or_default().pending = true;
+        state
+    }
+
+    fn reply(content: &str) -> AgentReply {
+        AgentReply {
+            content: content.to_string(),
+            reasoning: None,
+            meta: MessageMeta::default(),
+            model: None,
+            policy: None,
+            context: None,
+            tool_calls: Vec::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn ollama_tool_turn_is_appended_whole() {
+        let mut state = ollama_state_with_turn();
+        handle_response("chat-1".to_string(), Ok(reply("всё чисто")), 0, &mut state, &channel());
+
+        let unsaved = state.chat_ui["chat-1"].unsaved.as_ref().expect("ход отправлен на запись");
+        let roles: Vec<String> = unsaved
+            .messages
+            .iter()
+            .map(|m| serde_json::to_value(m.role).unwrap().as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(roles, vec!["user", "assistant", "tool", "assistant"]);
+        assert_eq!(unsaved.messages[0].content, "покажи статус");
+        assert_eq!(unsaved.messages[3].content, "всё чисто");
+        assert!(!state.chat_ui["chat-1"].pending);
+    }
+
+    #[tokio::test]
+    async fn failed_ollama_turn_after_executed_call_appends_executed_part() {
+        let mut state = ollama_state_with_turn();
+        handle_response(
+            "chat-1".to_string(),
+            Err(anyhow::anyhow!("модель недоступна")),
+            1,
+            &mut state,
+            &channel(),
+        );
+        let unsaved = state.chat_ui["chat-1"].unsaved.as_ref().expect("выполненная часть записывается");
+        assert_eq!(unsaved.messages.len(), 3, "реплика, вызов и результат — без текста ошибки");
+        assert!(unsaved.messages.iter().all(|m| !m.content.starts_with("Ошибка")));
+    }
+
+    #[tokio::test]
+    async fn failed_ollama_turn_without_executed_calls_is_not_appended() {
+        let mut state = ollama_state_with_turn();
+        handle_response(
+            "chat-1".to_string(),
+            Err(anyhow::anyhow!("модель недоступна")),
+            0,
+            &mut state,
+            &channel(),
+        );
+        assert!(state.chat_ui["chat-1"].unsaved.is_none());
+    }
+
+    #[test]
+    fn server_start_failure_returns_line_to_input() {
+        let mut state = test_state();
+        handle_chats_loaded(Ok(vec![summary("chat-1", "Первый", 0)]), &mut state, &channel());
+        state.chats[0].messages.push(Message::user("покажи статус"));
+        state.chat_ui.entry("chat-1".to_string()).or_default().pending = true;
+
+        handle_tool_server_failed(
+            "chat-1".to_string(),
+            "покажи статус".to_string(),
+            "не найден uvx".to_string(),
+            &mut state,
+        );
+
+        assert!(state.chats[0].messages.is_empty());
+        let ui = &state.chat_ui["chat-1"];
+        assert_eq!(ui.input, "покажи статус");
+        assert!(!ui.pending);
+        assert!(state.active_notice().unwrap().contains("uvx"));
+    }
+
+    #[test]
+    fn tool_messages_render_collapsed_until_selected() {
+        let result = Message::tool_result("call_0", "git_diff", "строка 1\nстрока 2\nстрока 3");
+        let collapsed: Vec<String> = render_message_lines(&result, true, false)
+            .iter()
+            .map(|line| line.to_string())
+            .collect();
+        assert!(collapsed.iter().any(|line| line.contains("git_diff — 3 стр.")));
+        assert!(!collapsed.iter().any(|line| line.contains("строка 2")));
+
+        let expanded: Vec<String> = render_message_lines(&result, true, true)
+            .iter()
+            .map(|line| line.to_string())
+            .collect();
+        assert!(expanded.iter().any(|line| line.contains("строка 2")));
+
+        let call = Message::assistant_with_tool_calls("", vec![git_call("git_status")]);
+        let lines: Vec<String> = render_message_lines(&call, true, false)
+            .iter()
+            .map(|line| line.to_string())
+            .collect();
+        assert!(lines.iter().any(|line| line.contains("⚙ git_status(")));
+    }
 }
+
