@@ -126,22 +126,27 @@ impl ExchangeLog {
         self.send(ExchangeKind::Response, RESPONSES_FILE, entry);
     }
 
+    /// Каждая запись проходит `redact_secrets`: результаты инструментов
+    /// (диффы, логи) попадают и в журнал вызовов инструментов, и в тела
+    /// запросов к модели, и одно место маскирования закрывает все пути.
     fn send<T: Serialize>(&self, kind: ExchangeKind, file: &'static str, entry: &T) {
+        if matches!(self.destination, Destination::Disabled) {
+            return;
+        }
+        let Ok(value) = serde_json::to_value(entry) else {
+            return;
+        };
+        let value = redact_secrets(&value);
         match &self.destination {
             Destination::Disabled => {}
             Destination::Dir { sender, .. } => {
                 let Some(sender) = sender else { return };
-                let Ok(line) = serde_json::to_string(entry) else {
+                let Ok(line) = serde_json::to_string(&value) else {
                     return;
                 };
                 let _ = sender.send(LogLine { file, line });
             }
-            Destination::Sink(sink) => {
-                let Ok(value) = serde_json::to_value(entry) else {
-                    return;
-                };
-                sink.record(kind, &value);
-            }
+            Destination::Sink(sink) => sink.record(kind, &value),
         }
     }
 
@@ -177,6 +182,106 @@ fn writer_loop(dir: PathBuf, receiver: Receiver<LogLine>) {
             let _ = writeln!(file, "{}", entry.line);
         }
     }
+}
+
+/// Префиксы, с которых начинаются ключи распространённых сервисов.
+const SECRET_PREFIXES: [&str; 5] = ["sk-", "ghp_", "github_pat_", "xox", "AKIA"];
+
+/// Ключи, значение после которых (`ключ=значение`) считается секретом.
+const SECRET_ASSIGNMENTS: [&str; 4] = ["password=", "token=", "secret=", "api_key="];
+
+/// Минимальная длина ключа с префиксом: короче — скорее обычное слово
+/// (`sk-learn`), чем ключ.
+const MIN_PREFIXED_SECRET_LEN: usize = 12;
+
+/// Копия JSON, в строках которой замаскированы значения, похожие на
+/// секреты: ключи с известными префиксами, `Bearer <…>` и значения после
+/// `password=`, `token=`, `secret=`, `api_key=`.
+///
+/// Регулярных выражений в ядре нет, а правила простые, поэтому разбор
+/// ручной. Маска — как `mask` у сервиса (`secr***alue`): по краям видно,
+/// какой ключ был, но не он сам.
+pub fn redact_secrets(value: &serde_json::Value) -> serde_json::Value {
+    use serde_json::Value;
+    match value {
+        Value::String(text) => Value::String(redact_text(text)),
+        Value::Array(items) => Value::Array(items.iter().map(redact_secrets).collect()),
+        Value::Object(map) => Value::Object(
+            map.iter()
+                .map(|(key, value)| (key.clone(), redact_secrets(value)))
+                .collect(),
+        ),
+        other => other.clone(),
+    }
+}
+
+fn is_token_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || c == '_' || c == '-'
+}
+
+/// Символы, которыми заканчивается значение после `ключ=` или `Bearer `.
+fn ends_value(c: char) -> bool {
+    c.is_whitespace() || matches!(c, '"' | '\'' | '&' | ',' | ';' | ')' | ']' | '}')
+}
+
+fn mask_secret(secret: &str) -> String {
+    let chars: Vec<char> = secret.chars().collect();
+    match chars.len() {
+        n if n <= 8 => "*".repeat(n),
+        n => {
+            let head: String = chars[..4].iter().collect();
+            let tail: String = chars[n - 4..].iter().collect();
+            format!("{head}***{tail}")
+        }
+    }
+}
+
+fn redact_text(text: &str) -> String {
+    let chars: Vec<char> = text.chars().collect();
+    let lower: Vec<char> = chars.iter().map(|c| c.to_ascii_lowercase()).collect();
+    let starts_with = |haystack: &[char], at: usize, needle: &str| {
+        let needle: Vec<char> = needle.chars().collect();
+        haystack.len() >= at + needle.len() && haystack[at..at + needle.len()] == needle[..]
+    };
+    let mut out = String::with_capacity(text.len());
+    let mut i = 0;
+    'scan: while i < chars.len() {
+        let at_boundary = i == 0 || !is_token_char(chars[i - 1]);
+        if at_boundary {
+            for prefix in SECRET_PREFIXES {
+                if starts_with(&chars, i, prefix) {
+                    let end = (i..chars.len())
+                        .find(|&j| !is_token_char(chars[j]))
+                        .unwrap_or(chars.len());
+                    if end - i >= MIN_PREFIXED_SECRET_LEN {
+                        let token: String = chars[i..end].iter().collect();
+                        out.push_str(&mask_secret(&token));
+                        i = end;
+                        continue 'scan;
+                    }
+                }
+            }
+            let markers = ["bearer "].into_iter().chain(SECRET_ASSIGNMENTS);
+            for marker in markers {
+                if starts_with(&lower, i, marker) {
+                    let start = i + marker.chars().count();
+                    let end = (start..chars.len())
+                        .find(|&j| ends_value(chars[j]))
+                        .unwrap_or(chars.len());
+                    if end > start {
+                        out.extend(&chars[i..start]);
+                        let secret: String = chars[start..end].iter().collect();
+                        out.push_str(&mask_secret(&secret));
+                        i = end;
+                        continue 'scan;
+                    }
+                }
+            }
+        }
+        out.push(chars[i]);
+        i += 1;
+    }
+    out
 }
 
 pub fn unix_timestamp() -> u64 {
@@ -284,5 +389,49 @@ mod tests {
         });
         log.shutdown();
         assert!(!dir.exists());
+    }
+
+    #[test]
+    fn secrets_are_masked_in_written_journal() {
+        let dir = temp_dir("redact");
+        let log = ExchangeLog::to_dir(dir.clone());
+        log.log_request(&RequestLogEntry {
+            id: "id-4",
+            timestamp: 42,
+            url: "mcp+stdio://mcp-server-git/tools/call",
+            model: "git_diff",
+            request: serde_json::json!({
+                "diff": "+OPENAI_KEY=sk-abcdefghijklmnop1234\n+db password=hunter2secret",
+                "nested": ["Authorization: Bearer abcdef0123456789"],
+            }),
+        });
+        log.shutdown();
+
+        let content = std::fs::read_to_string(dir.join(REQUESTS_FILE)).expect("файл журнала");
+        assert!(!content.contains("sk-abcdefghijklmnop1234"), "{content}");
+        assert!(!content.contains("hunter2secret"), "{content}");
+        assert!(!content.contains("abcdef0123456789"), "{content}");
+        assert!(content.contains("sk-a***1234"), "{content}");
+        assert!(content.contains("password=hunt***cret"), "{content}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ordinary_text_is_not_redacted() {
+        let value = serde_json::json!({
+            "text": "task-list sk-learn tokens=3 xoxo disk-usage",
+            "n": 5,
+        });
+        assert_eq!(redact_secrets(&value), value);
+    }
+
+    #[test]
+    fn prefixed_keys_are_masked() {
+        let value = serde_json::json!("ключ ghp_0123456789abcdefABCD и AKIAABCDEFGHIJKLMNOP");
+        let redacted = redact_secrets(&value);
+        let text = redacted.as_str().unwrap();
+        assert!(!text.contains("ghp_0123456789abcdefABCD"));
+        assert!(!text.contains("AKIAABCDEFGHIJKLMNOP"));
+        assert!(text.starts_with("ключ ghp_***ABCD"));
     }
 }

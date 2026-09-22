@@ -50,6 +50,17 @@ pub enum AgentError {
         message: String,
         request_id: Option<String>,
     },
+    /// Модель или провайдер не умеют вызывать инструменты.
+    ToolsUnsupported {
+        model: Option<String>,
+        request_id: Option<String>,
+    },
+    /// Сервер инструментов (MCP) не запустился, не прошёл рукопожатие или
+    /// упал и не перезапустился.
+    ToolServerUnavailable { server: String, reason: String },
+    /// Модель продолжает вызывать инструменты после исчерпания лимита
+    /// итераций и финального запроса без инструментов.
+    ToolLoopLimit { iterations: u32 },
 }
 
 impl AgentError {
@@ -78,10 +89,13 @@ impl AgentError {
             | AgentError::Unauthorized { request_id, .. }
             | AgentError::InvalidRequest { request_id, .. }
             | AgentError::PolicyRejected { request_id, .. }
-            | AgentError::RateLimited { request_id, .. } => request_id.as_deref(),
-            AgentError::Transport(_) | AgentError::MissingApiKey { .. } | AgentError::Decode(_) => {
-                None
-            }
+            | AgentError::RateLimited { request_id, .. }
+            | AgentError::ToolsUnsupported { request_id, .. } => request_id.as_deref(),
+            AgentError::Transport(_)
+            | AgentError::MissingApiKey { .. }
+            | AgentError::Decode(_)
+            | AgentError::ToolServerUnavailable { .. }
+            | AgentError::ToolLoopLimit { .. } => None,
         }
     }
 }
@@ -153,6 +167,23 @@ impl fmt::Display for AgentError {
                 "превышен предел нагрузки: {message}{}",
                 request_id_suffix(request_id)
             ),
+            AgentError::ToolsUnsupported { model, request_id } => {
+                let suffix = request_id_suffix(request_id);
+                match model {
+                    Some(model) => write!(
+                        f,
+                        "модель {model} не поддерживает вызов инструментов{suffix}"
+                    ),
+                    None => write!(f, "модель не поддерживает вызов инструментов{suffix}"),
+                }
+            }
+            AgentError::ToolServerUnavailable { server, reason } => {
+                write!(f, "сервер инструментов {server} недоступен: {reason}")
+            }
+            AgentError::ToolLoopLimit { iterations } => write!(
+                f,
+                "модель продолжает вызывать инструменты после {iterations} итераций"
+            ),
         }
     }
 }
@@ -186,5 +217,35 @@ mod tests {
             .to_string();
         assert!(text.starts_with(MISSING_API_KEY_MESSAGE));
         assert!(text.contains("agentcli config set-key"));
+    }
+
+    #[test]
+    fn tool_errors_downcast_from_anyhow() {
+        let errors = [
+            AgentError::ToolsUnsupported {
+                model: Some("gemma".into()),
+                request_id: Some("req-1".into()),
+            },
+            AgentError::ToolServerUnavailable {
+                server: "mcp-server-git".into(),
+                reason: "не найден uvx".into(),
+            },
+            AgentError::ToolLoopLimit { iterations: 8 },
+        ];
+        for error in errors {
+            let wrapped: anyhow::Error = error.clone().into();
+            assert_eq!(wrapped.downcast_ref::<AgentError>(), Some(&error));
+        }
+    }
+
+    #[test]
+    fn tools_unsupported_exposes_request_id() {
+        let error = AgentError::ToolsUnsupported {
+            model: None,
+            request_id: Some("req-7".into()),
+        };
+        assert_eq!(error.request_id(), Some("req-7"));
+        assert!(error.to_string().contains("req-7"));
+        assert_eq!(AgentError::ToolLoopLimit { iterations: 3 }.request_id(), None);
     }
 }

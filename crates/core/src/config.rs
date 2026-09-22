@@ -448,9 +448,43 @@ pub struct ChatSettings {
     /// (`AGENTD_TASK_STATE_AUTO_ENABLED`).
     #[serde(default)]
     pub task_state_auto_enabled: Option<bool>,
+    /// Подключает git-инструменты (`mcp-server-git`) к ходам этого чата.
+    /// `None`/`false` — инструменты не подключаются. Сервис поле только
+    /// хранит: инструменты запускает и выполняет клиент.
+    #[serde(default)]
+    pub git_tools_enabled: Option<bool>,
+    /// Путь к репозиторию на машине клиента (`--repository` сервера).
+    #[serde(default)]
+    pub git_repository: Option<String>,
+    /// Разрешённые модели инструменты. `None` — только читающие; пишущие
+    /// попадают к модели, лишь если перечислены явно.
+    #[serde(default)]
+    pub git_allowed_tools: Option<Vec<String>>,
+    /// Лимит итераций цикла инструментов. `None` —
+    /// `DEFAULT_TOOL_MAX_ITERATIONS`, потолок — `MAX_TOOL_ITERATIONS`.
+    #[serde(default)]
+    pub tool_max_iterations: Option<u32>,
 }
 
+/// Лимит итераций цикла инструментов, если чат его не задал.
+pub const DEFAULT_TOOL_MAX_ITERATIONS: u32 = 8;
+/// Потолок лимита итераций: модель, зациклившаяся на вызовах, не должна
+/// жечь запросы без конца даже при неосторожной настройке.
+pub const MAX_TOOL_ITERATIONS: u32 = 32;
+
 impl ChatSettings {
+    /// Включены ли git-инструменты в этом чате.
+    pub fn git_tools_active(&self) -> bool {
+        self.git_tools_enabled == Some(true)
+    }
+
+    /// Действующий лимит итераций цикла инструментов: от 1 до потолка.
+    pub fn effective_tool_max_iterations(&self) -> u32 {
+        self.tool_max_iterations
+            .unwrap_or(DEFAULT_TOOL_MAX_ITERATIONS)
+            .clamp(1, MAX_TOOL_ITERATIONS)
+    }
+
     /// Системный промпт выбранной стратегии рассуждения
     pub fn reasoning_prompt(&self) -> Option<String> {
         self.reasoning.system_prompt(&self.experts)
@@ -527,6 +561,17 @@ pub struct Config {
     /// содержимое.
     #[serde(default)]
     pub invariants_path: Option<String>,
+    /// Умолчания git-инструментов для НОВЫХ чатов, по тому же правилу, что
+    /// и `max_context_tokens`. Их же использует `agentcli ask`, у которого
+    /// чата нет.
+    #[serde(default)]
+    pub git_tools_enabled: Option<bool>,
+    #[serde(default)]
+    pub git_repository: Option<String>,
+    #[serde(default)]
+    pub git_allowed_tools: Option<Vec<String>>,
+    #[serde(default)]
+    pub tool_max_iterations: Option<u32>,
 }
 
 impl Config {
@@ -601,6 +646,10 @@ impl Config {
             profile_id: None,
             task_state_enabled: None,
             task_state_auto_enabled: None,
+            git_tools_enabled: self.git_tools_enabled,
+            git_repository: self.git_repository.clone(),
+            git_allowed_tools: self.git_allowed_tools.clone(),
+            tool_max_iterations: self.tool_max_iterations,
         }
     }
 
@@ -737,6 +786,44 @@ client_token = "t"
         assert_eq!(settings.summary_enabled, None);
         assert_eq!(settings.summary_keep_messages, None);
         assert_eq!(settings.summary_step_messages, None);
+    }
+
+    #[test]
+    fn old_chat_settings_without_git_tools_fields_parse_as_none() {
+        let settings: ChatSettings = serde_json::from_str("{}").expect("настройки чата");
+        assert_eq!(settings.git_tools_enabled, None);
+        assert_eq!(settings.git_repository, None);
+        assert_eq!(settings.git_allowed_tools, None);
+        assert_eq!(settings.tool_max_iterations, None);
+        assert!(!settings.git_tools_active());
+        assert_eq!(settings.effective_tool_max_iterations(), DEFAULT_TOOL_MAX_ITERATIONS);
+    }
+
+    #[test]
+    fn tool_max_iterations_is_clamped() {
+        let mut settings = ChatSettings {
+            tool_max_iterations: Some(1000),
+            ..ChatSettings::default()
+        };
+        assert_eq!(settings.effective_tool_max_iterations(), MAX_TOOL_ITERATIONS);
+        settings.tool_max_iterations = Some(0);
+        assert_eq!(settings.effective_tool_max_iterations(), 1);
+    }
+
+    #[test]
+    fn new_chat_inherits_git_tools_defaults_from_config() {
+        let config = Config {
+            git_tools_enabled: Some(true),
+            git_repository: Some("/tmp/repo".into()),
+            git_allowed_tools: Some(vec!["git_add".into()]),
+            tool_max_iterations: Some(4),
+            ..Config::default()
+        };
+        let chat = config.default_chat_settings();
+        assert!(chat.git_tools_active());
+        assert_eq!(chat.git_repository.as_deref(), Some("/tmp/repo"));
+        assert_eq!(chat.git_allowed_tools, Some(vec!["git_add".to_string()]));
+        assert_eq!(chat.tool_max_iterations, Some(4));
     }
 
     #[test]

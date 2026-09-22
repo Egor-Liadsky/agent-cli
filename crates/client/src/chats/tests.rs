@@ -207,6 +207,10 @@ fn settings_with(provider: Provider, model: &str) -> ChatSettings {
         profile_id: None,
         task_state_enabled: None,
         task_state_auto_enabled: None,
+        git_tools_enabled: None,
+        git_repository: None,
+        git_allowed_tools: None,
+        tool_max_iterations: None,
     }
 }
 
@@ -697,6 +701,7 @@ async fn append_sends_both_replies_in_one_request_with_telemetry() {
             model: Some("llama3".to_string()),
             ..MessageMeta::default()
         }),
+        ..Message::assistant("")
     };
     let seqs = chats(&server, "token-a")
         .append("chat-1", &[Message::user("вопрос"), assistant])

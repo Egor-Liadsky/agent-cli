@@ -147,6 +147,12 @@ impl OutputPolicy for InvariantGuard {
         if context.invariants.is_empty() {
             return Ok(PolicyOutcome::Pass);
         }
+        // Промежуточный ответ из одних вызовов инструментов текста не несёт:
+        // служебный запрос к модели на каждой итерации цикла стоил бы
+        // дороже, чем даёт. Аргументы пишущих вызовов проверяет человек.
+        if reply.content.trim().is_empty() {
+            return Ok(PolicyOutcome::Pass);
+        }
 
         let history = Self::prompt(&context.invariants, &reply.content);
         let verdict_reply = self.agent.ask(&history, &context.settings).await?;
@@ -295,6 +301,7 @@ category = "security"
                 model: None,
                 policy: None,
                 context: None,
+                tool_calls: Vec::new(),
             })
         }
     }
@@ -312,6 +319,7 @@ category = "security"
             model: None,
             policy: None,
             context: None,
+            tool_calls: Vec::new(),
         }
     }
 
@@ -421,5 +429,27 @@ category = "security"
             }
         }
         assert_eq!(agent.calls(), 1, "InvariantGuard не должен вызывать агента при пустом наборе");
+    }
+
+    #[tokio::test]
+    async fn empty_content_passes_without_service_call() {
+        use crate::invariants::Invariant;
+
+        let agent = FakeAgent::new("не важно");
+        let guard = InvariantGuard::new(agent.clone());
+        let set = InvariantSet {
+            invariants: vec![Invariant {
+                id: "no-secrets".to_string(),
+                statement: "секреты не выводятся".to_string(),
+                category: "security".to_string(),
+                rationale: None,
+            }],
+        };
+        let outcome = guard
+            .check(&context_with(set), &reply("  "))
+            .await
+            .expect("проверка");
+        assert!(matches!(outcome, PolicyOutcome::Pass));
+        assert_eq!(agent.calls(), 0);
     }
 }

@@ -415,6 +415,7 @@ impl ServerAgent {
                 Role::User => "user",
                 Role::Assistant => "assistant",
                 Role::System => "system",
+                Role::Tool => "tool",
             },
             content: m.content.clone(),
         }));
@@ -574,6 +575,7 @@ impl ServerAgent {
             model: parsed.model.filter(|m| !m.trim().is_empty()),
             policy: parsed.policy,
             context: parsed.context.map(Into::into),
+            tool_calls: Vec::new(),
         })
     }
 }

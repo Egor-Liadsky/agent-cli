@@ -2359,7 +2359,8 @@ fn handle_settings_key(
                     let ollama_url = non_empty(&editor.ollama_url);
                     state.settings = None;
                     state.focus = Focus::Input;
-                    if state.chat_index(&chat_id).is_some() {
+                    if let Some(index) = state.chat_index(&chat_id) {
+                        let current = &state.chats[index].settings;
                         let settings = ChatSettings {
                             provider,
                             model,
@@ -2382,6 +2383,10 @@ fn handle_settings_key(
                             profile_id,
                             task_state_enabled,
                             task_state_auto_enabled,
+                            git_tools_enabled: current.git_tools_enabled,
+                            git_repository: current.git_repository.clone(),
+                            git_allowed_tools: current.git_allowed_tools.clone(),
+                            tool_max_iterations: current.tool_max_iterations,
                         };
                         // Настройки чата хранит сервис: локально они
                         // применяются ответом на PATCH, а не сразу.
@@ -5308,6 +5313,7 @@ fn render_message_lines(
         Role::User => ("Вы", Color::Green),
         Role::Assistant => ("Агент", Color::Cyan),
         Role::System => ("Система", Color::Yellow),
+        Role::Tool => ("Инструмент", Color::Magenta),
     };
     // Подсвечиваем строку заголовка, а не весь блок: перекрашивать
     // многострочный отрисованный markdown значило бы потерять его разметку.
@@ -6040,6 +6046,7 @@ fn render_memory_popup(f: &mut Frame, picker: &MemoryPicker, short_term_tail: &[
                             Role::User => "Вы",
                             Role::Assistant => "Модель",
                             Role::System => "Система",
+                            Role::Tool => "Инструмент",
                         };
                         Line::from(Span::raw(format!(" {who}: {}", m.content)))
                     })

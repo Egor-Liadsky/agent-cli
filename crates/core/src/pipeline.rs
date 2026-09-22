@@ -5,7 +5,7 @@
 //! поэтому новое правило добавляется регистрацией реализации, а не правкой
 //! конвейера или обработчика транспортного уровня.
 
-use crate::agent::{Agent, AgentReply, Message};
+use crate::agent::{Agent, AgentReply, Message, Role, ToolSpec};
 use crate::config::ChatSettings;
 use crate::invariants::InvariantSet;
 use anyhow::Result;
@@ -108,6 +108,9 @@ pub struct RequestContext {
     /// Активные инварианты этого процесса: не приходят с запросом и не
     /// сериализуются в файл чата (design.md, «Отдельный тип `InvariantSet`»).
     pub invariants: InvariantSet,
+    /// Инструменты, доступные модели на этом вызове. Принадлежат запуску
+    /// клиента, а не чату, поэтому живут в контексте, а не в `settings`.
+    pub tools: Vec<ToolSpec>,
 }
 
 impl RequestContext {
@@ -119,6 +122,7 @@ impl RequestContext {
             client_id: None,
             policy: PolicyLog::default(),
             invariants: InvariantSet::default(),
+            tools: Vec::new(),
         }
     }
 
@@ -129,6 +133,11 @@ impl RequestContext {
 
     pub fn with_invariants(mut self, invariants: InvariantSet) -> Self {
         self.invariants = invariants;
+        self
+    }
+
+    pub fn with_tools(mut self, tools: Vec<ToolSpec>) -> Self {
+        self.tools = tools;
         self
     }
 }
@@ -314,8 +323,16 @@ impl Pipeline {
 
     /// Нормализация запроса: убираются сообщения, состоящие из одних пробелов,
     /// у остальных обрезаются краевые пробелы.
+    ///
+    /// Ответ модели из одних `tool_calls` и результат инструмента остаются
+    /// даже с пустым текстом: без них история хода с инструментами теряет
+    /// связь «вызов → результат», которую провайдер требует.
     fn normalize(history: &mut Vec<Message>) {
-        history.retain(|message| !message.content.trim().is_empty());
+        history.retain(|message| {
+            !message.content.trim().is_empty()
+                || !message.tool_calls.is_empty()
+                || matches!(message.role, Role::Tool)
+        });
         for message in history.iter_mut() {
             let trimmed = message.content.trim();
             if trimmed.len() != message.content.len() {
@@ -364,7 +381,11 @@ impl Pipeline {
 
         let mut reply = self
             .agent
-            .ask(&Self::history_with_invariants(&context), &context.settings)
+            .ask_with_tools(
+                &Self::history_with_invariants(&context),
+                &context.settings,
+                &context.tools,
+            )
             .await?;
 
         for policy in &self.output {
@@ -404,7 +425,9 @@ impl Pipeline {
             }
         }
 
-        if let Some(judge) = &self.judge {
+        // Промежуточный ответ (модель ещё собирает данные инструментами)
+        // оценивать нечего: судья смотрит только окончательный.
+        if let Some(judge) = self.judge.as_ref().filter(|_| reply.tool_calls.is_empty()) {
             let verdict = judge.review(&context, &reply, self.agent.as_ref()).await?;
             context.policy.judge = Some(verdict);
         }
@@ -419,22 +442,30 @@ impl Pipeline {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::agent::MessageMeta;
+    use crate::agent::{MessageMeta, ToolCall};
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     /// Агент без сети: считает вызовы и запоминает последнюю историю.
     struct FakeAgent {
         reply: String,
+        tool_calls: Vec<ToolCall>,
         calls: AtomicUsize,
         last_history: std::sync::Mutex<Vec<Message>>,
+        last_tools: std::sync::Mutex<Vec<ToolSpec>>,
     }
 
     impl FakeAgent {
         fn new(reply: &str) -> Arc<Self> {
+            Self::with_tool_calls(reply, Vec::new())
+        }
+
+        fn with_tool_calls(reply: &str, tool_calls: Vec<ToolCall>) -> Arc<Self> {
             Arc::new(Self {
                 reply: reply.to_string(),
+                tool_calls,
                 calls: AtomicUsize::new(0),
                 last_history: std::sync::Mutex::new(Vec::new()),
+                last_tools: std::sync::Mutex::new(Vec::new()),
             })
         }
 
@@ -449,9 +480,19 @@ mod tests {
 
     #[async_trait]
     impl Agent for FakeAgent {
-        async fn ask(&self, history: &[Message], _settings: &ChatSettings) -> Result<AgentReply> {
+        async fn ask(&self, history: &[Message], settings: &ChatSettings) -> Result<AgentReply> {
+            self.ask_with_tools(history, settings, &[]).await
+        }
+
+        async fn ask_with_tools(
+            &self,
+            history: &[Message],
+            _settings: &ChatSettings,
+            tools: &[ToolSpec],
+        ) -> Result<AgentReply> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             *self.last_history.lock().expect("история") = history.to_vec();
+            *self.last_tools.lock().expect("инструменты") = tools.to_vec();
             Ok(AgentReply {
                 content: self.reply.clone(),
                 reasoning: None,
@@ -459,6 +500,7 @@ mod tests {
                 model: None,
                 policy: None,
                 context: None,
+                tool_calls: self.tool_calls.clone(),
             })
         }
     }
@@ -765,5 +807,55 @@ mod tests {
         let (_, policy) = completed(pipeline.run(context()).await.expect("конвейер"));
         assert_eq!(policy.input[0].stage, "allow-all-input");
         assert_eq!(policy.input[1].stage, "rewrite-history");
+    }
+
+    fn git_status_call() -> ToolCall {
+        ToolCall {
+            id: "call_0".into(),
+            name: "git_status".into(),
+            arguments: serde_json::json!({}),
+        }
+    }
+
+    #[tokio::test]
+    async fn tool_calls_only_messages_survive_normalize() {
+        let agent = FakeAgent::new("ответ модели");
+        let context = RequestContext::new(
+            "req-1",
+            vec![
+                Message::user("статус?"),
+                Message::assistant_with_tool_calls("  ", vec![git_status_call()]),
+                Message::tool_result("call_0", "git_status", ""),
+            ],
+            ChatSettings::default(),
+        );
+        completed(Pipeline::new(agent.clone()).run(context).await.expect("конвейер"));
+        let history = agent.last_history();
+        assert_eq!(history.len(), 3);
+        assert_eq!(history[1].tool_calls.len(), 1);
+        assert!(matches!(history[2].role, Role::Tool));
+    }
+
+    #[tokio::test]
+    async fn judge_skips_intermediate_tool_call_reply() {
+        let agent = FakeAgent::with_tool_calls("", vec![git_status_call()]);
+        let pipeline = Pipeline::new(agent.clone()).with_judge(Arc::new(AskingJudge));
+        let (reply, policy) = completed(pipeline.run(context()).await.expect("конвейер"));
+        assert_eq!(reply.tool_calls.len(), 1);
+        assert!(policy.judge.is_none());
+        assert_eq!(agent.calls(), 1, "судья к модели не ходил");
+    }
+
+    #[tokio::test]
+    async fn request_tools_reach_agent() {
+        let agent = FakeAgent::new("ответ модели");
+        let spec = ToolSpec {
+            name: "git_status".into(),
+            description: None,
+            parameters: serde_json::json!({ "type": "object" }),
+        };
+        let context = context().with_tools(vec![spec.clone()]);
+        completed(Pipeline::new(agent.clone()).run(context).await.expect("конвейер"));
+        assert_eq!(*agent.last_tools.lock().unwrap(), vec![spec]);
     }
 }

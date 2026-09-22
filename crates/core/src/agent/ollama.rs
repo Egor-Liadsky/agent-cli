@@ -5,7 +5,7 @@
 //! (`message.thinking`), счётчики токенов и `top_k`, то есть всё, что
 //! приложение уже показывает для облачных моделей.
 
-use super::{AgentReply, Message, MessageMeta, Role};
+use super::{close_dangling_tool_calls, AgentReply, Message, MessageMeta, Role, ToolCall, ToolSpec};
 use crate::config::{ChatSettings, ThinkingMode};
 use super::error::{transport_error, AgentError};
 use crate::logging::{request_id, unix_timestamp, ExchangeLog, RequestLogEntry, ResponseLogEntry};
@@ -25,12 +25,50 @@ struct ChatRequest<'a> {
     think: Option<bool>,
     #[serde(skip_serializing_if = "Options::is_empty")]
     options: Options,
+    /// Описания инструментов. Пустой список не отправляется: модели без
+    /// поддержки tools отвечают на само поле ошибкой.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    tools: Vec<ToolDef<'a>>,
 }
 
 #[derive(Serialize)]
 struct ChatMessage {
     role: &'static str,
     content: String,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    tool_calls: Vec<WireToolCall>,
+    /// Ollama сопоставляет результат с вызовом по имени инструмента: `id` у
+    /// вызовов в его API нет.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_name: Option<String>,
+}
+
+#[derive(Serialize)]
+struct ToolDef<'a> {
+    #[serde(rename = "type")]
+    kind: &'static str,
+    function: ToolFunctionDef<'a>,
+}
+
+#[derive(Serialize)]
+struct ToolFunctionDef<'a> {
+    name: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    description: Option<&'a str>,
+    parameters: &'a serde_json::Value,
+}
+
+/// Вызов инструмента в формате Ollama: аргументы — объект, а не строка.
+#[derive(Serialize, Deserialize)]
+struct WireToolCall {
+    function: WireToolFunction,
+}
+
+#[derive(Serialize, Deserialize)]
+struct WireToolFunction {
+    name: String,
+    #[serde(default)]
+    arguments: serde_json::Value,
 }
 
 /// Параметры генерации Ollama. Незаданные поля не отправляются — модель
@@ -82,6 +120,8 @@ struct ChatResponseMessage {
     /// Цепочка рассуждений модели, если thinking включён.
     #[serde(default)]
     thinking: Option<String>,
+    #[serde(default)]
+    tool_calls: Vec<WireToolCall>,
 }
 
 #[derive(Deserialize)]
@@ -122,7 +162,11 @@ fn tags_url(base_url: &str) -> String {
 }
 
 /// Ошибка Ollama: тело `{"error": "..."}`, иначе — как есть.
-fn parse_error(status: reqwest::StatusCode, body: &str) -> AgentError {
+///
+/// Единственное место, где причина берётся из текста: у Ollama нет
+/// машинного кода для «модель не умеет tools», а дальше по стеку причина
+/// различается только типом ошибки.
+fn parse_error(status: reqwest::StatusCode, body: &str, model: &str) -> AgentError {
     let message = if body.trim().is_empty() {
         "пустое тело ответа. Обычно так отвечает HTTP-прокси или обратный прокси \
          перед Ollama, а не он сам: проверьте адрес"
@@ -132,6 +176,12 @@ fn parse_error(status: reqwest::StatusCode, body: &str) -> AgentError {
             .map(|e| e.error)
             .unwrap_or_else(|_| body.to_string())
     };
+    if status == reqwest::StatusCode::BAD_REQUEST && message.contains("does not support tools") {
+        return AgentError::ToolsUnsupported {
+            model: Some(model.to_string()),
+            request_id: None,
+        };
+    }
     AgentError::provider(status.as_u16(), message)
 }
 
@@ -157,7 +207,7 @@ pub async fn list_models(base_url: &str) -> Result<Vec<String>> {
         .await
         .map_err(|err| transport_error("не удалось прочитать список моделей Ollama", err))?;
     if !status.is_success() {
-        return Err(parse_error(status, &body).into());
+        return Err(parse_error(status, &body, "").into());
     }
     let parsed: TagsResponse = serde_json::from_str(&body).map_err(|err| {
         AgentError::Decode(format!("не удалось разобрать список моделей Ollama: {err}"))
@@ -166,11 +216,12 @@ pub async fn list_models(base_url: &str) -> Result<Vec<String>> {
 }
 
 fn build_messages(system: Option<String>, history: &[Message]) -> Vec<ChatMessage> {
+    let history = close_dangling_tool_calls(history);
     let (history_system, history) = match history.split_first() {
         Some((first, rest)) if matches!(first.role, Role::System) => {
             (Some(first.content.clone()), rest)
         }
-        _ => (None, history),
+        _ => (None, history.as_slice()),
     };
     let combined_system = match (system, history_system) {
         (Some(settings), Some(history)) => Some(format!("{settings}\n\n{history}")),
@@ -183,6 +234,8 @@ fn build_messages(system: Option<String>, history: &[Message]) -> Vec<ChatMessag
         messages.push(ChatMessage {
             role: "system",
             content,
+            tool_calls: Vec::new(),
+            tool_name: None,
         });
     }
     messages.extend(history.iter().map(|m| ChatMessage {
@@ -190,8 +243,20 @@ fn build_messages(system: Option<String>, history: &[Message]) -> Vec<ChatMessag
             Role::User => "user",
             Role::Assistant => "assistant",
             Role::System => "system",
+            Role::Tool => "tool",
         },
         content: m.content.clone(),
+        tool_calls: m
+            .tool_calls
+            .iter()
+            .map(|call| WireToolCall {
+                function: WireToolFunction {
+                    name: call.name.clone(),
+                    arguments: call.arguments.clone(),
+                },
+            })
+            .collect(),
+        tool_name: m.tool_name.clone(),
     }));
     messages
 }
@@ -218,7 +283,42 @@ fn think_flag(mode: ThinkingMode) -> Option<bool> {
     }
 }
 
+fn build_tools(tools: &[ToolSpec]) -> Vec<ToolDef<'_>> {
+    tools
+        .iter()
+        .map(|tool| ToolDef {
+            kind: "function",
+            function: ToolFunctionDef {
+                name: &tool.name,
+                description: tool.description.as_deref(),
+                parameters: &tool.parameters,
+            },
+        })
+        .collect()
+}
+
+/// Вызовы из ответа Ollama с назначенными ядром идентификаторами.
+///
+/// Номер продолжает счёт вызовов в истории, чтобы `id` не повторялся в
+/// пределах чата: по нему сервис сверяет присланные результаты.
+fn assign_call_ids(history: &[Message], calls: Vec<WireToolCall>) -> Vec<ToolCall> {
+    let offset: usize = history.iter().map(|m| m.tool_calls.len()).sum();
+    calls
+        .into_iter()
+        .enumerate()
+        .map(|(index, call)| ToolCall {
+            id: format!("call_{}", offset + index),
+            name: call.function.name,
+            arguments: match call.function.arguments {
+                serde_json::Value::Null => serde_json::Value::Object(serde_json::Map::new()),
+                other => other,
+            },
+        })
+        .collect()
+}
+
 /// Один обмен с локальной моделью.
+#[allow(clippy::too_many_arguments)]
 pub async fn chat(
     client: &reqwest::Client,
     base_url: &str,
@@ -226,6 +326,7 @@ pub async fn chat(
     history: &[Message],
     settings: &ChatSettings,
     system: Option<String>,
+    tools: &[ToolSpec],
     log: &ExchangeLog,
 ) -> Result<AgentReply> {
     if model.trim().is_empty() {
@@ -240,6 +341,7 @@ pub async fn chat(
         stream: false,
         think: think_flag(settings.thinking),
         options: build_options(settings),
+        tools: build_tools(tools),
     };
 
     let url = chat_url(base_url);
@@ -278,7 +380,7 @@ pub async fn chat(
     });
 
     if !status.is_success() {
-        return Err(parse_error(status, &body).into());
+        return Err(parse_error(status, &body, model).into());
     }
 
     let parsed: ChatResponse = serde_json::from_str(&body)
@@ -303,6 +405,7 @@ pub async fn chat(
         .thinking
         .map(|r| r.trim().to_string())
         .filter(|r| !r.is_empty());
+    let tool_calls = assign_call_ids(history, parsed.message.tool_calls);
 
     Ok(AgentReply {
         content: parsed.message.content,
@@ -311,6 +414,7 @@ pub async fn chat(
         model: Some(model.to_string()),
         policy: None,
         context: None,
+        tool_calls,
     })
 }
 
@@ -347,5 +451,66 @@ mod tests {
         let messages = build_messages(Some("формат ответа: markdown".to_string()), &history);
         assert_eq!(roles(&messages), vec!["system", "user"]);
         assert_eq!(messages[0].content, "формат ответа: markdown");
+    }
+
+    #[test]
+    fn tool_messages_carry_calls_and_tool_name() {
+        let history = vec![
+            Message::user("статус?"),
+            Message::assistant_with_tool_calls(
+                "",
+                vec![ToolCall {
+                    id: "call_0".into(),
+                    name: "git_status".into(),
+                    arguments: serde_json::json!({}),
+                }],
+            ),
+            Message::tool_result("call_0", "git_status", "clean"),
+        ];
+        let messages = build_messages(None, &history);
+        let value = serde_json::to_value(&messages).unwrap();
+        assert_eq!(value[1]["tool_calls"][0]["function"]["name"], "git_status");
+        assert_eq!(value[2]["role"], "tool");
+        assert_eq!(value[2]["tool_name"], "git_status");
+        assert!(value[0].get("tool_calls").is_none());
+    }
+
+    #[test]
+    fn call_ids_continue_history_count() {
+        let history = vec![Message::assistant_with_tool_calls(
+            "",
+            vec![ToolCall {
+                id: "call_0".into(),
+                name: "git_status".into(),
+                arguments: serde_json::json!({}),
+            }],
+        )];
+        let calls = assign_call_ids(
+            &history,
+            vec![WireToolCall {
+                function: WireToolFunction {
+                    name: "git_log".into(),
+                    arguments: serde_json::Value::Null,
+                },
+            }],
+        );
+        assert_eq!(calls[0].id, "call_1");
+        assert_eq!(calls[0].arguments, serde_json::json!({}));
+    }
+
+    #[test]
+    fn unsupported_tools_error_is_typed() {
+        let error = parse_error(
+            reqwest::StatusCode::BAD_REQUEST,
+            r#"{"error":"registry.ollama.ai/library/gemma:2b does not support tools"}"#,
+            "gemma:2b",
+        );
+        assert_eq!(
+            error,
+            AgentError::ToolsUnsupported {
+                model: Some("gemma:2b".into()),
+                request_id: None
+            }
+        );
     }
 }

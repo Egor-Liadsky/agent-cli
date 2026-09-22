@@ -5,7 +5,8 @@
 //! зависимостей. Запрет держится сборкой, а не договорённостью.
 
 use agentcore::agent::{
-    system_prompt, transport_error, Agent, AgentError, AgentReply, Message, MessageMeta, Role,
+    close_dangling_tool_calls, system_prompt, transport_error, Agent, AgentError, AgentReply,
+    Message, MessageMeta, Role, ToolCall, ToolSpec,
 };
 use agentcore::config::{ChatSettings, DEFAULT_MODEL};
 use agentcore::logging::{
@@ -112,6 +113,84 @@ struct ChatRequest<'a> {
     /// Не отправляется в режиме «Авто»: не все провайдеры знают это поле.
     #[serde(skip_serializing_if = "Option::is_none")]
     thinking: Option<Thinking>,
+    /// Описания инструментов. Пустой список не отправляется: не все модели
+    /// принимают само поле.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tools: Option<Vec<ToolDef<'a>>>,
+}
+
+#[derive(Serialize)]
+struct ToolDef<'a> {
+    #[serde(rename = "type")]
+    kind: &'static str,
+    function: ToolFunctionDef<'a>,
+}
+
+#[derive(Serialize)]
+struct ToolFunctionDef<'a> {
+    name: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    description: Option<&'a str>,
+    parameters: &'a serde_json::Value,
+}
+
+/// Вызов инструмента в формате OpenAI: аргументы — строка с JSON.
+#[derive(Serialize, Deserialize)]
+struct WireToolCall {
+    #[serde(default)]
+    id: String,
+    #[serde(rename = "type", default = "function_kind")]
+    kind: String,
+    function: WireToolFunction,
+}
+
+fn function_kind() -> String {
+    "function".to_string()
+}
+
+#[derive(Serialize, Deserialize)]
+struct WireToolFunction {
+    name: String,
+    #[serde(default)]
+    arguments: String,
+}
+
+impl WireToolCall {
+    fn from_call(call: &ToolCall) -> Self {
+        Self {
+            id: call.id.clone(),
+            kind: function_kind(),
+            function: WireToolFunction {
+                name: call.name.clone(),
+                arguments: match &call.arguments {
+                    // Неразобранные аргументы модели возвращаются как были.
+                    serde_json::Value::String(raw) => raw.clone(),
+                    other => other.to_string(),
+                },
+            },
+        }
+    }
+
+    /// Строка `arguments` разбирается в объект; при ошибке разбора она
+    /// сохраняется как `Value::String` — исполнитель вернёт модели ошибку
+    /// аргументов, а не уронит ход.
+    fn into_call(self, index: usize) -> ToolCall {
+        let raw = self.function.arguments;
+        let arguments = if raw.trim().is_empty() {
+            serde_json::Value::Object(serde_json::Map::new())
+        } else {
+            serde_json::from_str(&raw).unwrap_or(serde_json::Value::String(raw))
+        };
+        ToolCall {
+            id: if self.id.is_empty() {
+                format!("call_{index}")
+            } else {
+                self.id
+            },
+            name: self.function.name,
+            arguments,
+        }
+    }
 }
 
 #[derive(Serialize)]
@@ -123,7 +202,13 @@ struct Thinking {
 #[derive(Serialize)]
 struct ChatMessage {
     role: &'static str,
-    content: String,
+    /// `null` у ответа модели из одних вызовов: так его отдаёт и принимает
+    /// OpenAI-формат.
+    content: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    tool_calls: Vec<WireToolCall>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_call_id: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -143,7 +228,11 @@ struct ChatChoice {
 
 #[derive(Deserialize)]
 struct ChatResponseMessage {
-    content: String,
+    /// `null` или отсутствует, если модель ответила одними вызовами.
+    #[serde(default)]
+    content: Option<String>,
+    #[serde(default)]
+    tool_calls: Vec<WireToolCall>,
     /// Цепочка рассуждений: DeepSeek отдаёт её в `reasoning_content`,
     /// OpenAI-совместимые прокси — в `reasoning`.
     #[serde(default)]
@@ -191,11 +280,12 @@ fn parse_api_error(status: reqwest::StatusCode, body: &str) -> AgentError {
 
 impl UpstreamAgent {
     fn build_messages(&self, history: &[Message], settings: &ChatSettings) -> Vec<ChatMessage> {
+        let history = close_dangling_tool_calls(history);
         let (history_system, history) = match history.split_first() {
             Some((first, rest)) if matches!(first.role, Role::System) => {
                 (Some(first.content.clone()), rest)
             }
-            _ => (None, history),
+            _ => (None, history.as_slice()),
         };
         let combined_system = match (system_prompt(settings), history_system) {
             (Some(settings), Some(history)) => Some(format!("{settings}\n\n{history}")),
@@ -207,7 +297,9 @@ impl UpstreamAgent {
         if let Some(content) = combined_system {
             messages.push(ChatMessage {
                 role: "system",
-                content,
+                content: Some(content),
+                tool_calls: Vec::new(),
+                tool_call_id: None,
             });
         }
         messages.extend(history.iter().map(|m| ChatMessage {
@@ -215,8 +307,15 @@ impl UpstreamAgent {
                 Role::User => "user",
                 Role::Assistant => "assistant",
                 Role::System => "system",
+                Role::Tool => "tool",
             },
-            content: m.content.clone(),
+            content: if m.content.is_empty() && !m.tool_calls.is_empty() {
+                None
+            } else {
+                Some(m.content.clone())
+            },
+            tool_calls: m.tool_calls.iter().map(WireToolCall::from_call).collect(),
+            tool_call_id: m.tool_call_id.clone(),
         }));
         messages
     }
@@ -226,6 +325,7 @@ impl UpstreamAgent {
         messages: Vec<ChatMessage>,
         settings: &ChatSettings,
         model: &'a str,
+        tools: &'a [ToolSpec],
     ) -> ChatRequest<'a> {
         let active_format = settings.active_response_format();
         let sampling = &settings.sampling;
@@ -240,6 +340,19 @@ impl UpstreamAgent {
             frequency_penalty: sampling.frequency_penalty,
             presence_penalty: sampling.presence_penalty,
             thinking: settings.thinking.api_value().map(|kind| Thinking { kind }),
+            tools: (!tools.is_empty()).then(|| {
+                tools
+                    .iter()
+                    .map(|tool| ToolDef {
+                        kind: "function",
+                        function: ToolFunctionDef {
+                            name: &tool.name,
+                            description: tool.description.as_deref(),
+                            parameters: &tool.parameters,
+                        },
+                    })
+                    .collect()
+            }),
         }
     }
 
@@ -331,23 +444,40 @@ fn extract_answer(body: &str, mut meta: MessageMeta) -> Result<AgentReply> {
         .map(|r| r.trim().to_string())
         .filter(|r| !r.is_empty());
 
+    let tool_calls = message
+        .tool_calls
+        .into_iter()
+        .enumerate()
+        .map(|(index, call)| call.into_call(index))
+        .collect();
+
     Ok(AgentReply {
-        content: message.content,
+        content: message.content.unwrap_or_default(),
         reasoning,
         meta,
         model,
         policy: None,
         context: None,
+        tool_calls,
     })
 }
 
 #[async_trait]
 impl Agent for UpstreamAgent {
     async fn ask(&self, history: &[Message], settings: &ChatSettings) -> Result<AgentReply> {
+        self.ask_with_tools(history, settings, &[]).await
+    }
+
+    async fn ask_with_tools(
+        &self,
+        history: &[Message],
+        settings: &ChatSettings,
+        tools: &[ToolSpec],
+    ) -> Result<AgentReply> {
         let messages = self.build_messages(history, settings);
         let url = format!("{}/chat/completions", self.base_url.trim_end_matches('/'));
         let model = self.model_for(settings);
-        let request_body = self.build_request(messages, settings, &model);
+        let request_body = self.build_request(messages, settings, &model, tools);
 
         let (body, meta) = self.send_request(&url, &request_body).await?;
         extract_answer(&body, meta)
@@ -421,7 +551,7 @@ mod tests {
         let roles: Vec<&str> = messages.iter().map(|m| m.role).collect();
         assert_eq!(roles.iter().filter(|r| **r == "system").count(), 1);
         assert_eq!(roles[0], "system");
-        assert_eq!(messages[0].content, "базовый текст");
+        assert_eq!(messages[0].content.as_deref(), Some("базовый текст"));
     }
 
     #[tokio::test]
@@ -479,5 +609,120 @@ mod tests {
             Some(AgentError::MissingApiKey { .. })
         ));
         assert!(format!("{err}").contains("подсказка вызывающей стороны"));
+    }
+
+    /// Одноразовый сервер, который отдаёт ответ и возвращает тело запроса.
+    async fn capturing_provider(body: &'static str) -> (String, tokio::task::JoinHandle<String>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("порт");
+        let addr = listener.local_addr().expect("адрес");
+        let handle = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("соединение");
+            let mut data = Vec::new();
+            let mut buffer = [0u8; 4096];
+            let request_body = loop {
+                let read = socket.read(&mut buffer).await.unwrap_or(0);
+                data.extend_from_slice(&buffer[..read]);
+                let text = String::from_utf8_lossy(&data).to_string();
+                if let Some(end) = text.find("\r\n\r\n") {
+                    let length = text[..end]
+                        .lines()
+                        .find_map(|line| {
+                            line.to_ascii_lowercase()
+                                .strip_prefix("content-length:")
+                                .map(|v| v.trim().parse::<usize>().unwrap_or(0))
+                        })
+                        .unwrap_or(0);
+                    if data.len() >= end + 4 + length || read == 0 {
+                        break String::from_utf8_lossy(&data[end + 4..]).to_string();
+                    }
+                }
+                if read == 0 {
+                    break String::new();
+                }
+            };
+            let head = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                 Content-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            let _ = socket.write_all(head.as_bytes()).await;
+            let _ = socket.write_all(body.as_bytes()).await;
+            let _ = socket.flush().await;
+            request_body
+        });
+        (format!("http://{addr}"), handle)
+    }
+
+    #[tokio::test]
+    async fn tool_calls_with_null_content_are_parsed() {
+        let (base_url, handle) = capturing_provider(
+            r#"{"model":"deepseek-v4-flash","choices":[{"message":{"content":null,"tool_calls":[{"id":"call_abc","type":"function","function":{"name":"git_log","arguments":"{\"max_count\":3}"}}]}}]}"#,
+        )
+        .await;
+        let tools = [ToolSpec {
+            name: "git_log".into(),
+            description: Some("Shows commit logs".into()),
+            parameters: serde_json::json!({ "type": "object" }),
+        }];
+        let history = [
+            Message::user("что нового?"),
+            Message::assistant_with_tool_calls(
+                "",
+                vec![ToolCall {
+                    id: "call_0".into(),
+                    name: "git_status".into(),
+                    arguments: serde_json::json!({}),
+                }],
+            ),
+            Message::tool_result("call_0", "git_status", "clean"),
+        ];
+        let reply = agent(base_url)
+            .ask_with_tools(&history, &ChatSettings::default(), &tools)
+            .await
+            .expect("ответ");
+        assert_eq!(reply.content, "");
+        assert_eq!(
+            reply.tool_calls,
+            vec![ToolCall {
+                id: "call_abc".into(),
+                name: "git_log".into(),
+                arguments: serde_json::json!({ "max_count": 3 }),
+            }]
+        );
+
+        let request: serde_json::Value =
+            serde_json::from_str(&handle.await.expect("запрос")).expect("JSON запроса");
+        assert_eq!(request["tools"][0]["type"], "function");
+        assert_eq!(request["tools"][0]["function"]["name"], "git_log");
+        assert_eq!(request["messages"][1]["content"], serde_json::Value::Null);
+        assert_eq!(request["messages"][1]["tool_calls"][0]["function"]["arguments"], "{}");
+        assert_eq!(request["messages"][2]["role"], "tool");
+        assert_eq!(request["messages"][2]["tool_call_id"], "call_0");
+    }
+
+    #[test]
+    fn unparsable_arguments_are_kept_as_string() {
+        let call = WireToolCall {
+            id: String::new(),
+            kind: function_kind(),
+            function: WireToolFunction {
+                name: "git_add".into(),
+                arguments: "{не json".into(),
+            },
+        }
+        .into_call(2);
+        assert_eq!(call.id, "call_2");
+        assert_eq!(call.arguments, serde_json::Value::String("{не json".into()));
+    }
+
+    #[test]
+    fn request_without_tools_has_no_tools_field() {
+        let agent = agent("http://127.0.0.1:0".to_string());
+        let settings = ChatSettings::default();
+        let messages = agent.build_messages(&[Message::user("привет")], &settings);
+        let request = agent.build_request(messages, &settings, "m", &[]);
+        let value = serde_json::to_value(&request).unwrap();
+        assert!(value.get("tools").is_none());
+        assert!(value["messages"][0].get("tool_calls").is_none());
     }
 }

@@ -63,6 +63,7 @@ pub fn context_block(chat: &ChatSession) -> String {
             Role::User => "Вы",
             Role::Assistant => "Агент",
             Role::System => "Система",
+            Role::Tool => "Инструмент",
         };
         block.push_str(&format!("{label}: {}\n", message.content));
     }

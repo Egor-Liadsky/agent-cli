@@ -4,7 +4,7 @@
 //! консольный клиент (как единственным прямым вызовом модели) и сетевой
 //! сервис (как одним из провайдеров).
 
-use super::{ollama, system_prompt, Agent, AgentReply, Message};
+use super::{ollama, system_prompt, Agent, AgentReply, Message, ToolSpec};
 use crate::config::{ChatSettings, Config};
 use crate::logging::ExchangeLog;
 use anyhow::Result;
@@ -51,6 +51,15 @@ impl OllamaAgent {
 #[async_trait]
 impl Agent for OllamaAgent {
     async fn ask(&self, history: &[Message], settings: &ChatSettings) -> Result<AgentReply> {
+        self.ask_with_tools(history, settings, &[]).await
+    }
+
+    async fn ask_with_tools(
+        &self,
+        history: &[Message],
+        settings: &ChatSettings,
+        tools: &[ToolSpec],
+    ) -> Result<AgentReply> {
         ollama::chat(
             &self.client,
             &self.base_url,
@@ -58,6 +67,7 @@ impl Agent for OllamaAgent {
             history,
             settings,
             system_prompt(settings),
+            tools,
             &self.log,
         )
         .await
@@ -75,16 +85,24 @@ mod tests {
     /// Одноразовый сервер: отдаёт ответ Ollama и возвращает первую строку
     /// запроса, чтобы проверить, куда он ушёл.
     async fn stub_ollama() -> (String, tokio::task::JoinHandle<String>) {
+        stub_ollama_with(
+            "200 OK",
+            r#"{"message":{"content":"ответ"},"prompt_eval_count":1,"eval_count":2}"#,
+        )
+        .await
+    }
+
+    async fn stub_ollama_with(
+        status: &'static str,
+        body: &'static str,
+    ) -> (String, tokio::task::JoinHandle<String>) {
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("порт");
         let addr = listener.local_addr().expect("адрес");
         let handle = tokio::spawn(async move {
             let (mut socket, _) = listener.accept().await.expect("соединение");
-            let mut buffer = vec![0u8; 4096];
-            let read = socket.read(&mut buffer).await.unwrap_or(0);
-            let request = String::from_utf8_lossy(&buffer[..read]).to_string();
-            let body = r#"{"message":{"content":"ответ"},"prompt_eval_count":1,"eval_count":2}"#;
+            let request = read_request(&mut socket).await;
             let head = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                "HTTP/1.1 {status}\r\nContent-Type: application/json\r\n\
                  Content-Length: {}\r\nConnection: close\r\n\r\n",
                 body.len()
             );
@@ -94,6 +112,97 @@ mod tests {
             request
         });
         (format!("http://{addr}"), handle)
+    }
+
+    /// Читает запрос целиком: заголовки и тело по `Content-Length`. Тело с
+    /// описаниями инструментов не помещается в один `read`.
+    async fn read_request(socket: &mut tokio::net::TcpStream) -> String {
+        let mut data = Vec::new();
+        let mut buffer = [0u8; 4096];
+        loop {
+            let read = socket.read(&mut buffer).await.unwrap_or(0);
+            if read == 0 {
+                break;
+            }
+            data.extend_from_slice(&buffer[..read]);
+            let text = String::from_utf8_lossy(&data);
+            if let Some(end) = text.find("\r\n\r\n") {
+                let length = text[..end]
+                    .lines()
+                    .find_map(|line| {
+                        let lower = line.to_ascii_lowercase();
+                        lower
+                            .strip_prefix("content-length:")
+                            .map(|v| v.trim().parse::<usize>().unwrap_or(0))
+                    })
+                    .unwrap_or(0);
+                if data.len() >= end + 4 + length {
+                    break;
+                }
+            }
+        }
+        String::from_utf8_lossy(&data).to_string()
+    }
+
+    fn agent_for(url: &str) -> (OllamaAgent, ChatSettings) {
+        let config = Config {
+            ollama_url: Some(url.to_string()),
+            ollama_model: Some("gemma4:26b".to_string()),
+            ..Config::default()
+        };
+        let agent =
+            OllamaAgent::from_config(&config, Arc::new(ExchangeLog::disabled())).expect("агент");
+        let settings = ChatSettings {
+            provider: Provider::Ollama,
+            ..ChatSettings::default()
+        };
+        (agent, settings)
+    }
+
+    fn git_status_spec() -> ToolSpec {
+        ToolSpec {
+            name: "git_status".into(),
+            description: Some("Shows the working tree status".into()),
+            parameters: serde_json::json!({ "type": "object", "properties": {} }),
+        }
+    }
+
+    #[tokio::test]
+    async fn ollama_tool_calls_are_sent_and_parsed() {
+        let (url, handle) = stub_ollama_with(
+            "200 OK",
+            r#"{"message":{"content":"","tool_calls":[{"function":{"name":"git_status","arguments":{}}}]}}"#,
+        )
+        .await;
+        let (agent, settings) = agent_for(&url);
+        let reply = agent
+            .ask_with_tools(&[Message::user("статус?")], &settings, &[git_status_spec()])
+            .await
+            .expect("ответ Ollama");
+        assert_eq!(reply.tool_calls.len(), 1);
+        assert_eq!(reply.tool_calls[0].id, "call_0");
+        assert_eq!(reply.tool_calls[0].name, "git_status");
+
+        let request = handle.await.expect("запрос");
+        assert!(request.contains(r#""tools":[{"type":"function""#), "запрос: {request}");
+    }
+
+    #[tokio::test]
+    async fn ollama_without_tool_support_is_typed_error() {
+        let (url, _handle) = stub_ollama_with(
+            "400 Bad Request",
+            r#"{"error":"registry.ollama.ai/library/gemma4:26b does not support tools"}"#,
+        )
+        .await;
+        let (agent, settings) = agent_for(&url);
+        let err = agent
+            .ask_with_tools(&[Message::user("статус?")], &settings, &[git_status_spec()])
+            .await
+            .expect_err("ошибка");
+        assert!(matches!(
+            err.downcast_ref::<crate::agent::AgentError>(),
+            Some(crate::agent::AgentError::ToolsUnsupported { .. })
+        ));
     }
 
     #[tokio::test]

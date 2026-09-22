@@ -748,6 +748,7 @@ impl From<&Message> for NewMessagePayload {
                 Role::User => "user",
                 Role::Assistant => "assistant",
                 Role::System => "system",
+                Role::Tool => "tool",
             },
             content: message.content.clone(),
             reasoning: message.reasoning.clone(),
@@ -1092,6 +1093,9 @@ impl From<MessagePayload> for StoredMessage {
                 content: message.content,
                 reasoning: message.reasoning,
                 meta: has_telemetry.then_some(meta),
+                tool_calls: Vec::new(),
+                tool_call_id: None,
+                tool_name: None,
             },
         }
     }
