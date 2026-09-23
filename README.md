@@ -805,8 +805,8 @@ cargo-зависимости на сервер у `agentcli` нет, этот wo
 ```bash
 cargo install --path crates/cli
 cargo install --git https://github.com/Egor-Liadsky/git-mcp-agent git-mcp
-# или из подмодуля mcp зонтичного репозитория agent:
-cargo install --path ../mcp/crates/git
+# или из подмодуля mcp/git зонтичного репозитория agent:
+cargo install --path ../mcp/git/crates/git
 ```
 
 Бинарник клиент ищет в таком порядке:
@@ -822,8 +822,8 @@ cargo install --path ../mcp/crates/git
 agentcli` — укажите собранный бинарник:
 
 ```bash
-(cd ../mcp && cargo build --release)
-AGENTCLI_GIT_MCP=$PWD/../mcp/target/release/git-mcp cargo run -p agentcli -- chat
+(cd ../mcp/git && cargo build --release)
+AGENTCLI_GIT_MCP=$PWD/../mcp/git/target/release/git-mcp cargo run -p agentcli -- chat
 ```
 
 Сервер подключается и к другим MCP-клиентам той же командой:
