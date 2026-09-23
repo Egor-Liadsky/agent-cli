@@ -10,15 +10,19 @@
 
 ## Архитектура
 
-Проект собран как cargo workspace из пяти крейтов:
+Проект собран как cargo workspace из четырёх крейтов:
 
 | Крейт             | Каталог           | Кто зависит                    |
 |-------------------|-------------------|--------------------------------|
-| `agentcore`       | `crates/core`     | все, кроме `agentcli-git-mcp`  |
+| `agentcore`       | `crates/core`     | все                            |
 | `agentupstream`   | `crates/upstream` | только сервис `agentd`         |
 | `agentclient`     | `crates/client`   | только `agentcli`              |
 | `agentcli`        | `crates/cli`      | —                              |
-| `agentcli-git-mcp` | `crates/git-mcp` | — (отдельный бинарник, `agentcli` запускает его процессом) |
+
+MCP-сервер git-инструментов `git-mcp` живёт в отдельном репозитории
+[`git-mcp-agent`](https://github.com/Egor-Liadsky/git-mcp-agent): `agentcli`
+запускает его дочерним процессом и cargo-зависимости на него не имеет (см.
+«Git-инструменты (MCP)»).
 
 Облачный провайдер вынесен в отдельный крейт `agentupstream` намеренно:
 консольный клиент от него не зависит, поэтому прямой запрос к облачному API
@@ -159,14 +163,13 @@ AGENTCLI_LOG_DIR=/tmp/agentcli-logs cargo run -p agentcli -- ask "привет"
 | Рендер Markdown в терминале      | `termimad`, `ansi-to-tui`        |
 | Индикация прогресса/стиль текста | `indicatif`, `console`          |
 | Клиент MCP (git-инструменты)     | `rmcp` (client, transport-child-process) |
-| Сервер MCP (`agentcli-git-mcp`)  | `rmcp` (server, macros, transport-io), `schemars` |
 
 Терминальные зависимости (`clap`, `ratatui`, `crossterm`, `termimad`,
 `ansi-to-tui`, `indicatif`, `console`, `arboard`) живут только в `agentcli`:
 `agentcore` от терминала не зависит. Там же живёт клиентская часть `rmcp`:
 процессы MCP-серверов запускает только клиент, ядро знает лишь типы вызовов
-(`ToolSpec`, `ToolCall`). Серверная часть `rmcp` — только в
-`agentcli-git-mcp`, у которого нет ни терминальных крейтов, ни ядра.
+(`ToolSpec`, `ToolCall`). Серверной части `rmcp` в этом workspace нет: она
+живёт в отдельном сервере `git-mcp`.
 
 ## Запуск
 
@@ -786,26 +789,45 @@ cargo run -p agentcli -- profiles create --file profile.json
 ### Git-инструменты (MCP)
 
 Модель может сама смотреть в git-репозиторий: статус, диффы, лог, коммиты,
-ветки. Инструменты даёт MCP-сервер `agentcli-git-mcp` — отдельный бинарник
-этого workspace (`crates/git-mcp`), который клиент запускает дочерним
-процессом: `agentcli-git-mcp --repository <путь>`, протокол — JSON-RPC
-через stdin/stdout. Сервер вызывает системный `git`; Python, `uv` и сеть
+ветки. Инструменты даёт MCP-сервер `git-mcp` из отдельного репозитория
+[`git-mcp-agent`](https://github.com/Egor-Liadsky/git-mcp-agent), который
+клиент запускает дочерним процессом: `git-mcp --repository <путь>`,
+протокол — JSON-RPC через stdin/stdout. Связь только через процесс:
+cargo-зависимости на сервер у `agentcli` нет, этот workspace его не
+собирает. Сервер вызывает системный `git`; Python, `uv` и сеть
 не нужны. Имена и аргументы инструментов совпадают с
 [`mcp-server-git`](https://github.com/modelcontextprotocol/servers/tree/main/src/git),
 а репозиторий сервер берёт только из `--repository` — путь из аргументов
 вызова он игнорирует.
 
-Бинарник собирается вместе со всем workspace (`cargo build`) и ищется рядом
-с `agentcli`, затем в `PATH`. `cargo run -p agentcli` собирает только сам
-клиент, поэтому перед первым запуском выполните `cargo build`. Установка:
+Сервер устанавливается отдельно:
 
 ```bash
 cargo install --path crates/cli
-cargo install --path crates/git-mcp   # тот же каталог ~/.cargo/bin
+cargo install --git https://github.com/Egor-Liadsky/git-mcp-agent git-mcp
+# или из подмодуля mcp зонтичного репозитория agent:
+cargo install --path ../mcp/crates/git
+```
+
+Бинарник клиент ищет в таком порядке:
+
+1. путь из переменной окружения `AGENTCLI_GIT_MCP` — берётся как есть,
+   даже если файла нет: явная настройка не уступает молча другому
+   бинарнику, а ошибка запуска называет неверный путь;
+2. `git-mcp` рядом с исполняемым `agentcli` (`cargo install` кладёт оба в
+   `~/.cargo/bin`);
+3. `git-mcp` в `PATH`.
+
+Для сборки из исходников без установки — например, при `cargo run -p
+agentcli` — укажите собранный бинарник:
+
+```bash
+(cd ../mcp && cargo build --release)
+AGENTCLI_GIT_MCP=$PWD/../mcp/target/release/git-mcp cargo run -p agentcli -- chat
 ```
 
 Сервер подключается и к другим MCP-клиентам той же командой:
-`agentcli-git-mcp --repository <путь>`.
+`git-mcp --repository <путь>`; подробности — в README `git-mcp-agent`.
 
 Инструменты выполняет только клиент: сервис `agentd` процессов не
 запускает и файловой системы пользователя не видит. Облачный чат
@@ -876,7 +898,7 @@ agentcli chat», в stderr печатается предупреждение с 
 результат-ошибку, а процесс перезапускается. Упавший процесс
 перезапускается один раз; неудача прерывает ход. Процесс останавливается
 при выходе из TUI и когда репозиторий больше не нужен ни одному чату. Не
-найден `agentcli-git-mcp`, нет каталога или `.git` — реплика не
+найден `git-mcp`, нет каталога или `.git` — реплика не
 отправляется и остаётся в поле ввода, причина видна в строке уведомлений.
 
 **Защита аргументов.** Ревизии, ветки и даты, начинающиеся с `-`, сервер
@@ -886,7 +908,7 @@ agentcli chat», в stderr печатается предупреждение с 
 запрос пароля — stdin занят протоколом.
 
 **Журнал.** Вызовы инструментов пишутся в те же `requests.jsonl` и
-`responses.jsonl`: запрос с `url = mcp+stdio://agentcli-git-mcp/tools/call`,
+`responses.jsonl`: запрос с `url = mcp+stdio://git-mcp/tools/call`,
 именем инструмента в `model` и аргументами; ответ со статусом `200`
 (успех), `500` (ошибка инструмента) или `504` (таймаут), результат обрезан
 до 4 000 символов. Запуск сервера — одна запись со списком инструментов.

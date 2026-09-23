@@ -448,7 +448,7 @@ pub struct ChatSettings {
     /// (`AGENTD_TASK_STATE_AUTO_ENABLED`).
     #[serde(default)]
     pub task_state_auto_enabled: Option<bool>,
-    /// Подключает git-инструменты (MCP-сервер `agentcli-git-mcp`) к ходам этого чата.
+    /// Подключает git-инструменты (MCP-сервер `git-mcp`) к ходам этого чата.
     /// `None`/`false` — инструменты не подключаются. Сервис поле только
     /// хранит: инструменты запускает и выполняет клиент.
     #[serde(default)]

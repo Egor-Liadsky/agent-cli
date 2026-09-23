@@ -158,7 +158,7 @@ struct ToolApprovalRequest {
     reply: tokio::sync::oneshot::Sender<bool>,
 }
 
-/// Процессы `agentcli-git-mcp` по каноническому пути репозитория: чаты с одним
+/// Процессы `git-mcp` по каноническому пути репозитория: чаты с одним
 /// репозиторием делят процесс.
 type ToolServers = Arc<tokio::sync::Mutex<HashMap<PathBuf, Arc<GitToolServer>>>>;
 
@@ -529,7 +529,7 @@ impl SettingsSection {
                 "Профиль владельца: роль, стиль, формат и ограничения ответа, заданные сервисом."
             }
             SettingsSection::Tools => {
-                "Git-инструменты (MCP-сервер agentcli-git-mcp): модель читает репозиторий сама, а пишущие вызовы выполняются только после подтверждения."
+                "Git-инструменты (MCP-сервер git-mcp): модель читает репозиторий сама, а пишущие вызовы выполняются только после подтверждения."
             }
             SettingsSection::Format => "Формат ответа: кастомный режим, длина, стоп-условия.",
             SettingsSection::Reasoning => {
@@ -795,8 +795,8 @@ AGENTD_TASK_STATE_ENABLED (по умолчанию выключено)."
             }
             FormatField::GitToolsEnabled => {
                 "◀/▶ или Space — переключить. Подключает к ходам этого чата git-инструменты: клиент при первом ходе \
-запускает agentcli-git-mcp для репозитория ниже. Читающие инструменты (статус, диффы, лог, show, ветки) \
-выполняются сразу, пишущие — только после подтверждения в отдельном окне. Бинарник собирается вместе с agentcli."
+запускает git-mcp для репозитория ниже. Читающие инструменты (статус, диффы, лог, show, ветки) \
+выполняются сразу, пишущие — только после подтверждения в отдельном окне. Сервер git-mcp устанавливается отдельно от agentcli (см. README, «Git-инструменты (MCP)»)."
             }
             FormatField::GitRepository => {
                 "Путь к git-репозиторию на этой машине. Модель работает только с ним: путь подставляет клиент, \
@@ -4466,7 +4466,7 @@ fn handle_response(
         && state.chats[chat_index].title == DEFAULT_CHAT_TITLE
         && state.chats[chat_index].messages.len() == 2
     {
-        schedule_title_refresh(&state, tx);
+        schedule_title_refresh(state, tx);
     }
     // Обмен облачного чата записал сам сервис (запрос шёл с `chat_id`), а
     // обмен локального записывает клиент: ответ дала модель на машине
@@ -8152,7 +8152,7 @@ mod tests {
         handle_tool_server_failed(
             "chat-1".to_string(),
             "покажи статус".to_string(),
-            "не найден agentcli-git-mcp".to_string(),
+            "не найден git-mcp".to_string(),
             &mut state,
         );
 
@@ -8160,7 +8160,7 @@ mod tests {
         let ui = &state.chat_ui["chat-1"];
         assert_eq!(ui.input, "покажи статус");
         assert!(!ui.pending);
-        assert!(state.active_notice().unwrap().contains("agentcli-git-mcp"));
+        assert!(state.active_notice().unwrap().contains("git-mcp"));
     }
 
     #[test]

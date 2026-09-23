@@ -1,9 +1,12 @@
-//! Git-инструменты через MCP: процесс `agentcli-git-mcp`, его инструменты и
-//! вызовы.
+//! Git-инструменты через MCP: процесс `git-mcp`, его инструменты и вызовы.
 //!
-//! Сервер — отдельный бинарник этого workspace (`crates/git-mcp`) на Rust,
-//! без Python и `uv`: инструменты вызывают системный `git`. Имена и
-//! аргументы инструментов совпадают с `mcp-server-git`.
+//! Сервер — отдельный проект на Rust
+//! (<https://github.com/Egor-Liadsky/git-mcp-agent>), без Python и `uv`:
+//! инструменты вызывают системный `git`. Имена и аргументы инструментов
+//! совпадают с `mcp-server-git`. Клиент связан с сервером только процессом и
+//! протоколом, а не cargo-зависимостью: сервер обновляется и подключается к
+//! другим клиентам независимо, а в граф зависимостей `agentcli` не попадает
+//! серверная часть `rmcp`.
 //!
 //! Сервер запускается лениво — при первой реплике чата с включёнными
 //! инструментами, а не при старте TUI: большинству чатов git не нужен.
@@ -26,7 +29,11 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
 
-pub const SERVER_NAME: &str = "agentcli-git-mcp";
+pub const SERVER_NAME: &str = "git-mcp";
+
+/// Переменная окружения с путём к бинарнику сервера — для сборки из
+/// исходников без установки и для тестов.
+pub const SERVER_PROGRAM_ENV: &str = "AGENTCLI_GIT_MCP";
 
 /// Инструменты, которые только читают репозиторий. Всё прочее — пишущее,
 /// включая инструменты будущих версий сервера: неизвестное считается
@@ -62,25 +69,32 @@ pub const MAX_RESULT_CHARS: usize = 16_000;
 /// Предел результата в журнале обмена.
 const MAX_LOG_RESULT_CHARS: usize = 4_000;
 
-const CALL_URL: &str = "mcp+stdio://agentcli-git-mcp/tools/call";
-const LIST_URL: &str = "mcp+stdio://agentcli-git-mcp/tools/list";
+const CALL_URL: &str = "mcp+stdio://git-mcp/tools/call";
+const LIST_URL: &str = "mcp+stdio://git-mcp/tools/list";
 
-/// Где искать сервер: рядом с исполняемым файлом `agentcli` — туда его
-/// кладут `cargo build` (`target/<профиль>/`) и `cargo install` (`~/.cargo/bin`),
-/// — иначе по `PATH`. Тестовый бинарник лежит в `target/<профиль>/deps/`,
-/// поэтому проверяется и родительский каталог `deps`.
+/// Где искать сервер: путь из `AGENTCLI_GIT_MCP`, затем рядом с исполняемым
+/// файлом `agentcli` (туда их обоих кладёт `cargo install`, `~/.cargo/bin`),
+/// иначе по `PATH`.
+///
+/// Каталоги `target/<профиль>/` и `target/<профиль>/deps/` этого workspace
+/// не проверяются: сервер собирается своим репозиторием, и собственная
+/// сборка `agentcli` его туда не кладёт.
 pub fn server_program() -> PathBuf {
+    locate_server(std::env::var_os(SERVER_PROGRAM_ENV), std::env::current_exe().ok())
+}
+
+/// Путь из переменной окружения берётся как есть, даже если файла нет:
+/// явная настройка не должна молча уступать другому бинарнику, а ошибка
+/// запуска назовёт неверный путь.
+fn locate_server(from_env: Option<std::ffi::OsString>, exe: Option<PathBuf>) -> PathBuf {
+    if let Some(path) = from_env.filter(|path| !path.is_empty()) {
+        return PathBuf::from(path);
+    }
     let name = format!("{SERVER_NAME}{}", std::env::consts::EXE_SUFFIX);
-    if let Some(dir) = std::env::current_exe().ok().and_then(|exe| exe.parent().map(Path::to_path_buf)) {
-        let mut candidates = vec![dir.join(&name)];
-        if dir.file_name().is_some_and(|dir_name| dir_name == "deps")
-            && let Some(parent) = dir.parent()
-        {
-            candidates.push(parent.join(&name));
-        }
-        if let Some(found) = candidates.into_iter().find(|candidate| candidate.is_file()) {
-            return found;
-        }
+    if let Some(beside) = exe.as_deref().and_then(Path::parent).map(|dir| dir.join(&name))
+        && beside.is_file()
+    {
+        return beside;
     }
     PathBuf::from(name)
 }
@@ -226,7 +240,7 @@ struct Running {
     service: RunningService<RoleClient, ()>,
 }
 
-/// Процесс `agentcli-git-mcp` одного репозитория.
+/// Процесс `git-mcp` одного репозитория.
 pub struct GitToolServer {
     repository: PathBuf,
     /// Программа и аргументы до `--repository`: в тестах — несуществующая
@@ -242,7 +256,7 @@ pub struct GitToolServer {
 }
 
 impl GitToolServer {
-    /// Запуск `agentcli-git-mcp --repository <путь>` с проверкой пути,
+    /// Запуск `git-mcp --repository <путь>` с проверкой пути,
     /// рукопожатием и полным `tools/list`.
     pub async fn start(repository: &str, log: Arc<ExchangeLog>) -> Result<Arc<Self>> {
         let program = server_program();
@@ -289,8 +303,9 @@ impl GitToolServer {
             .map_err(|err| {
                 if err.kind() == std::io::ErrorKind::NotFound {
                     unavailable(format!(
-                        "не найден {}: соберите его вместе с agentcli (cargo build в agent-cli) \
-                         или установите рядом с agentcli (cargo install --path crates/git-mcp)",
+                        "не найден {}: установите сервер (cargo install --git \
+                         https://github.com/Egor-Liadsky/git-mcp-agent git-mcp) \
+                         или укажите путь к бинарнику в {SERVER_PROGRAM_ENV}",
                         self.program
                     ))
                 } else {
@@ -532,6 +547,28 @@ mod tests {
         assert!(text.chars().count() < MAX_RESULT_CHARS + 60);
     }
 
+    #[test]
+    fn server_path_from_env_takes_priority() {
+        let dir = std::env::temp_dir().join(format!("agentcli-mcp-locate-{}", request_id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let name = format!("{SERVER_NAME}{}", std::env::consts::EXE_SUFFIX);
+        let beside = dir.join(&name);
+        std::fs::write(&beside, "").unwrap();
+        let custom = dir.join("custom-git-mcp");
+        std::fs::write(&custom, "").unwrap();
+        let exe = Some(dir.join("agentcli"));
+
+        assert_eq!(locate_server(Some(custom.clone().into()), exe.clone()), custom);
+        // Пустая переменная — как отсутствующая.
+        assert_eq!(locate_server(Some("".into()), exe.clone()), beside);
+        assert_eq!(locate_server(None, exe.clone()), beside);
+        // Неверный путь из переменной не подменяется соседним бинарником.
+        let missing = dir.join("missing");
+        assert_eq!(locate_server(Some(missing.clone().into()), exe), missing);
+        assert_eq!(locate_server(None, Some(std::env::temp_dir().join("agentcli"))), PathBuf::from(&name));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     fn temp_repo(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("agentcli-mcp-{name}-{}", request_id()));
         std::fs::create_dir_all(dir.join(".git")).unwrap();
@@ -565,16 +602,18 @@ mod tests {
         match err.downcast_ref::<AgentError>() {
             Some(AgentError::ToolServerUnavailable { server, reason }) => {
                 assert_eq!(server, SERVER_NAME);
-                assert!(reason.contains("cargo install --path crates/git-mcp"), "причина: {reason}");
+                assert!(reason.contains("cargo install --git"), "причина: {reason}");
+                assert!(reason.contains(SERVER_PROGRAM_ENV), "причина: {reason}");
             }
             other => panic!("ожидался ToolServerUnavailable, получено: {other:?}"),
         }
         let _ = std::fs::remove_dir_all(repo);
     }
 
-    /// Живой тест с настоящим `agentcli-git-mcp`: бинарник должен быть
-    /// собран (`cargo build -p agentcli-git-mcp`), поэтому тест под `ignore` —
-    /// `cargo test -p agentcli` сервер не собирает.
+    /// Живой тест с настоящим `git-mcp`: сервер собирается своим
+    /// репозиторием, а не этим workspace, поэтому тест под `ignore` — для
+    /// запуска `git-mcp` должен быть в `PATH` или путь к нему — в
+    /// `AGENTCLI_GIT_MCP` (абсолютный: тесты идут из каталога крейта).
     #[tokio::test]
     #[ignore]
     async fn live_server_reads_status_of_temp_repository() {
@@ -590,7 +629,7 @@ mod tests {
 
         let server = GitToolServer::start(dir.to_str().unwrap(), Arc::new(ExchangeLog::disabled()))
             .await
-            .expect("запуск agentcli-git-mcp");
+            .expect("запуск git-mcp");
         let names: Vec<&str> = server.tools().iter().map(|t| t.name.as_str()).collect();
         assert!(names.contains(&"git_status"), "инструменты: {names:?}");
         let text = server.call("git_status", &json!({})).await.expect("git_status");

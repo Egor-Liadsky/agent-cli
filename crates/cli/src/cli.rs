@@ -167,7 +167,7 @@ pub enum ConfigAction {
         #[command(subcommand)]
         action: SummaryAction,
     },
-    /// Умолчания git-инструментов (agentcli-git-mcp) для НОВЫХ чатов и для
+    /// Умолчания git-инструментов (git-mcp) для НОВЫХ чатов и для
     /// `agentcli ask`; настройки уже созданного чата меняются в TUI (Ctrl+P)
     GitTools {
         #[command(subcommand)]
