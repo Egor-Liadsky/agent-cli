@@ -474,7 +474,7 @@ fn parse_tool_list(value: &str) -> Vec<String> {
 fn print_git_tools(config: &Config) {
     println!(
         "{} {}",
-        style("git-инструменты (mcp-server-git):").cyan().bold(),
+        style("git-инструменты (agentcli-git-mcp):").cyan().bold(),
         if config.git_tools_enabled == Some(true) {
             "включены"
         } else {

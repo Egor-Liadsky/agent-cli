@@ -1,10 +1,14 @@
-//! Git-инструменты через MCP: процесс `mcp-server-git`, его инструменты и
+//! Git-инструменты через MCP: процесс `agentcli-git-mcp`, его инструменты и
 //! вызовы.
 //!
+//! Сервер — отдельный бинарник этого workspace (`crates/git-mcp`) на Rust,
+//! без Python и `uv`: инструменты вызывают системный `git`. Имена и
+//! аргументы инструментов совпадают с `mcp-server-git`.
+//!
 //! Сервер запускается лениво — при первой реплике чата с включёнными
-//! инструментами, а не при старте TUI: большинству чатов git не нужен, а
-//! первый `uvx` ещё и скачивает пакет. Один процесс обслуживает один
-//! репозиторий; чаты с тем же репозиторием делят его.
+//! инструментами, а не при старте TUI: большинству чатов git не нужен.
+//! Один процесс обслуживает один репозиторий; чаты с тем же репозиторием
+//! делят его.
 
 use crate::tool_loop::ToolExecutor;
 use agentcore::agent::{AgentError, ToolCall, ToolSpec};
@@ -22,7 +26,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
 
-pub const SERVER_NAME: &str = "mcp-server-git";
+pub const SERVER_NAME: &str = "agentcli-git-mcp";
 
 /// Инструменты, которые только читают репозиторий. Всё прочее — пишущее,
 /// включая инструменты будущих версий сервера: неизвестное считается
@@ -38,12 +42,15 @@ pub const READ_ONLY_TOOLS: [&str; 7] = [
     "git_branch",
 ];
 
-/// Аргумент пути к репозиторию, который есть у каждого инструмента сервера.
-/// Модели он не показывается: путь подставляет клиент.
+/// Аргумент пути к репозиторию у инструментов `mcp-server-git`. Свой сервер
+/// его не объявляет и берёт репозиторий только из `--repository`; клиент
+/// всё равно убирает его из схем и подставляет сам — защита не должна
+/// зависеть от того, какой сервер запущен.
 const REPO_PATH_ARG: &str = "repo_path";
 
-/// Запуск: рукопожатие и `tools/list`. Первый `uvx` скачивает пакет.
-const START_TIMEOUT: Duration = Duration::from_secs(60);
+/// Запуск: процесс, рукопожатие и `tools/list`. Локальному бинарнику
+/// хватает долей секунды; предел ловит зависший процесс.
+const START_TIMEOUT: Duration = Duration::from_secs(10);
 /// Один вызов инструмента.
 pub const CALL_TIMEOUT: Duration = Duration::from_secs(30);
 /// Штатная остановка сервиса `rmcp`, после неё — `kill`.
@@ -55,8 +62,28 @@ pub const MAX_RESULT_CHARS: usize = 16_000;
 /// Предел результата в журнале обмена.
 const MAX_LOG_RESULT_CHARS: usize = 4_000;
 
-const CALL_URL: &str = "mcp+stdio://mcp-server-git/tools/call";
-const LIST_URL: &str = "mcp+stdio://mcp-server-git/tools/list";
+const CALL_URL: &str = "mcp+stdio://agentcli-git-mcp/tools/call";
+const LIST_URL: &str = "mcp+stdio://agentcli-git-mcp/tools/list";
+
+/// Где искать сервер: рядом с исполняемым файлом `agentcli` — туда его
+/// кладут `cargo build` (`target/<профиль>/`) и `cargo install` (`~/.cargo/bin`),
+/// — иначе по `PATH`. Тестовый бинарник лежит в `target/<профиль>/deps/`,
+/// поэтому проверяется и родительский каталог `deps`.
+pub fn server_program() -> PathBuf {
+    let name = format!("{SERVER_NAME}{}", std::env::consts::EXE_SUFFIX);
+    if let Some(dir) = std::env::current_exe().ok().and_then(|exe| exe.parent().map(Path::to_path_buf)) {
+        let mut candidates = vec![dir.join(&name)];
+        if dir.file_name().is_some_and(|dir_name| dir_name == "deps")
+            && let Some(parent) = dir.parent()
+        {
+            candidates.push(parent.join(&name));
+        }
+        if let Some(found) = candidates.into_iter().find(|candidate| candidate.is_file()) {
+            return found;
+        }
+    }
+    PathBuf::from(name)
+}
 
 pub fn is_read_only(name: &str) -> bool {
     READ_ONLY_TOOLS.contains(&name)
@@ -199,26 +226,27 @@ struct Running {
     service: RunningService<RoleClient, ()>,
 }
 
-/// Процесс `mcp-server-git` одного репозитория.
+/// Процесс `agentcli-git-mcp` одного репозитория.
 pub struct GitToolServer {
     repository: PathBuf,
     /// Программа и аргументы до `--repository`: в тестах — несуществующая
-    /// команда вместо `uvx`.
+    /// команда вместо сервера.
     program: String,
     args: Vec<String>,
     log: Arc<ExchangeLog>,
     /// Список инструментов фиксируется на время жизни процесса:
-    /// `notifications/tools/list_changed` не обрабатывается, у
-    /// `mcp-server-git` набор статичный.
+    /// `notifications/tools/list_changed` не обрабатывается, набор у
+    /// сервера статичный.
     tools: Vec<ServerTool>,
     running: Mutex<Option<Running>>,
 }
 
 impl GitToolServer {
-    /// Запуск `uvx mcp-server-git --repository <путь>` с проверкой пути,
+    /// Запуск `agentcli-git-mcp --repository <путь>` с проверкой пути,
     /// рукопожатием и полным `tools/list`.
     pub async fn start(repository: &str, log: Arc<ExchangeLog>) -> Result<Arc<Self>> {
-        Self::start_with("uvx", &[SERVER_NAME], repository, log).await
+        let program = server_program();
+        Self::start_with(&program.to_string_lossy(), &[], repository, log).await
     }
 
     pub async fn start_with(
@@ -261,7 +289,8 @@ impl GitToolServer {
             .map_err(|err| {
                 if err.kind() == std::io::ErrorKind::NotFound {
                     unavailable(format!(
-                        "не найден {}: установите uv (https://docs.astral.sh/uv/) — он даёт команду uvx",
+                        "не найден {}: соберите его вместе с agentcli (cargo build в agent-cli) \
+                         или установите рядом с agentcli (cargo install --path crates/git-mcp)",
                         self.program
                     ))
                 } else {
@@ -283,7 +312,7 @@ impl GitToolServer {
         .await
         .map_err(|_| {
             unavailable(format!(
-                "сервер не запустился за {} с (первый запуск uvx требует сети)",
+                "сервер не запустился за {} с",
                 START_TIMEOUT.as_secs()
             ))
         })??;
@@ -522,11 +551,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn missing_uvx_is_server_unavailable() {
-        let repo = temp_repo("no-uvx");
+    async fn missing_server_binary_is_server_unavailable() {
+        let repo = temp_repo("no-server");
         let err = GitToolServer::start_with(
-            "agentcli-no-such-uvx-binary",
-            &[SERVER_NAME],
+            "agentcli-no-such-git-mcp-binary",
+            &[],
             repo.to_str().unwrap(),
             Arc::new(ExchangeLog::disabled()),
         )
@@ -536,15 +565,16 @@ mod tests {
         match err.downcast_ref::<AgentError>() {
             Some(AgentError::ToolServerUnavailable { server, reason }) => {
                 assert_eq!(server, SERVER_NAME);
-                assert!(reason.contains("установите uv"), "причина: {reason}");
+                assert!(reason.contains("cargo install --path crates/git-mcp"), "причина: {reason}");
             }
             other => panic!("ожидался ToolServerUnavailable, получено: {other:?}"),
         }
         let _ = std::fs::remove_dir_all(repo);
     }
 
-    /// Живой тест с настоящим `uvx mcp-server-git`: требует сети при первом
-    /// запуске и установленного `uv`.
+    /// Живой тест с настоящим `agentcli-git-mcp`: бинарник должен быть
+    /// собран (`cargo build -p agentcli-git-mcp`), поэтому тест под `ignore` —
+    /// `cargo test -p agentcli` сервер не собирает.
     #[tokio::test]
     #[ignore]
     async fn live_server_reads_status_of_temp_repository() {
@@ -560,7 +590,7 @@ mod tests {
 
         let server = GitToolServer::start(dir.to_str().unwrap(), Arc::new(ExchangeLog::disabled()))
             .await
-            .expect("запуск mcp-server-git");
+            .expect("запуск agentcli-git-mcp");
         let names: Vec<&str> = server.tools().iter().map(|t| t.name.as_str()).collect();
         assert!(names.contains(&"git_status"), "инструменты: {names:?}");
         let text = server.call("git_status", &json!({})).await.expect("git_status");

@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/core", "crates/upstream", "crates/client", "crates/cli"]
+members = ["crates/core", "crates/upstream", "crates/client", "crates/cli", "crates/git-mcp"]
 
 [workspace.package]
 version = "0.1.0"

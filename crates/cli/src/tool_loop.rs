@@ -26,7 +26,7 @@ pub const LIMIT_RESULT: &str =
 pub const TOO_MANY_CALLS_RESULT: &str =
     "слишком много вызовов за один ответ: этот вызов не выполнен, повтори его следующим шагом";
 
-/// Исполнитель инструментов (для git — процесс `mcp-server-git`).
+/// Исполнитель инструментов (для git — процесс `agentcli-git-mcp`).
 #[async_trait]
 pub trait ToolExecutor: Send + Sync {
     /// Описания инструментов, доступных модели в этом ходе.
@@ -481,7 +481,7 @@ mod tests {
         let mut executor = FakeExecutor::new();
         executor.fail_with = Some(|| {
             AgentError::ToolServerUnavailable {
-                server: "mcp-server-git".into(),
+                server: "agentcli-git-mcp".into(),
                 reason: "упал".into(),
             }
             .into()

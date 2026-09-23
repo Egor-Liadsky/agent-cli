@@ -158,7 +158,7 @@ struct ToolApprovalRequest {
     reply: tokio::sync::oneshot::Sender<bool>,
 }
 
-/// Процессы `mcp-server-git` по каноническому пути репозитория: чаты с одним
+/// Процессы `agentcli-git-mcp` по каноническому пути репозитория: чаты с одним
 /// репозиторием делят процесс.
 type ToolServers = Arc<tokio::sync::Mutex<HashMap<PathBuf, Arc<GitToolServer>>>>;
 
@@ -529,7 +529,7 @@ impl SettingsSection {
                 "Профиль владельца: роль, стиль, формат и ограничения ответа, заданные сервисом."
             }
             SettingsSection::Tools => {
-                "Git-инструменты (mcp-server-git): модель читает репозиторий сама, а пишущие вызовы выполняются только после подтверждения."
+                "Git-инструменты (MCP-сервер agentcli-git-mcp): модель читает репозиторий сама, а пишущие вызовы выполняются только после подтверждения."
             }
             SettingsSection::Format => "Формат ответа: кастомный режим, длина, стоп-условия.",
             SettingsSection::Reasoning => {
@@ -795,8 +795,8 @@ AGENTD_TASK_STATE_ENABLED (по умолчанию выключено)."
             }
             FormatField::GitToolsEnabled => {
                 "◀/▶ или Space — переключить. Подключает к ходам этого чата git-инструменты: клиент при первом ходе \
-запускает uvx mcp-server-git для репозитория ниже. Читающие инструменты (статус, диффы, лог, show, ветки) \
-выполняются сразу, пишущие — только после подтверждения в отдельном окне. Нужен установленный uv."
+запускает agentcli-git-mcp для репозитория ниже. Читающие инструменты (статус, диффы, лог, show, ветки) \
+выполняются сразу, пишущие — только после подтверждения в отдельном окне. Бинарник собирается вместе с agentcli."
             }
             FormatField::GitRepository => {
                 "Путь к git-репозиторию на этой машине. Модель работает только с ним: путь подставляет клиент, \
@@ -8152,7 +8152,7 @@ mod tests {
         handle_tool_server_failed(
             "chat-1".to_string(),
             "покажи статус".to_string(),
-            "не найден uvx".to_string(),
+            "не найден agentcli-git-mcp".to_string(),
             &mut state,
         );
 
@@ -8160,7 +8160,7 @@ mod tests {
         let ui = &state.chat_ui["chat-1"];
         assert_eq!(ui.input, "покажи статус");
         assert!(!ui.pending);
-        assert!(state.active_notice().unwrap().contains("uvx"));
+        assert!(state.active_notice().unwrap().contains("agentcli-git-mcp"));
     }
 
     #[test]

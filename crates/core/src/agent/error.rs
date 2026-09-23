@@ -227,8 +227,8 @@ mod tests {
                 request_id: Some("req-1".into()),
             },
             AgentError::ToolServerUnavailable {
-                server: "mcp-server-git".into(),
-                reason: "не найден uvx".into(),
+                server: "agentcli-git-mcp".into(),
+                reason: "не найден agentcli-git-mcp".into(),
             },
             AgentError::ToolLoopLimit { iterations: 8 },
         ];

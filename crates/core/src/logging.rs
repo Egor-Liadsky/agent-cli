@@ -398,7 +398,7 @@ mod tests {
         log.log_request(&RequestLogEntry {
             id: "id-4",
             timestamp: 42,
-            url: "mcp+stdio://mcp-server-git/tools/call",
+            url: "mcp+stdio://agentcli-git-mcp/tools/call",
             model: "git_diff",
             request: serde_json::json!({
                 "diff": "+OPENAI_KEY=sk-abcdefghijklmnop1234\n+db password=hunter2secret",
