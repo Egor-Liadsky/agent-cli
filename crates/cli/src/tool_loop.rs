@@ -242,6 +242,49 @@ impl TurnBackend for HistoryTurn<'_> {
     }
 }
 
+/// Несколько исполнителей в одном ходе (git-mcp и activity-mcp): вызов
+/// уходит тому, чьи описания содержат имя инструмента. Имена у серверов
+/// разные по префиксу (`git_*`, `activity_*`), так что первый подходящий —
+/// единственный.
+#[derive(Default)]
+pub struct ToolSet<'a> {
+    executors: Vec<&'a dyn ToolExecutor>,
+}
+
+impl<'a> ToolSet<'a> {
+    pub fn with(mut self, executor: Option<&'a dyn ToolExecutor>) -> Self {
+        self.executors.extend(executor);
+        self
+    }
+
+    fn owner(&self, name: &str) -> Option<&'a dyn ToolExecutor> {
+        self.executors
+            .iter()
+            .copied()
+            .find(|executor| executor.specs().iter().any(|spec| spec.name == name))
+    }
+}
+
+#[async_trait]
+impl ToolExecutor for ToolSet<'_> {
+    fn specs(&self) -> Vec<ToolSpec> {
+        self.executors.iter().flat_map(|executor| executor.specs()).collect()
+    }
+
+    /// Инструмент без владельца — пишущий: неизвестное опасно, а не
+    /// безопасно, как и в `mcp::is_read_only`.
+    fn is_write(&self, name: &str) -> bool {
+        self.owner(name).is_none_or(|executor| executor.is_write(name))
+    }
+
+    async fn call(&self, call: &ToolCall) -> Result<String> {
+        match self.owner(&call.name) {
+            Some(executor) => executor.call(call).await,
+            None => Ok(NOT_ALLOWED_RESULT.to_string()),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -520,5 +563,48 @@ mod tests {
         let results = trailing_results(&turn);
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].content, "b");
+    }
+
+    /// Второй исполнитель с одним читающим инструментом.
+    struct Activity;
+
+    #[async_trait]
+    impl ToolExecutor for Activity {
+        fn specs(&self) -> Vec<ToolSpec> {
+            vec![ToolSpec {
+                name: "activity_changes".into(),
+                description: None,
+                parameters: json!({ "type": "object" }),
+            }]
+        }
+
+        fn is_write(&self, _name: &str) -> bool {
+            false
+        }
+
+        async fn call(&self, call: &ToolCall) -> Result<String> {
+            Ok(format!("активность {}", call.name))
+        }
+    }
+
+    #[tokio::test]
+    async fn tool_set_routes_calls_by_owner() {
+        let git = FakeExecutor::new();
+        let activity = Activity;
+        let set = ToolSet::default()
+            .with(Some(&git as &dyn ToolExecutor))
+            .with(None)
+            .with(Some(&activity as &dyn ToolExecutor));
+        let names: Vec<String> = set.specs().into_iter().map(|spec| spec.name).collect();
+        assert_eq!(names, vec!["git_status", "git_add", "activity_changes"]);
+        assert!(!set.is_write("git_status"));
+        assert!(set.is_write("git_add"));
+        assert!(!set.is_write("activity_changes"));
+        assert!(set.is_write("unknown_tool"));
+        assert_eq!(set.call(&call("1", "activity_changes")).await.unwrap(), "активность activity_changes");
+        assert_eq!(set.call(&call("2", "git_status")).await.unwrap(), "вывод git_status");
+        assert_eq!(set.call(&call("3", "unknown_tool")).await.unwrap(), NOT_ALLOWED_RESULT);
+        assert_eq!(git.called(), vec!["git_status"]);
+        assert!(ToolSet::default().specs().is_empty());
     }
 }

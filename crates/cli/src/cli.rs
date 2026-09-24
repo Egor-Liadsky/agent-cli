@@ -48,6 +48,31 @@ pub enum Commands {
         #[command(subcommand)]
         action: ProfilesAction,
     },
+    /// Сводки активности проектов от демона activity-mcp (адрес и токен —
+    /// `config activity`)
+    Activity {
+        #[command(subcommand)]
+        action: ActivityAction,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum ActivityAction {
+    /// Показать непрочитанные сводки и отметить их прочитанными
+    Digest {
+        /// Показать и уже прочитанные (последние 5)
+        #[arg(long)]
+        all: bool,
+        /// Не отмечать показанные сводки прочитанными
+        #[arg(long)]
+        keep_unread: bool,
+    },
+    /// Собрать сводку сейчас, вне расписания демона
+    Build,
+    /// Отметить сводку прочитанной
+    Ack { id: i64 },
+    /// Проверить связь с демоном и показать наблюдаемые проекты
+    Status,
 }
 
 #[derive(Subcommand)]
@@ -173,6 +198,12 @@ pub enum ConfigAction {
         #[command(subcommand)]
         action: GitToolsAction,
     },
+    /// Подключение к демону activity-mcp: сводки в TUI и инструменты
+    /// activity_* для модели
+    Activity {
+        #[command(subcommand)]
+        action: ActivityConfigAction,
+    },
     /// Задать путь к файлу инвариантов (`invariants.toml`)
     SetInvariantsPath {
         /// Путь к файлу; пустая строка снимает умолчание
@@ -203,6 +234,34 @@ pub enum GitToolsAction {
     /// Снять все умолчания git-инструментов: новые чаты создаются без них
     Clear,
     /// Показать текущие умолчания
+    Show,
+}
+
+#[derive(Subcommand)]
+pub enum ActivityConfigAction {
+    /// Включить или выключить сводки и задать параметры подключения
+    Set {
+        /// true/false, on/off, yes/no
+        enabled: Option<String>,
+        /// Адрес MCP демона, по умолчанию http://127.0.0.1:7878/mcp; пустая
+        /// строка — адрес по умолчанию
+        #[arg(long)]
+        url: Option<String>,
+        /// Bearer-токен (если демон запущен с --token-file); пустая строка
+        /// — без токена
+        #[arg(long)]
+        token: Option<String>,
+        /// Как часто TUI спрашивает о новых сводках, секунды (от 10, по
+        /// умолчанию 300)
+        #[arg(long = "poll-secs")]
+        poll_secs: Option<u64>,
+        /// Давать модели в чатах читающие инструменты activity_*: true/false
+        #[arg(long = "chat-tools")]
+        chat_tools: Option<String>,
+    },
+    /// Снять все настройки activity-mcp: сводки выключены
+    Clear,
+    /// Показать текущие настройки
     Show,
 }
 

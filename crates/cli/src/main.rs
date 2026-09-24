@@ -1,3 +1,4 @@
+mod activity;
 mod agent;
 mod chats;
 mod clipboard;
@@ -13,7 +14,7 @@ use agentcore::agent::{Agent, AgentReply, Message, MessageMeta};
 use anyhow::Context;
 use clap::Parser;
 use cli::{
-    BranchesAction, Cli, Commands, ConfigAction, ContextLimitAction, FactsAction, FormatAction,
+    ActivityAction, ActivityConfigAction, BranchesAction, Cli, Commands, ConfigAction, ContextLimitAction, FactsAction, FormatAction,
     GitToolsAction, OllamaAction, ProfilesAction, SamplingAction, SummaryAction,
 };
 use agentcore::config::{Config, Provider, ReasoningMode, ThinkingMode};
@@ -39,6 +40,7 @@ async fn main() -> anyhow::Result<()> {
         Commands::Facts { chat_id, action } => run_facts(chat_id, action).await?,
         Commands::Branches { chat_id, action } => run_branches(chat_id, action).await?,
         Commands::Profiles { action } => run_profiles(action).await?,
+        Commands::Activity { action } => run_activity(action).await?,
     }
 
     Ok(())
@@ -161,8 +163,8 @@ async fn run_ask(prompt: String) -> anyhow::Result<()> {
         CliAgent::from_config(&config, exchange_log())?.with_unauthorized_hint(UNAUTHORIZED_HINT);
     let history = vec![Message::user(prompt)];
     let settings = config.default_chat_settings();
-    let reply = if settings.git_tools_active() {
-        ask_with_git_tools(&agent, &history, &settings).await?
+    let reply = if settings.git_tools_active() || config.activity_chat_tools_active() {
+        ask_with_tools(&agent, &history, &settings, &config).await?
     } else {
         ask_with_spinner(&agent, &history, &settings).await?
     };
@@ -249,6 +251,7 @@ fn run_config(action: ConfigAction) -> anyhow::Result<()> {
         ConfigAction::ContextLimit { action } => run_context_limit_action(action)?,
         ConfigAction::Summary { action } => run_summary_action(action)?,
         ConfigAction::GitTools { action } => run_git_tools_action(action)?,
+        ConfigAction::Activity { action } => run_activity_config(action)?,
         ConfigAction::SetInvariantsPath { path } => {
             let mut config = load_config()?;
             config.invariants_path = if path.trim().is_empty() { None } else { Some(path) };
@@ -462,6 +465,153 @@ fn run_git_tools_action(action: GitToolsAction) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn run_activity_config(action: ActivityConfigAction) -> anyhow::Result<()> {
+    match action {
+        ActivityConfigAction::Set {
+            enabled,
+            url,
+            token,
+            poll_secs,
+            chat_tools,
+        } => {
+            if enabled.is_none() && url.is_none() && token.is_none() && poll_secs.is_none() && chat_tools.is_none() {
+                anyhow::bail!("укажите хотя бы одно значение: enabled, --url, --token, --poll-secs или --chat-tools");
+            }
+            if let Some(secs) = poll_secs
+                && secs < agentcore::config::MIN_ACTIVITY_POLL_SECS
+            {
+                anyhow::bail!("--poll-secs должен быть не меньше {}", agentcore::config::MIN_ACTIVITY_POLL_SECS);
+            }
+            let mut config = load_config()?;
+            if let Some(enabled) = enabled {
+                config.activity_enabled = Some(parse_bool_flag(&enabled)?);
+            }
+            if let Some(url) = url {
+                config.activity_url = Some(url).filter(|url| !url.trim().is_empty());
+            }
+            if let Some(token) = token {
+                config.activity_token = Some(token).filter(|token| !token.trim().is_empty());
+            }
+            if poll_secs.is_some() {
+                config.activity_poll_secs = poll_secs;
+            }
+            if let Some(chat_tools) = chat_tools {
+                config.activity_chat_tools = Some(parse_bool_flag(&chat_tools)?);
+            }
+            config.save()?;
+            println!("{}", style("Настройки activity-mcp сохранены.").green().bold());
+            print_activity(&config);
+        }
+        ActivityConfigAction::Clear => {
+            let mut config = load_config()?;
+            config.activity_enabled = None;
+            config.activity_url = None;
+            config.activity_token = None;
+            config.activity_poll_secs = None;
+            config.activity_chat_tools = None;
+            config.save()?;
+            println!("{}", style("Настройки activity-mcp сняты.").green().bold());
+        }
+        ActivityConfigAction::Show => print_activity(&load_config()?),
+    }
+    Ok(())
+}
+
+fn print_activity(config: &Config) {
+    let on_off = |value: bool| if value { "включены" } else { "выключены" };
+    println!(
+        "{} {}",
+        style("сводки активности (activity-mcp):").cyan().bold(),
+        on_off(config.activity_active())
+    );
+    println!("{} {}", style("адрес:").cyan().bold(), config.effective_activity_url());
+    println!(
+        "{} {}",
+        style("токен:").cyan().bold(),
+        if config.activity_token.is_some() { "задан" } else { "<нет>" }
+    );
+    println!(
+        "{} {} с",
+        style("опрос новых сводок:").cyan().bold(),
+        config.effective_activity_poll_secs()
+    );
+    println!(
+        "{} {}",
+        style("инструменты activity_* в чатах:").cyan().bold(),
+        on_off(config.activity_chat_tools_active())
+    );
+}
+
+/// Команды `agentcli activity`: одно соединение с демоном на команду.
+async fn run_activity(action: ActivityAction) -> anyhow::Result<()> {
+    let config = load_config()?;
+    let endpoint = activity::Endpoint::from_config(&config);
+    let client = activity::ActivityClient::connect(&endpoint, exchange_log()).await?;
+    let result = run_activity_action(&client, action).await;
+    client.close().await;
+    result
+}
+
+fn print_digest(digest: &activity::Digest) {
+    let mark = if digest.acked { " (прочитана)" } else { "" };
+    println!(
+        "{}",
+        style(format!("Сводка #{}{mark}: {} — {}", digest.id, digest.period_from, digest.period_to))
+            .cyan()
+            .bold()
+    );
+    print_markdown(&digest.text);
+    println!();
+}
+
+async fn run_activity_action(client: &activity::ActivityClient, action: ActivityAction) -> anyhow::Result<()> {
+    match action {
+        ActivityAction::Digest { all, keep_unread } => {
+            let mut digests = client.digests(!all, if all { 5 } else { 20 }).await?;
+            if digests.is_empty() {
+                println!("{}", if all { "Сводок пока нет." } else { "Непрочитанных сводок нет." });
+            }
+            // Старые первыми: читаются в том порядке, в каком шли периоды.
+            digests.reverse();
+            for digest in &digests {
+                print_digest(digest);
+                if !digest.acked && !keep_unread {
+                    client.ack(digest.id).await?;
+                }
+            }
+        }
+        ActivityAction::Build => match client.build_digest().await? {
+            Some(digest) => print_digest(&digest),
+            None => println!("С прошлой сводки изменений нет."),
+        },
+        ActivityAction::Ack { id } => {
+            client.ack(id).await?;
+            println!("Сводка {id} отмечена прочитанной.");
+        }
+        ActivityAction::Status => {
+            let (content, is_error) = client.call("activity_projects", &serde_json::json!({})).await?;
+            let text: String = content
+                .iter()
+                .filter_map(|item| item.get("text").and_then(serde_json::Value::as_str))
+                .collect();
+            if is_error {
+                anyhow::bail!("activity_projects: {text}");
+            }
+            let parsed: serde_json::Value = serde_json::from_str(&text)?;
+            let projects = parsed["projects"].as_array().cloned().unwrap_or_default();
+            let active: Vec<&serde_json::Value> = projects.iter().filter(|p| p["removed"] != true).collect();
+            println!("{} {}", style("демон доступен, проектов:").green().bold(), active.len());
+            for project in active {
+                let branch = project["branch"].as_str().unwrap_or("-");
+                let dirty = project["uncommitted_files"].as_i64().unwrap_or(0);
+                let dirty = if dirty > 0 { format!(", незакоммичено: {dirty}") } else { String::new() };
+                println!("  {} ({branch}{dirty})", project["name"].as_str().unwrap_or("?"));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Список инструментов через запятую, без пустых элементов.
 fn parse_tool_list(value: &str) -> Vec<String> {
     value
@@ -663,6 +813,7 @@ fn show_config() -> anyhow::Result<()> {
     print_context_limit(&config);
     print_summary(&config);
     print_git_tools(&config);
+    print_activity(&config);
     print_invariants_path(&config);
     Ok(())
 }
@@ -1021,17 +1172,40 @@ impl tool_loop::TurnObserver for SpinnerObserver {
     }
 }
 
-/// Разовый вопрос с git-инструментами: сервер запускается на время команды.
-async fn ask_with_git_tools(
+/// Разовый вопрос с инструментами: git-сервер запускается на время
+/// команды, к демону activity-mcp — соединение на время команды.
+async fn ask_with_tools(
     agent: &CliAgent,
     history: &[Message],
     settings: &agentcore::config::ChatSettings,
+    config: &Config,
 ) -> anyhow::Result<AgentReply> {
-    let repository = settings.git_repository.clone().unwrap_or_default();
-    let server = mcp::GitToolServer::start(&repository, exchange_log()).await?;
-    let tools = mcp::GitTools {
+    let git = if settings.git_tools_active() {
+        let repository = settings.git_repository.clone().unwrap_or_default();
+        Some(mcp::GitToolServer::start(&repository, exchange_log()).await?)
+    } else {
+        None
+    };
+    let git_tools = git.as_ref().map(|server| mcp::GitTools {
         server: server.clone(),
         allowed_writes: settings.git_allowed_tools.clone(),
+    });
+    // Демон сводок необязателен: без него вопрос задаётся без его
+    // инструментов, а не отклоняется.
+    let activity_tools = if config.activity_chat_tools_active() {
+        match activity::ActivityTools::connect(&activity::Endpoint::from_config(config), exchange_log()).await {
+            Ok(tools) => Some(tools),
+            Err(err) => {
+                eprintln!(
+                    "{} {}",
+                    style("Внимание:").yellow().bold(),
+                    style(format!("инструменты activity_* недоступны: {err}")).yellow()
+                );
+                None
+            }
+        }
+    } else {
+        None
     };
     let spinner = ProgressBar::new_spinner();
     spinner.set_style(
@@ -1042,22 +1216,32 @@ async fn ask_with_git_tools(
     spinner.set_message(style("Агент думает...").magenta().to_string());
     spinner.enable_steady_tick(Duration::from_millis(80));
 
-    let mut backend = tool_loop::HistoryTurn {
-        agent,
-        history,
-        settings,
+    let result = {
+        let tools = tool_loop::ToolSet::default()
+            .with(git_tools.as_ref().map(|tools| tools as &dyn tool_loop::ToolExecutor))
+            .with(activity_tools.as_ref().map(|tools| tools as &dyn tool_loop::ToolExecutor));
+        let mut backend = tool_loop::HistoryTurn {
+            agent,
+            history,
+            settings,
+        };
+        let observer = SpinnerObserver(spinner.clone());
+        tool_loop::run_tool_loop(
+            &mut backend,
+            &tools,
+            &DenyWrites,
+            settings.effective_tool_max_iterations(),
+            &observer,
+        )
+        .await
     };
-    let observer = SpinnerObserver(spinner.clone());
-    let result = tool_loop::run_tool_loop(
-        &mut backend,
-        &tools,
-        &DenyWrites,
-        settings.effective_tool_max_iterations(),
-        &observer,
-    )
-    .await;
     spinner.finish_and_clear();
-    server.shutdown().await;
+    if let Some(server) = git {
+        server.shutdown().await;
+    }
+    if let Some(tools) = activity_tools {
+        tools.close().await;
+    }
     result.map_err(|err| err.error)
 }
 

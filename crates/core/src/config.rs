@@ -572,6 +572,55 @@ pub struct Config {
     pub git_allowed_tools: Option<Vec<String>>,
     #[serde(default)]
     pub tool_max_iterations: Option<u32>,
+    /// Сводки активности проектов от демона `activity-mcp`. Не чатовые
+    /// умолчания, а свойство клиента: демон один на машину, и его сводки
+    /// показываются вне зависимости от открытого чата. Выключено, пока не
+    /// включено явно: без запущенного демона клиент не должен его искать.
+    #[serde(default)]
+    pub activity_enabled: Option<bool>,
+    /// Адрес MCP демона. Пусто — `DEFAULT_ACTIVITY_URL`.
+    #[serde(default)]
+    pub activity_url: Option<String>,
+    /// Bearer-токен, если демон запущен с `--token-file`.
+    #[serde(default)]
+    pub activity_token: Option<String>,
+    /// Как часто спрашивать демон о новых сводках, секунды.
+    #[serde(default)]
+    pub activity_poll_secs: Option<u64>,
+    /// Давать модели в чатах читающие инструменты `activity_*`.
+    #[serde(default)]
+    pub activity_chat_tools: Option<bool>,
+}
+
+/// Адрес `activity-mcp` по умолчанию — тот, что слушает демон без `--listen`.
+pub const DEFAULT_ACTIVITY_URL: &str = "http://127.0.0.1:7878/mcp";
+/// Период опроса демона по умолчанию: сводки собираются раз в несколько
+/// часов, чаще спрашивать незачем.
+pub const DEFAULT_ACTIVITY_POLL_SECS: u64 = 300;
+/// Нижняя граница периода опроса.
+pub const MIN_ACTIVITY_POLL_SECS: u64 = 10;
+
+impl Config {
+    pub fn activity_active(&self) -> bool {
+        self.activity_enabled == Some(true)
+    }
+
+    pub fn activity_chat_tools_active(&self) -> bool {
+        self.activity_active() && self.activity_chat_tools == Some(true)
+    }
+
+    pub fn effective_activity_url(&self) -> String {
+        self.activity_url
+            .clone()
+            .filter(|url| !url.trim().is_empty())
+            .unwrap_or_else(|| DEFAULT_ACTIVITY_URL.to_string())
+    }
+
+    pub fn effective_activity_poll_secs(&self) -> u64 {
+        self.activity_poll_secs
+            .unwrap_or(DEFAULT_ACTIVITY_POLL_SECS)
+            .max(MIN_ACTIVITY_POLL_SECS)
+    }
 }
 
 impl Config {

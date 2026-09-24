@@ -1,4 +1,5 @@
 use crate::agent::CliAgent;
+use crate::activity::ActivityTools;
 use crate::mcp::{GitToolServer, GitTools};
 use crate::tool_loop::{self, ToolApprover, TurnObserver};
 use agentcore::agent::{AgentReply, Message, MessageMeta, Role, ToolCall};
@@ -75,6 +76,10 @@ enum ChatEvent {
     /// Ход с инструментами прервался ошибкой после стольких выполненных
     /// вызовов.
     ToolTurnFailed(String, anyhow::Error, usize),
+    /// Непрочитанные сводки activity-mcp: фоновый опрос демона.
+    ActivityDigests(Result<Vec<crate::activity::Digest>, String>),
+    /// Итог действия со сводкой или с демоном — в строку уведомлений.
+    ActivityNotice(String),
     /// Список локальных моделей Ollama: пришёл фоновой задачей.
     OllamaModels(Result<Vec<String>, String>),
     /// Список облачных моделей сервиса: пришёл фоновой задачей.
@@ -147,6 +152,8 @@ enum Focus {
     Branches,
     Memory,
     Task,
+    /// Экран сводок activity-mcp (`Ctrl+A`).
+    Activity,
 }
 
 /// Запрос подтверждения пишущего вызова инструмента. Ответ уходит циклу
@@ -1781,6 +1788,70 @@ impl Default for ChatUi {
     }
 }
 
+/// Сводки демона activity-mcp. Демон один на машину, а не на чат, поэтому
+/// состояние глобальное: сводка видна, какой бы чат ни был открыт.
+#[derive(Default)]
+struct ActivityState {
+    /// Непрочитанные сводки, старые первыми.
+    digests: Vec<crate::activity::Digest>,
+    /// Последняя ошибка связи с демоном: видна на экране сводок, а не
+    /// всплывает уведомлением при каждом опросе.
+    error: Option<String>,
+    /// Первый ответ демона (или отказ) уже пришёл.
+    loaded: bool,
+    /// Сводка, открытая на экране.
+    cursor: usize,
+    scroll: u16,
+    /// Предел прокрутки с прошлого кадра: зависит от ширины окна.
+    max_scroll: u16,
+}
+
+impl ActivityState {
+    /// Новый список от демона. Открытая сводка остаётся открытой, если она
+    /// ещё в списке. Возвращает число сводок, которых раньше не было.
+    fn replace(&mut self, digests: Vec<crate::activity::Digest>) -> usize {
+        let fresh = digests
+            .iter()
+            .filter(|digest| !self.digests.iter().any(|old| old.id == digest.id))
+            .count();
+        let current = self.current().map(|digest| digest.id);
+        self.digests = digests;
+        let position = current.and_then(|id| self.digests.iter().position(|digest| digest.id == id));
+        if position != Some(self.cursor) {
+            self.scroll = 0;
+        }
+        self.cursor = position.unwrap_or(0);
+        fresh
+    }
+
+    fn current(&self) -> Option<&crate::activity::Digest> {
+        self.digests.get(self.cursor)
+    }
+
+    fn select(&mut self, delta: isize) {
+        if self.digests.is_empty() {
+            return;
+        }
+        let last = self.digests.len() as isize - 1;
+        let cursor = (self.cursor as isize + delta).clamp(0, last) as usize;
+        if cursor != self.cursor {
+            self.cursor = cursor;
+            self.scroll = 0;
+        }
+    }
+
+    /// Убирает открытую сводку из списка: она прочитана.
+    fn take_current(&mut self) -> Option<crate::activity::Digest> {
+        if self.cursor >= self.digests.len() {
+            return None;
+        }
+        let digest = self.digests.remove(self.cursor);
+        self.cursor = self.cursor.min(self.digests.len().saturating_sub(1));
+        self.scroll = 0;
+        Some(digest)
+    }
+}
+
 struct AppState {
     /// Глобальный конфиг: ключ API, адрес и модель по умолчанию.
     config: Config,
@@ -1813,6 +1884,8 @@ struct AppState {
     memory: Option<MemoryPicker>,
     /// Экран состояния задачи чата, если он открыт.
     task: Option<TaskPicker>,
+    /// Сводки activity-mcp: непрочитанные и экран `Ctrl+A`.
+    activity: ActivityState,
     /// Короткое уведомление внизу экрана (например, «скопировано»).
     notice: Option<(String, Instant)>,
     /// Показывать ли цепочку рассуждений модели в истории.
@@ -1921,7 +1994,7 @@ impl AppState {
             }
             return;
         }
-        if matches!(self.focus, Focus::Import | Focus::Confirm | Focus::Facts | Focus::Branches | Focus::Memory) {
+        if matches!(self.focus, Focus::Import | Focus::Confirm | Focus::Facts | Focus::Branches | Focus::Memory | Focus::Activity) {
             return;
         }
         let Some(chat_id) = self.active_chat_id() else {
@@ -1968,6 +2041,7 @@ async fn run_app(
         branches: None,
         memory: None,
         task: None,
+        activity: ActivityState::default(),
         notice: None,
         show_reasoning: true,
         ollama_models: Vec::new(),
@@ -1991,6 +2065,9 @@ async fn run_app(
     // Список чатов тоже тянем фоном: сервис может быть недоступен, и тогда
     // TUI открывается с баннером причины, а не падает.
     fetch_chats(&state, &tx);
+    // Сводки activity-mcp: демон может быть не запущен — тогда экран
+    // сводок покажет причину, а чат работает как обычно.
+    spawn_activity_poller(&state.config, &tx);
     let mut events = EventStream::new();
     let mut tick = tokio::time::interval(Duration::from_millis(80));
     // Кадр рисуется только после изменения состояния: на длинной истории
@@ -2147,7 +2224,7 @@ fn handle_global_key(
         return Some(LoopControl::Break);
     }
     if key.code == KeyCode::Char('n') && key.modifiers.contains(KeyModifiers::CONTROL) {
-        if matches!(state.focus, Focus::Settings | Focus::Import | Focus::Confirm | Focus::Facts | Focus::Branches | Focus::Memory)
+        if matches!(state.focus, Focus::Settings | Focus::Import | Focus::Confirm | Focus::Facts | Focus::Branches | Focus::Memory | Focus::Activity)
             || state.active_pending()
         {
             return Some(LoopControl::Continue);
@@ -2237,7 +2314,7 @@ fn handle_global_key(
         });
         return Some(LoopControl::Continue);
     }
-    if matches!(state.focus, Focus::Settings | Focus::Import | Focus::Confirm | Focus::Facts | Focus::Branches | Focus::Memory) {
+    if matches!(state.focus, Focus::Settings | Focus::Import | Focus::Confirm | Focus::Facts | Focus::Branches | Focus::Memory | Focus::Activity) {
         return None;
     }
     if key.code == KeyCode::Char('w') && key.modifiers.contains(KeyModifiers::CONTROL) {
@@ -2290,7 +2367,7 @@ fn handle_key(
         if state.focus == Focus::Import {
             state.import = None;
             state.focus = Focus::Input;
-        } else if !matches!(state.focus, Focus::Settings | Focus::Confirm | Focus::Facts | Focus::Branches | Focus::Memory)
+        } else if !matches!(state.focus, Focus::Settings | Focus::Confirm | Focus::Facts | Focus::Branches | Focus::Memory | Focus::Activity)
             && let Some(chat_index) = state.active_chat_index() {
                 state.import = Some(ImportPicker::new(&state.chats[chat_index], &state.chats));
                 state.focus = Focus::Import;
@@ -2298,7 +2375,7 @@ fn handle_key(
         return LoopControl::Continue;
     }
     if key.code == KeyCode::Char('p') && key.modifiers.contains(KeyModifiers::CONTROL) {
-        if matches!(state.focus, Focus::Import | Focus::Confirm | Focus::Facts | Focus::Branches | Focus::Memory) {
+        if matches!(state.focus, Focus::Import | Focus::Confirm | Focus::Facts | Focus::Branches | Focus::Memory | Focus::Activity) {
             return LoopControl::Continue;
         }
         if state.focus == Focus::Settings {
@@ -2379,10 +2456,26 @@ fn handle_key(
         }
         return LoopControl::Continue;
     }
+    // Ctrl+A — сводки активности; `ф` — та же клавиша на русской раскладке.
+    if matches!(key.code, KeyCode::Char('a') | KeyCode::Char('ф'))
+        && key.modifiers.contains(KeyModifiers::CONTROL)
+    {
+        if state.focus == Focus::Activity {
+            state.focus = Focus::Input;
+        } else if matches!(state.focus, Focus::Input | Focus::Sidebar) {
+            if state.config.activity_active() {
+                state.activity.scroll = 0;
+                state.focus = Focus::Activity;
+            } else {
+                state.notify("Сводки активности выключены: agentcli config activity set on");
+            }
+        }
+        return LoopControl::Continue;
+    }
     if key.code == KeyCode::Tab
         && !matches!(
             state.focus,
-            Focus::Settings | Focus::Import | Focus::Confirm | Focus::Facts | Focus::Branches | Focus::Memory | Focus::Task | Focus::MessageSelect
+            Focus::Settings | Focus::Import | Focus::Confirm | Focus::Facts | Focus::Branches | Focus::Memory | Focus::Task | Focus::Activity | Focus::MessageSelect
         )
     {
         state.focus = match state.focus {
@@ -2395,6 +2488,7 @@ fn handle_key(
             | Focus::Branches
             | Focus::Memory
             | Focus::Task
+            | Focus::Activity
             | Focus::MessageSelect => unreachable!(),
         };
         return LoopControl::Continue;
@@ -2408,6 +2502,7 @@ fn handle_key(
         Focus::Branches => handle_branches_key(key, state, tx),
         Focus::Memory => handle_memory_key(key, state, tx),
         Focus::Task => handle_task_key(key, state, tx),
+        Focus::Activity => handle_activity_key(key, state, agent, tx),
         Focus::MessageSelect => handle_message_select_key(key, state),
         Focus::Sidebar => handle_sidebar_key(key, state, tx),
         Focus::Input => {
@@ -3423,76 +3518,7 @@ fn handle_input_key(
             if line == "exit" || line == "quit" {
                 return LoopControl::Break;
             }
-            let Some(chat_index) = state.chat_index(&chat_id) else {
-                return LoopControl::Continue;
-            };
-            // Отправлять некуда, пока список чатов не получен от сервиса:
-            // обмену негде записаться.
-            if let Some(reason) = state.blocked_reason() {
-                state.notify(format!("Сообщение не отправлено: {reason}"));
-                return LoopControl::Continue;
-            }
-            // Неполная история испортила бы контекст запроса к модели.
-            if !state.chats[chat_index].history_loaded {
-                ensure_history(state, &chat_id, tx);
-                state.notify("История чата ещё загружается: сообщение не отправлено");
-                return LoopControl::Continue;
-            }
-            // Путь проверяется до отправки: с неверным путём ход не
-            // начинается, а реплика остаётся в поле ввода.
-            let tool_repository = if state.chats[chat_index].settings.git_tools_active() {
-                let path = state.chats[chat_index].settings.git_repository.clone().unwrap_or_default();
-                match crate::mcp::validate_repository(&path) {
-                    Ok(repository) => Some(repository),
-                    Err(err) => {
-                        state.chat_ui.entry(chat_id.clone()).or_default().input = line;
-                        state.notify(format!("Сообщение не отправлено: {err}"));
-                        return LoopControl::Continue;
-                    }
-                }
-            } else {
-                None
-            };
-            state.chats[chat_index].messages.push(Message::user(line.clone()));
-            state.chats[chat_index].touch_quietly();
-            // Заголовок нового чата придумывает сервис после первого обмена
-            // (AGENTD_AUTO_TITLE): клиент больше не подставляет свой,
-            // иначе он гарантированно перебивал бы серверную генерацию,
-            // отправляясь раньше, чем сервис успевал ответить.
-            {
-                let ui = state.chat_ui.entry(chat_id.clone()).or_default();
-                ui.pending = true;
-                ui.pending_since = Some(Instant::now());
-                ui.auto_scroll = true;
-                ui.scroll_to_message = None;
-            }
-
-            let agent = agent.clone();
-            let hist = state.chats[chat_index].messages.clone();
-            let settings = state.chats[chat_index].settings.clone();
-            let tx_response = tx.clone();
-            let event_chat_id = chat_id.clone();
-            let request_chat_id = chat_id.clone();
-            if let Some(repository) = tool_repository {
-                spawn_tool_turn(ToolTurnRequest {
-                    agent,
-                    servers: state.tool_servers.clone(),
-                    repository,
-                    chat_id,
-                    chat_title: state.chats[chat_index].title.clone(),
-                    line,
-                    history: hist,
-                    settings,
-                    tx: tx.clone(),
-                });
-                return LoopControl::Continue;
-            }
-            tokio::spawn(async move {
-                let result = agent
-                    .ask_in_chat(&request_chat_id, &line, &hist, &settings)
-                    .await;
-                let _ = tx_response.send(ChatEvent::Response(event_chat_id, result));
-            });
+            submit_line(state, agent, tx, chat_id, line);
         }
         KeyCode::Esc => return LoopControl::Break,
         KeyCode::Char(c) => {
@@ -3518,11 +3544,104 @@ fn handle_input_key(
     LoopControl::Continue
 }
 
+/// Отправка реплики в чат: обычный ход или ход с инструментами. `false` —
+/// реплика не ушла (причина — в уведомлении); при неверном пути
+/// репозитория она возвращается в поле ввода.
+fn submit_line(
+    state: &mut AppState,
+    agent: &Arc<CliAgent>,
+    tx: &mpsc::UnboundedSender<ChatEvent>,
+    chat_id: String,
+    line: String,
+) -> bool {
+    let Some(chat_index) = state.chat_index(&chat_id) else {
+        return false;
+    };
+    // Отправлять некуда, пока список чатов не получен от сервиса:
+    // обмену негде записаться.
+    if let Some(reason) = state.blocked_reason() {
+        state.notify(format!("Сообщение не отправлено: {reason}"));
+        return false;
+    }
+    // Неполная история испортила бы контекст запроса к модели.
+    if !state.chats[chat_index].history_loaded {
+        ensure_history(state, &chat_id, tx);
+        state.notify("История чата ещё загружается: сообщение не отправлено");
+        return false;
+    }
+    // Путь проверяется до отправки: с неверным путём ход не
+    // начинается, а реплика остаётся в поле ввода.
+    let tool_repository = if state.chats[chat_index].settings.git_tools_active() {
+        let path = state.chats[chat_index].settings.git_repository.clone().unwrap_or_default();
+        match crate::mcp::validate_repository(&path) {
+            Ok(repository) => Some(repository),
+            Err(err) => {
+                state.chat_ui.entry(chat_id.clone()).or_default().input = line;
+                state.notify(format!("Сообщение не отправлено: {err}"));
+                return false;
+            }
+        }
+    } else {
+        None
+    };
+    state.chats[chat_index].messages.push(Message::user(line.clone()));
+    state.chats[chat_index].touch_quietly();
+    // Заголовок нового чата придумывает сервис после первого обмена
+    // (AGENTD_AUTO_TITLE): клиент больше не подставляет свой,
+    // иначе он гарантированно перебивал бы серверную генерацию,
+    // отправляясь раньше, чем сервис успевал ответить.
+    {
+        let ui = state.chat_ui.entry(chat_id.clone()).or_default();
+        ui.pending = true;
+        ui.pending_since = Some(Instant::now());
+        ui.auto_scroll = true;
+        ui.scroll_to_message = None;
+    }
+
+    let agent = agent.clone();
+    let hist = state.chats[chat_index].messages.clone();
+    let settings = state.chats[chat_index].settings.clone();
+    let tx_response = tx.clone();
+    let event_chat_id = chat_id.clone();
+    let request_chat_id = chat_id.clone();
+    // Инструменты activity_* — свойство клиента, а не чата: демон один на
+    // машину. Их включение делает ходом с инструментами любой чат.
+    let activity = state
+        .config
+        .activity_chat_tools_active()
+        .then(|| crate::activity::Endpoint::from_config(&state.config));
+    if tool_repository.is_some() || activity.is_some() {
+        spawn_tool_turn(ToolTurnRequest {
+            agent,
+            servers: state.tool_servers.clone(),
+            repository: tool_repository,
+            activity,
+            chat_id,
+            chat_title: state.chats[chat_index].title.clone(),
+            line,
+            history: hist,
+            settings,
+            tx: tx.clone(),
+        });
+        return true;
+    }
+    tokio::spawn(async move {
+        let result = agent
+            .ask_in_chat(&request_chat_id, &line, &hist, &settings)
+            .await;
+        let _ = tx_response.send(ChatEvent::Response(event_chat_id, result));
+    });
+    true
+}
+
 /// Всё, что нужно фоновой задаче хода с инструментами.
 struct ToolTurnRequest {
     agent: Arc<CliAgent>,
     servers: ToolServers,
-    repository: PathBuf,
+    /// Репозиторий git-инструментов чата, если они включены.
+    repository: Option<PathBuf>,
+    /// Демон activity-mcp, если его инструменты включены в конфиге.
+    activity: Option<crate::activity::Endpoint>,
     chat_id: String,
     chat_title: String,
     line: String,
@@ -3576,15 +3695,16 @@ impl TurnObserver for TuiObserver {
     }
 }
 
-/// Ход с git-инструментами: сервер репозитория (запуск при первом ходе),
-/// затем цикл инструментов. Облачный чат продолжает ход через сервис, а
-/// локальный собирает историю сам.
+/// Ход с инструментами: сервер git-репозитория (запуск при первом ходе) и
+/// соединение с демоном activity-mcp, затем цикл инструментов. Облачный чат
+/// продолжает ход через сервис, а локальный собирает историю сам.
 fn spawn_tool_turn(request: ToolTurnRequest) {
     tokio::spawn(async move {
         let ToolTurnRequest {
             agent,
             servers,
             repository,
+            activity,
             chat_id,
             chat_title,
             line,
@@ -3592,35 +3712,57 @@ fn spawn_tool_turn(request: ToolTurnRequest) {
             settings,
             tx,
         } = request;
-        let server = {
-            let mut servers = servers.lock().await;
-            match servers.get(&repository) {
-                Some(server) => Ok(server.clone()),
-                None => {
-                    let started =
-                        GitToolServer::start(&repository.to_string_lossy(), crate::logging::exchange_log()).await;
-                    if let Ok(server) = &started {
-                        servers.insert(repository.clone(), server.clone());
+        let git_tools = match repository {
+            Some(repository) => {
+                let server = {
+                    let mut servers = servers.lock().await;
+                    match servers.get(&repository) {
+                        Some(server) => Ok(server.clone()),
+                        None => {
+                            let started =
+                                GitToolServer::start(&repository.to_string_lossy(), crate::logging::exchange_log())
+                                    .await;
+                            if let Ok(server) = &started {
+                                servers.insert(repository.clone(), server.clone());
+                            }
+                            started
+                        }
                     }
-                    started
+                };
+                match server {
+                    Ok(server) => Some(GitTools {
+                        server,
+                        allowed_writes: settings.git_allowed_tools.clone(),
+                    }),
+                    Err(err) => {
+                        let _ = tx.send(ChatEvent::ToolServerFailed {
+                            chat_id,
+                            line,
+                            error: failure_text(&err),
+                        });
+                        return;
+                    }
                 }
             }
+            None => None,
         };
-        let server = match server {
-            Ok(server) => server,
-            Err(err) => {
-                let _ = tx.send(ChatEvent::ToolServerFailed {
-                    chat_id,
-                    line,
-                    error: failure_text(&err),
-                });
-                return;
-            }
+        // Демон сводок необязателен, в отличие от git-сервера, который чат
+        // включил явно: без демона ход идёт без его инструментов.
+        let activity_tools = match activity {
+            Some(endpoint) => match ActivityTools::connect(&endpoint, crate::logging::exchange_log()).await {
+                Ok(tools) => Some(tools),
+                Err(err) => {
+                    let _ = tx.send(ChatEvent::ActivityNotice(format!(
+                        "Инструменты activity_* недоступны в этом ходе: {err}"
+                    )));
+                    None
+                }
+            },
+            None => None,
         };
-        let tools = GitTools {
-            server,
-            allowed_writes: settings.git_allowed_tools.clone(),
-        };
+        let tools = tool_loop::ToolSet::default()
+            .with(git_tools.as_ref().map(|tools| tools as &dyn tool_loop::ToolExecutor))
+            .with(activity_tools.as_ref().map(|tools| tools as &dyn tool_loop::ToolExecutor));
         let approver = TuiApprover {
             chat_title,
             tx: tx.clone(),
@@ -3649,12 +3791,169 @@ fn spawn_tool_turn(request: ToolTurnRequest) {
                 tool_loop::run_tool_loop(&mut backend, &tools, &approver, max_iterations, &observer).await
             }
         };
+        drop(tools);
+        if let Some(tools) = activity_tools {
+            tools.close().await;
+        }
         let event = match result {
             Ok(reply) => ChatEvent::Response(chat_id, Ok(reply)),
             Err(err) => ChatEvent::ToolTurnFailed(chat_id, err.error, err.executed),
         };
         let _ = tx.send(event);
     });
+}
+
+/// Фоновый опрос демона activity-mcp: непрочитанные сводки сразу при старте
+/// и затем раз в `activity_poll_secs`. Задача заканчивается вместе с TUI:
+/// отправка в закрытый канал событий не проходит.
+fn spawn_activity_poller(config: &Config, tx: &mpsc::UnboundedSender<ChatEvent>) {
+    if !config.activity_active() {
+        return;
+    }
+    let endpoint = crate::activity::Endpoint::from_config(config);
+    let period = Duration::from_secs(config.effective_activity_poll_secs());
+    let tx = tx.clone();
+    tokio::spawn(async move {
+        loop {
+            let result = crate::activity::fetch_unread(&endpoint, crate::logging::exchange_log())
+                .await
+                .map_err(|err| failure_text(&err));
+            if tx.send(ChatEvent::ActivityDigests(result)).is_err() {
+                return;
+            }
+            tokio::time::sleep(period).await;
+        }
+    });
+}
+
+/// Разовый запрос непрочитанных сводок вне расписания опроса.
+fn refresh_activity(state: &AppState, tx: &mpsc::UnboundedSender<ChatEvent>) {
+    let endpoint = crate::activity::Endpoint::from_config(&state.config);
+    let tx = tx.clone();
+    tokio::spawn(async move {
+        let result = crate::activity::fetch_unread(&endpoint, crate::logging::exchange_log())
+            .await
+            .map_err(|err| failure_text(&err));
+        let _ = tx.send(ChatEvent::ActivityDigests(result));
+    });
+}
+
+fn handle_activity_digests(result: Result<Vec<crate::activity::Digest>, String>, state: &mut AppState) {
+    let first = !state.activity.loaded;
+    state.activity.loaded = true;
+    match result {
+        Ok(digests) => {
+            state.activity.error = None;
+            let fresh = state.activity.replace(digests);
+            if fresh > 0 && first {
+                state.notify(format!("Непрочитанных сводок активности: {fresh} — Ctrl+A"));
+            } else if fresh > 0 {
+                state.notify("Новая сводка активности проектов — Ctrl+A");
+            }
+        }
+        Err(err) => state.activity.error = Some(err),
+    }
+}
+
+/// Пометка прочитанной уходит демону фоном: сводка уже убрана с экрана, а
+/// неудача вернёт её следующим опросом.
+fn spawn_activity_ack(state: &AppState, id: i64, tx: &mpsc::UnboundedSender<ChatEvent>) {
+    let endpoint = crate::activity::Endpoint::from_config(&state.config);
+    let tx = tx.clone();
+    tokio::spawn(async move {
+        if let Err(err) = crate::activity::ack(&endpoint, crate::logging::exchange_log(), id).await {
+            let _ = tx.send(ChatEvent::ActivityNotice(format!(
+                "Сводка #{id} не отмечена прочитанной: {}",
+                failure_text(&err)
+            )));
+        }
+    });
+}
+
+/// Внеплановая сводка, затем обновлённый список.
+fn spawn_activity_build(state: &AppState, tx: &mpsc::UnboundedSender<ChatEvent>) {
+    let endpoint = crate::activity::Endpoint::from_config(&state.config);
+    let tx = tx.clone();
+    tokio::spawn(async move {
+        let log = crate::logging::exchange_log();
+        let built = async {
+            let client = crate::activity::ActivityClient::connect(&endpoint, log.clone()).await?;
+            let result = client.build_digest().await;
+            client.close().await;
+            result
+        }
+        .await;
+        let notice = match &built {
+            Ok(Some(digest)) => format!("Собрана сводка #{}", digest.id),
+            Ok(None) => "С прошлой сводки изменений нет".to_string(),
+            Err(err) => format!("Сводка не собрана: {}", failure_text(err)),
+        };
+        let _ = tx.send(ChatEvent::ActivityNotice(notice));
+        let result = crate::activity::fetch_unread(&endpoint, log)
+            .await
+            .map_err(|err| failure_text(&err));
+        let _ = tx.send(ChatEvent::ActivityDigests(result));
+    });
+}
+
+/// Экран сводок по `Ctrl+A`: ←/→ — сводка, ↑/↓/PageUp/PageDown — прокрутка,
+/// Enter — пересказ моделью в активном чате, `a` — прочитано, `b` — собрать
+/// сводку сейчас, `r` — обновить, Esc — закрыть.
+fn handle_activity_key(
+    key: crossterm::event::KeyEvent,
+    state: &mut AppState,
+    agent: &Arc<CliAgent>,
+    tx: &mpsc::UnboundedSender<ChatEvent>,
+) -> LoopControl {
+    let activity = &mut state.activity;
+    match key.code {
+        KeyCode::Esc => state.focus = Focus::Input,
+        KeyCode::Left => activity.select(-1),
+        KeyCode::Right => activity.select(1),
+        KeyCode::Up => activity.scroll = activity.scroll.saturating_sub(1),
+        KeyCode::Down => activity.scroll = activity.scroll.saturating_add(1).min(activity.max_scroll),
+        KeyCode::PageUp => activity.scroll = activity.scroll.saturating_sub(10),
+        KeyCode::PageDown => activity.scroll = activity.scroll.saturating_add(10).min(activity.max_scroll),
+        KeyCode::Char('a') | KeyCode::Char('ф') => {
+            if let Some(digest) = activity.take_current() {
+                spawn_activity_ack(state, digest.id, tx);
+                state.notify(format!("Сводка #{} отмечена прочитанной", digest.id));
+            }
+        }
+        KeyCode::Char('r') | KeyCode::Char('к') => {
+            refresh_activity(state, tx);
+            state.notify("Обновляю сводки…");
+        }
+        KeyCode::Char('b') | KeyCode::Char('и') => {
+            spawn_activity_build(state, tx);
+            state.notify("Собираю сводку…");
+        }
+        KeyCode::Enter => {
+            let Some(digest) = activity.current().cloned() else {
+                return LoopControl::Continue;
+            };
+            let Some(chat_id) = state.active_chat_id() else {
+                state.notify("Нет открытого чата для пересказа");
+                return LoopControl::Continue;
+            };
+            if state.is_pending(&chat_id) {
+                state.notify("Чат ещё ждёт ответа: пересказ можно запросить после него");
+                return LoopControl::Continue;
+            }
+            state.focus = Focus::Input;
+            // Сводка прочитана, когда её пересказ ушёл в чат; отказ
+            // отправки (сервис недоступен) оставляет её непрочитанной.
+            if submit_line(state, agent, tx, chat_id, crate::activity::retell_prompt(&digest)) {
+                if let Some(position) = state.activity.digests.iter().position(|d| d.id == digest.id) {
+                    state.activity.cursor = position;
+                    state.activity.take_current();
+                }
+                spawn_activity_ack(state, digest.id, tx);
+            }
+        }
+        _ => {}
+    }
+    LoopControl::Continue
 }
 
 /// Сколько строк истории проматывает один щелчок колеса.
@@ -4247,6 +4546,14 @@ fn handle_chat_event(
     tx: &mpsc::UnboundedSender<ChatEvent>,
 ) {
     let chat_event = match chat_event {
+        ChatEvent::ActivityDigests(result) => {
+            handle_activity_digests(result, state);
+            return;
+        }
+        ChatEvent::ActivityNotice(text) => {
+            state.notify(text);
+            return;
+        }
         ChatEvent::OllamaModels(result) => {
             handle_ollama_models(result, state);
             return;
@@ -5079,6 +5386,9 @@ fn render_ui(f: &mut Frame, state: &mut AppState) {
     }
     if let Some(picker) = &state.task {
         render_task_popup(f, picker);
+    }
+    if state.focus == Focus::Activity {
+        render_activity_popup(f, &mut state.activity);
     }
     // Последним: подтверждение перекрывает любое окно.
     if let Some(request) = state.tool_approvals.front() {
@@ -6024,8 +6334,18 @@ fn render_help(f: &mut Frame, state: &AppState, area: Rect) {
             Color::DarkGray,
         ),
     };
-    let help = Paragraph::new(Line::from(Span::styled(text, Style::default().fg(color))))
-    .wrap(Wrap { trim: true });
+    let mut spans = Vec::new();
+    // Непрочитанные сводки видны постоянно, пока их не открыли, — а не
+    // только двухсекундным уведомлением, которое легко пропустить.
+    let unread = state.activity.digests.len();
+    if unread > 0 && state.active_notice().is_none() && state.focus != Focus::Activity {
+        spans.push(Span::styled(
+            format!("Сводок активности: {unread} — Ctrl+A · "),
+            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+        ));
+    }
+    spans.push(Span::styled(text, Style::default().fg(color)));
+    let help = Paragraph::new(Line::from(spans)).wrap(Wrap { trim: true });
     f.render_widget(help, area);
 }
 
@@ -6740,6 +7060,75 @@ fn render_memory_popup(f: &mut Frame, picker: &MemoryPicker, short_term_tail: &[
 /// предложенный следующий этап и последние переходы (specs/task-state,
 /// design.md решение 9). Правка шага/ожидаемого действия — отдельный режим
 /// с одним полем ввода.
+/// Экран сводок: текст открытой сводки, её номер среди непрочитанных,
+/// ошибка связи с демоном, если есть.
+fn render_activity_popup(f: &mut Frame, activity: &mut ActivityState) {
+    let area = centered_rect(96, 32, f.area());
+    f.render_widget(Clear, area);
+
+    let title = match activity.current() {
+        Some(digest) => format!(
+            " Сводка активности #{} ({} из {}) ",
+            digest.id,
+            activity.cursor + 1,
+            activity.digests.len()
+        ),
+        None => " Сводки активности ".to_string(),
+    };
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan))
+        .title(title);
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(0), Constraint::Length(1)])
+        .split(inner);
+
+    let mut lines: Vec<Line> = Vec::new();
+    if let Some(error) = &activity.error {
+        lines.push(Line::from(Span::styled(
+            format!(" Демон activity-mcp недоступен: {error}"),
+            Style::default().fg(Color::Red),
+        )));
+        lines.push(Line::raw(""));
+    }
+    match activity.current() {
+        Some(digest) => {
+            let rendered = agent_skin().term_text(&digest.text).to_string();
+            match rendered.into_text() {
+                Ok(text) => lines.extend(text.lines),
+                Err(_) => lines.extend(digest.text.lines().map(|line| Line::raw(line.to_string()))),
+            }
+        }
+        None if !activity.loaded => {
+            lines.push(Line::from(Span::styled(" Загрузка...", Style::default().fg(Color::DarkGray))));
+        }
+        None => lines.push(Line::from(Span::styled(
+            " Непрочитанных сводок нет. b — собрать сводку сейчас",
+            Style::default().fg(Color::DarkGray),
+        ))),
+    }
+
+    let text = Text::from(lines);
+    let total = wrapped_text_line_count(text.clone(), rows[0].width);
+    activity.max_scroll = clamp_u16(total.saturating_sub(rows[0].height as usize));
+    activity.scroll = activity.scroll.min(activity.max_scroll);
+    f.render_widget(
+        Paragraph::new(text).wrap(Wrap { trim: false }).scroll((activity.scroll, 0)),
+        rows[0],
+    );
+    f.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            " ←/→ — сводка · ↑/↓ — прокрутка · Enter — пересказ в чате · a — прочитано · b — собрать сейчас · r — обновить · Esc — закрыть",
+            Style::default().fg(Color::DarkGray),
+        ))),
+        rows[1],
+    );
+}
+
 fn render_task_popup(f: &mut Frame, picker: &TaskPicker) {
     let area = centered_rect(76, 22, f.area());
     f.render_widget(Clear, area);
@@ -6915,6 +7304,7 @@ mod tests {
             branches: None,
             memory: None,
             task: None,
+            activity: ActivityState::default(),
             notice: None,
             show_reasoning: true,
             ollama_models: Vec::new(),
@@ -8186,5 +8576,69 @@ mod tests {
             .collect();
         assert!(lines.iter().any(|line| line.contains("⚙ git_status(")));
     }
-}
 
+    fn digest(id: i64) -> crate::activity::Digest {
+        crate::activity::Digest {
+            id,
+            period_from: "09:00".into(),
+            period_to: "18:00".into(),
+            acked: false,
+            text: format!("## Сводка {id}"),
+        }
+    }
+
+    #[test]
+    fn activity_state_keeps_open_digest_across_polls() {
+        let mut activity = ActivityState::default();
+        assert_eq!(activity.replace(vec![digest(1), digest(2)]), 2);
+        activity.select(1);
+        activity.scroll = 5;
+        // Опрос принёс ещё одну: открытая сводка и прокрутка не сбились.
+        assert_eq!(activity.replace(vec![digest(1), digest(2), digest(3)]), 1);
+        assert_eq!(activity.current().map(|d| d.id), Some(2));
+        assert_eq!(activity.scroll, 5);
+        // Открытую прочитали в другом месте: курсор на первой.
+        activity.replace(vec![digest(1), digest(3)]);
+        assert_eq!(activity.current().map(|d| d.id), Some(1));
+        assert_eq!(activity.scroll, 0);
+        activity.select(10);
+        assert_eq!(activity.take_current().map(|d| d.id), Some(3));
+        assert_eq!(activity.current().map(|d| d.id), Some(1));
+        activity.take_current();
+        assert!(activity.take_current().is_none());
+    }
+
+    #[test]
+    fn new_digests_are_announced_and_errors_kept_quiet() {
+        let mut state = test_state();
+        handle_activity_digests(Err("connection refused".into()), &mut state);
+        assert_eq!(state.activity.error.as_deref(), Some("connection refused"));
+        assert!(state.active_notice().is_none());
+
+        handle_activity_digests(Ok(vec![digest(1)]), &mut state);
+        assert!(state.activity.error.is_none());
+        assert!(state.active_notice().unwrap().contains("Новая сводка"));
+        state.notice = None;
+        handle_activity_digests(Ok(vec![digest(1)]), &mut state);
+        assert!(state.active_notice().is_none(), "повтор той же сводки не объявляется");
+    }
+
+    #[tokio::test]
+    async fn ctrl_a_opens_digests_only_when_enabled() {
+        let mut state = test_state();
+        let log = Arc::new(agentcore::logging::ExchangeLog::disabled());
+        let agent = Arc::new(CliAgent::from_config(&state.config, log).unwrap());
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let ctrl_a = crossterm::event::KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL);
+
+        handle_key(ctrl_a, &mut state, &agent, &tx);
+        assert!(state.focus == Focus::Input);
+        assert!(state.active_notice().unwrap().contains("config activity set on"));
+
+        state.config.activity_enabled = Some(true);
+        handle_key(ctrl_a, &mut state, &agent, &tx);
+        assert!(state.focus == Focus::Activity);
+        handle_key(key(KeyCode::Esc), &mut state, &agent, &tx);
+        assert!(state.focus == Focus::Input);
+    }
+}

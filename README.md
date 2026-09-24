@@ -22,7 +22,11 @@
 MCP-сервер git-инструментов `git-mcp` живёт в отдельном репозитории
 [`git-mcp-agent`](https://github.com/Egor-Liadsky/git-mcp-agent): `agentcli`
 запускает его дочерним процессом и cargo-зависимости на него не имеет (см.
-«Git-инструменты (MCP)»).
+«Git-инструменты (MCP)»). Так же отдельно живёт демон сводок активности
+проектов `activity-mcp`
+([`activity-mcp-agent`](https://github.com/Egor-Liadsky/activity-mcp-agent)),
+но его клиент не запускает, а подключается к уже работающему по HTTP (см.
+«Сводки активности проектов (activity-mcp)»).
 
 Облачный провайдер вынесен в отдельный крейт `agentupstream` намеренно:
 консольный клиент от него не зависит, поэтому прямой запрос к облачному API
@@ -162,14 +166,14 @@ AGENTCLI_LOG_DIR=/tmp/agentcli-logs cargo run -p agentcli -- ask "привет"
 | TUI                              | `ratatui`, `crossterm`, `futures` |
 | Рендер Markdown в терминале      | `termimad`, `ansi-to-tui`        |
 | Индикация прогресса/стиль текста | `indicatif`, `console`          |
-| Клиент MCP (git-инструменты)     | `rmcp` (client, transport-child-process) |
+| Клиент MCP (git-инструменты, сводки) | `rmcp` (client, transport-child-process, transport-streamable-http-client-reqwest) |
 
 Терминальные зависимости (`clap`, `ratatui`, `crossterm`, `termimad`,
 `ansi-to-tui`, `indicatif`, `console`, `arboard`) живут только в `agentcli`:
 `agentcore` от терминала не зависит. Там же живёт клиентская часть `rmcp`:
 процессы MCP-серверов запускает только клиент, ядро знает лишь типы вызовов
 (`ToolSpec`, `ToolCall`). Серверной части `rmcp` в этом workspace нет: она
-живёт в отдельном сервере `git-mcp`.
+живёт в отдельных серверах `git-mcp` и `activity-mcp`.
 
 ## Запуск
 
@@ -341,6 +345,11 @@ cargo run -p agentcli -- chat
   среди допустимых автоматом (или «без смены этапа»), `Enter` — применить
   переход, `s` — править шаг, `a` — править ожидаемое действие, `p` —
   поставить на паузу, `r` — снять с паузы, `Esc` — закрыть;
+- `Ctrl+A` — сводки активности проектов от демона `activity-mcp` (если
+  включены, см. «Сводки активности проектов»): `←`/`→` — сводка, `↑`/`↓`,
+  `PageUp`/`PageDown` — прокрутка, `Enter` — пересказ моделью в текущем чате,
+  `a` — отметить прочитанной, `b` — собрать сводку сейчас, `r` — обновить,
+  `Esc` — закрыть;
 - `Ctrl+R` — показать/скрыть цепочку рассуждений модели в истории;
 - колесо мыши, `PageUp`/`PageDown` — прокрутка истории; колесо листает ту
   панель, над которой стоит курсор, а не активную. Стрелки `↑`/`↓` историю
@@ -917,3 +926,69 @@ agentcli chat», в stderr печатается предупреждение с 
 и значения после `password=`, `token=`, `secret=`, `api_key=` пишутся как
 `secr***alue`. Маскируется только журнал: результаты `git_diff` и
 `git_show` уходят модели (и облачному провайдеру) как есть.
+
+### Сводки активности проектов (activity-mcp)
+
+Демон `activity-mcp` из отдельного репозитория
+[`activity-mcp-agent`](https://github.com/Egor-Liadsky/activity-mcp-agent)
+круглосуточно следит за каталогом с git-проектами, пишет журнал изменений
+(коммиты, ветки, незакоммиченное) в свою SQLite и по расписанию собирает
+сводки. Клиент его не запускает: демон работает под launchd/systemd, а
+`agentcli` подключается к нему по MCP Streamable HTTP
+(`http://127.0.0.1:7878/mcp`) — сводки копятся, даже пока клиент закрыт.
+Cargo-зависимости между проектами нет ни в одну сторону. Установка и
+автозапуск демона — в README `activity-mcp-agent`; из подмодуля зонтичного
+репозитория:
+
+```bash
+(cd ../mcp/activity && cargo build --release)
+../mcp/activity/target/release/activity-mcp --root ~/projects
+```
+
+Подключение выключено, пока не включено явно: без демона клиент его не ищет.
+
+```bash
+cargo run -p agentcli -- config activity set on
+cargo run -p agentcli -- config activity set --url http://127.0.0.1:7878/mcp --poll-secs 300
+cargo run -p agentcli -- config activity set --token <токен>     # если демон с --token-file
+cargo run -p agentcli -- config activity set --chat-tools true   # инструменты модели
+cargo run -p agentcli -- config activity show
+cargo run -p agentcli -- config activity clear
+```
+
+Поля конфига: `activity_enabled`, `activity_url`, `activity_token`,
+`activity_poll_secs` (не меньше 10, по умолчанию 300), `activity_chat_tools`.
+Это настройки клиента, а не умолчания чатов: демон один на машину.
+
+**TUI.** При старте и затем раз в `activity_poll_secs` клиент спрашивает у
+демона непрочитанные сводки. Пока они есть, в строке подсказок горит
+«Сводок активности: N — Ctrl+A», а о новой сводке появляется уведомление.
+`Ctrl+A` открывает экран сводок. `Enter` отправляет в текущий чат реплику
+с текстом сводки и просьбой пересказать главное: пересказ делает модель
+чата, а не демон (у демона нет ни ключей, ни модели), и он остаётся в
+истории чата — можно продолжить разговор. Отправленная на пересказ сводка
+и сводка, закрытая клавишей `a`, отмечаются у демона прочитанными. Если
+демон недоступен, причина видна на экране сводок, а чат работает как обычно.
+
+**Команды без TUI.**
+
+```bash
+cargo run -p agentcli -- activity digest              # непрочитанные, затем отметить прочитанными
+cargo run -p agentcli -- activity digest --keep-unread
+cargo run -p agentcli -- activity digest --all        # последние 5, включая прочитанные
+cargo run -p agentcli -- activity build               # собрать сводку сейчас
+cargo run -p agentcli -- activity ack <id>
+cargo run -p agentcli -- activity status              # связь с демоном и список проектов
+```
+
+**Инструменты модели.** С `--chat-tools true` каждый ход чата (и
+`agentcli ask`) идёт с инструментами `activity_digest`, `activity_projects`
+и `activity_changes` — можно спросить «что менялось в проектах за неделю».
+Инструменты только читающие: `activity_ack` и `activity_build_digest` меняют
+состояние демона и модели не показываются. С git-инструментами чата они
+работают в одном ходе. Если демон недоступен, ход идёт без его инструментов
+с уведомлением, а не отклоняется. Вызовы пишутся в `requests.jsonl` и
+`responses.jsonl` с `url = <адрес демона>#tools/call`.
+
+Живой тест против запущенного демона:
+`AGENTCLI_ACTIVITY_URL=http://127.0.0.1:7878/mcp cargo test -p agentcli live_daemon -- --ignored`.
