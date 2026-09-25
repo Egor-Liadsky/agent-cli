@@ -590,6 +590,15 @@ pub struct Config {
     /// Давать модели в чатах читающие инструменты `activity_*`.
     #[serde(default)]
     pub activity_chat_tools: Option<bool>,
+    /// Каталог с проектами для демона, который клиент запускает сам
+    /// (`agentcli activity start`, настройки TUI). Демону, запущенному
+    /// вручную, это поле не нужно.
+    #[serde(default)]
+    pub activity_root: Option<String>,
+    /// Расписание сводок (cron) для запускаемого клиентом демона. Пусто —
+    /// умолчание демона.
+    #[serde(default)]
+    pub activity_schedule: Option<String>,
 }
 
 /// Адрес `activity-mcp` по умолчанию — тот, что слушает демон без `--listen`.

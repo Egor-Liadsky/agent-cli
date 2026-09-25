@@ -73,6 +73,12 @@ pub enum ActivityAction {
     Ack { id: i64 },
     /// Проверить связь с демоном и показать наблюдаемые проекты
     Status,
+    /// Запустить демон и поставить его на автозапуск (launchd на macOS,
+    /// systemd --user на Linux) с каталогом и расписанием из config activity;
+    /// уже запущенный — перезапустить с новыми параметрами
+    Start,
+    /// Остановить демон, запущенный клиентом, и снять его с автозапуска
+    Stop,
 }
 
 #[derive(Subcommand)]
@@ -258,6 +264,13 @@ pub enum ActivityConfigAction {
         /// Давать модели в чатах читающие инструменты activity_*: true/false
         #[arg(long = "chat-tools")]
         chat_tools: Option<String>,
+        /// Каталог с проектами для `activity start`; пустая строка — снять
+        #[arg(long)]
+        root: Option<String>,
+        /// Расписание сводок (cron, 5 полей) для `activity start`; пустая
+        /// строка — умолчание демона (0 9,18 * * *)
+        #[arg(long)]
+        schedule: Option<String>,
     },
     /// Снять все настройки activity-mcp: сводки выключены
     Clear,

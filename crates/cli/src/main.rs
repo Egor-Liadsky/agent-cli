@@ -1,4 +1,5 @@
 mod activity;
+mod activity_daemon;
 mod agent;
 mod chats;
 mod clipboard;
@@ -473,9 +474,20 @@ fn run_activity_config(action: ActivityConfigAction) -> anyhow::Result<()> {
             token,
             poll_secs,
             chat_tools,
+            root,
+            schedule,
         } => {
-            if enabled.is_none() && url.is_none() && token.is_none() && poll_secs.is_none() && chat_tools.is_none() {
-                anyhow::bail!("укажите хотя бы одно значение: enabled, --url, --token, --poll-secs или --chat-tools");
+            if enabled.is_none()
+                && url.is_none()
+                && token.is_none()
+                && poll_secs.is_none()
+                && chat_tools.is_none()
+                && root.is_none()
+                && schedule.is_none()
+            {
+                anyhow::bail!(
+                    "укажите хотя бы одно значение: enabled, --url, --token, --poll-secs, --chat-tools, --root или --schedule"
+                );
             }
             if let Some(secs) = poll_secs
                 && secs < agentcore::config::MIN_ACTIVITY_POLL_SECS
@@ -498,6 +510,12 @@ fn run_activity_config(action: ActivityConfigAction) -> anyhow::Result<()> {
             if let Some(chat_tools) = chat_tools {
                 config.activity_chat_tools = Some(parse_bool_flag(&chat_tools)?);
             }
+            if let Some(root) = root {
+                config.activity_root = Some(root).filter(|root| !root.trim().is_empty());
+            }
+            if let Some(schedule) = schedule {
+                config.activity_schedule = Some(schedule).filter(|schedule| !schedule.trim().is_empty());
+            }
             config.save()?;
             println!("{}", style("Настройки activity-mcp сохранены.").green().bold());
             print_activity(&config);
@@ -509,6 +527,8 @@ fn run_activity_config(action: ActivityConfigAction) -> anyhow::Result<()> {
             config.activity_token = None;
             config.activity_poll_secs = None;
             config.activity_chat_tools = None;
+            config.activity_root = None;
+            config.activity_schedule = None;
             config.save()?;
             println!("{}", style("Настройки activity-mcp сняты.").green().bold());
         }
@@ -540,11 +560,43 @@ fn print_activity(config: &Config) {
         style("инструменты activity_* в чатах:").cyan().bold(),
         on_off(config.activity_chat_tools_active())
     );
+    println!(
+        "{} {}",
+        style("каталог проектов для запуска демона:").cyan().bold(),
+        config.activity_root.as_deref().unwrap_or("<не задан>")
+    );
+    println!(
+        "{} {}",
+        style("расписание сводок:").cyan().bold(),
+        config.activity_schedule.as_deref().unwrap_or("<умолчание демона>")
+    );
+    println!(
+        "{} {}",
+        style("демон зарегистрирован клиентом:").cyan().bold(),
+        if activity_daemon::installed() { "да" } else { "нет" }
+    );
 }
 
 /// Команды `agentcli activity`: одно соединение с демоном на команду.
 async fn run_activity(action: ActivityAction) -> anyhow::Result<()> {
     let config = load_config()?;
+    // Запуск и остановка работают без соединения: демона может ещё не быть.
+    match action {
+        ActivityAction::Start => {
+            println!("Регистрирую демон и жду ответа…");
+            let status = activity_daemon::start_from_config(&config, exchange_log())
+                .await
+                .map_err(anyhow::Error::msg)?;
+            println!("{} {status}", style("Демон activity-mcp:").green().bold());
+            return Ok(());
+        }
+        ActivityAction::Stop => {
+            activity_daemon::stop().await?;
+            println!("{}", style("Демон activity-mcp остановлен и снят с автозапуска.").green().bold());
+            return Ok(());
+        }
+        _ => {}
+    }
     let endpoint = activity::Endpoint::from_config(&config);
     let client = activity::ActivityClient::connect(&endpoint, exchange_log()).await?;
     let result = run_activity_action(&client, action).await;
@@ -584,6 +636,7 @@ async fn run_activity_action(client: &activity::ActivityClient, action: Activity
             Some(digest) => print_digest(&digest),
             None => println!("С прошлой сводки изменений нет."),
         },
+        ActivityAction::Start | ActivityAction::Stop => unreachable!("обрабатываются в run_activity"),
         ActivityAction::Ack { id } => {
             client.ack(id).await?;
             println!("Сводка {id} отмечена прочитанной.");
@@ -601,6 +654,9 @@ async fn run_activity_action(client: &activity::ActivityClient, action: Activity
             let projects = parsed["projects"].as_array().cloned().unwrap_or_default();
             let active: Vec<&serde_json::Value> = projects.iter().filter(|p| p["removed"] != true).collect();
             println!("{} {}", style("демон доступен, проектов:").green().bold(), active.len());
+            if activity_daemon::installed() {
+                println!("  (запущен клиентом: agentcli activity stop — остановить)");
+            }
             for project in active {
                 let branch = project["branch"].as_str().unwrap_or("-");
                 let dirty = project["uncommitted_files"].as_i64().unwrap_or(0);

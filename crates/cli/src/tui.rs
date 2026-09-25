@@ -80,6 +80,12 @@ enum ChatEvent {
     ActivityDigests(Result<Vec<crate::activity::Digest>, String>),
     /// Итог действия со сводкой или с демоном — в строку уведомлений.
     ActivityNotice(String),
+    /// Состояние демона для строки «Демон» в настройках; `announce` —
+    /// итог запуска или остановки, о нём нужно уведомление.
+    ActivityDaemon {
+        result: Result<String, String>,
+        announce: bool,
+    },
     /// Список локальных моделей Ollama: пришёл фоновой задачей.
     OllamaModels(Result<Vec<String>, String>),
     /// Список облачных моделей сервиса: пришёл фоновой задачей.
@@ -466,6 +472,11 @@ enum FormatField {
     GitRepository,
     GitAllowedTools,
     ToolMaxIterations,
+    ActivityEnabled,
+    ActivityRoot,
+    ActivitySchedule,
+    ActivityChatTools,
+    ActivityDaemon,
     Mode,
     Reasoning,
     Thinking,
@@ -489,18 +500,20 @@ enum SettingsSection {
     Memory,
     Profile,
     Tools,
+    Activity,
     Format,
     Reasoning,
     Sampling,
 }
 
 impl SettingsSection {
-    const ALL: [SettingsSection; 8] = [
+    const ALL: [SettingsSection; 9] = [
         SettingsSection::Connection,
         SettingsSection::Context,
         SettingsSection::Memory,
         SettingsSection::Profile,
         SettingsSection::Tools,
+        SettingsSection::Activity,
         SettingsSection::Format,
         SettingsSection::Reasoning,
         SettingsSection::Sampling,
@@ -513,6 +526,7 @@ impl SettingsSection {
             SettingsSection::Memory => "Память",
             SettingsSection::Profile => "Профиль",
             SettingsSection::Tools => "Инструменты",
+            SettingsSection::Activity => "Сводки активности",
             SettingsSection::Format => "Формат ответа",
             SettingsSection::Reasoning => "Рассуждение",
             SettingsSection::Sampling => "Сэмплинг",
@@ -537,6 +551,9 @@ impl SettingsSection {
             }
             SettingsSection::Tools => {
                 "Git-инструменты (MCP-сервер git-mcp): модель читает репозиторий сама, а пишущие вызовы выполняются только после подтверждения."
+            }
+            SettingsSection::Activity => {
+                "Демон activity-mcp: журнал изменений git-проектов и сводки по расписанию. Настройки общие для всех чатов; демон можно запустить отсюда — он встанет на автозапуск и будет работать и без TUI."
             }
             SettingsSection::Format => "Формат ответа: кастомный режим, длина, стоп-условия.",
             SettingsSection::Reasoning => {
@@ -579,6 +596,13 @@ impl SettingsSection {
                 FormatField::GitRepository,
                 FormatField::GitAllowedTools,
                 FormatField::ToolMaxIterations,
+            ],
+            SettingsSection::Activity => &[
+                FormatField::ActivityEnabled,
+                FormatField::ActivityRoot,
+                FormatField::ActivitySchedule,
+                FormatField::ActivityChatTools,
+                FormatField::ActivityDaemon,
             ],
             SettingsSection::Format => &[
                 FormatField::Mode,
@@ -696,6 +720,11 @@ impl FormatField {
             FormatField::GitRepository => "Репозиторий",
             FormatField::GitAllowedTools => "Разрешённые пишущие",
             FormatField::ToolMaxIterations => "Лимит итераций",
+            FormatField::ActivityEnabled => "Сводки активности",
+            FormatField::ActivityRoot => "Каталог проектов",
+            FormatField::ActivitySchedule => "Расписание сводок (cron)",
+            FormatField::ActivityChatTools => "Инструменты activity_* для модели",
+            FormatField::ActivityDaemon => "Демон activity-mcp",
             FormatField::Mode => "Режим",
             FormatField::Reasoning => "Стратегия рассуждения",
             FormatField::Thinking => "Режим thinking у модели",
@@ -817,6 +846,27 @@ git_reset, git_create_branch, git_checkout. Пусто — только чита
                 "Сколько раз за ход модель может запросить инструменты (1–32). После лимита она получает один \
 запрос без инструментов и отвечает по собранным данным. Пусто — 8."
             }
+            FormatField::ActivityEnabled => {
+                "◀/▶ или Space — переключить. Показывать сводки демона activity-mcp: индикатор в строке подсказок и экран Ctrl+A. \
+Общая настройка клиента, сохраняется по Ctrl+S."
+            }
+            FormatField::ActivityRoot => {
+                "Каталог, под которым лежат проекты (git-репозитории ищутся на глубину до 3). Нужен для запуска демона отсюда; \
+после смены — перезапустить демон (Enter на строке «Демон»)."
+            }
+            FormatField::ActivitySchedule => {
+                "Когда демон собирает сводку: cron из 5 полей в местном времени, например «0 9,18 * * *» — в 9:00 и 18:00. \
+Пусто — умолчание демона. Применяется при следующем запуске демона."
+            }
+            FormatField::ActivityChatTools => {
+                "◀/▶ или Space — переключить. Давать модели во всех чатах читающие инструменты activity_digest, activity_projects \
+и activity_changes — можно спросить «что менялось в проектах за неделю»."
+            }
+            FormatField::ActivityDaemon => {
+                "Enter — запустить демон с каталогом и расписанием выше (запущенный — перезапустить), Ctrl+D — остановить. \
+Демон регистрируется в launchd (macOS) или systemd --user (Linux): работает без TUI, стартует при входе в систему \
+и поднимается после падения. Поля раздела сохраняются в конфиг перед запуском."
+            }
             FormatField::Mode => {
                 "◀/▶ или Space — переключить. Кастомный режим задаёт свой формат ответа вместо формата по умолчанию."
             }
@@ -863,6 +913,9 @@ git_reset, git_create_branch, git_checkout. Пусто — только чита
                 | FormatField::TaskStateEnabled
                 | FormatField::TaskStateAutoEnabled
                 | FormatField::GitToolsEnabled
+                | FormatField::ActivityEnabled
+                | FormatField::ActivityChatTools
+                | FormatField::ActivityDaemon
         )
     }
 
@@ -892,6 +945,11 @@ git_reset, git_create_branch, git_checkout. Пусто — только чита
                 | FormatField::GitRepository
                 | FormatField::GitAllowedTools
                 | FormatField::ToolMaxIterations
+                | FormatField::ActivityEnabled
+                | FormatField::ActivityRoot
+                | FormatField::ActivitySchedule
+                | FormatField::ActivityChatTools
+                | FormatField::ActivityDaemon
         )
     }
 
@@ -910,6 +968,16 @@ git_reset, git_create_branch, git_checkout. Пусто — только чита
 
 /// Состояние редактора настроек формата ответа для конкретного чата.
 struct SettingsEditor {
+    /// Раздел «Сводки активности»: общие поля конфига клиента, как адрес
+    /// сервиса, а не настройки чата.
+    activity_enabled: bool,
+    activity_root: String,
+    activity_schedule: String,
+    activity_chat_tools: bool,
+    /// Состояние демона одной строкой: ответ проверки или итог запуска.
+    activity_daemon: String,
+    /// Идёт запуск или остановка: повторный Enter не ставит вторую.
+    activity_daemon_busy: bool,
     /// Чат, чьи параметры редактируются.
     chat_id: String,
     chat_title: String,
@@ -1024,6 +1092,12 @@ impl SettingsEditor {
         let format = settings.response_format.clone();
         let sampling = &settings.sampling;
         Self {
+            activity_enabled: config.activity_active(),
+            activity_root: config.activity_root.clone().unwrap_or_default(),
+            activity_schedule: config.activity_schedule.clone().unwrap_or_default(),
+            activity_chat_tools: config.activity_chat_tools == Some(true),
+            activity_daemon: if config.activity_active() { "проверяю…".to_string() } else { String::new() },
+            activity_daemon_busy: false,
             chat_id: chat.id.clone(),
             chat_title: chat.title.clone(),
             provider: settings.provider,
@@ -1159,6 +1233,10 @@ impl SettingsEditor {
                 FormatField::GitRepository | FormatField::GitAllowedTools | FormatField::ToolMaxIterations => {
                     self.git_tools_enabled
                 }
+                FormatField::ActivityRoot
+                | FormatField::ActivitySchedule
+                | FormatField::ActivityChatTools
+                | FormatField::ActivityDaemon => self.activity_enabled,
                 _ => true,
             })
             .collect()
@@ -1387,6 +1465,11 @@ impl SettingsEditor {
             Some(FormatField::TaskStateEnabled) => self.task_state_enabled.clear(),
             Some(FormatField::TaskStateAutoEnabled) => self.task_state_auto_enabled.clear(),
             Some(FormatField::GitToolsEnabled) => self.toggle_git_tools(false),
+            Some(FormatField::ActivityEnabled) => self.toggle_activity(false),
+            Some(FormatField::ActivityChatTools) => self.activity_chat_tools = false,
+            // Ctrl+D на строке демона — остановка, её обрабатывает
+            // handle_settings_key: редактору не хватает канала событий.
+            Some(FormatField::ActivityDaemon) => {}
             _ => {
                 if let Some(value) = self.field_value_mut() {
                     value.clear();
@@ -1407,7 +1490,12 @@ impl SettingsEditor {
             | FormatField::MemoryRouterEnabled
             | FormatField::TaskStateEnabled
             | FormatField::TaskStateAutoEnabled
-            | FormatField::GitToolsEnabled => None,
+            | FormatField::GitToolsEnabled
+            | FormatField::ActivityEnabled
+            | FormatField::ActivityChatTools
+            | FormatField::ActivityDaemon => None,
+            FormatField::ActivityRoot => Some(&mut self.activity_root),
+            FormatField::ActivitySchedule => Some(&mut self.activity_schedule),
             FormatField::GitRepository => Some(&mut self.git_repository),
             FormatField::GitAllowedTools => Some(&mut self.git_allowed_tools),
             FormatField::ToolMaxIterations => Some(&mut self.tool_max_iterations),
@@ -1619,6 +1707,14 @@ impl SettingsEditor {
         self.field = self.field.min(len.saturating_sub(1));
     }
 
+    /// Включение и выключение сводок; поля раздела появляются вместе с
+    /// переключателем.
+    fn toggle_activity(&mut self, enabled: bool) {
+        self.activity_enabled = enabled;
+        let len = self.visible_fields().len();
+        self.field = self.field.min(len.saturating_sub(1));
+    }
+
     fn build_git_tools_enabled(&self) -> Option<bool> {
         self.git_tools_enabled.then_some(true)
     }
@@ -1804,6 +1900,8 @@ struct ActivityState {
     scroll: u16,
     /// Предел прокрутки с прошлого кадра: зависит от ширины окна.
     max_scroll: u16,
+    /// Фоновый опрос демона: перезапускается при смене настроек сводок.
+    poller: Option<tokio::task::AbortHandle>,
 }
 
 impl ActivityState {
@@ -2067,7 +2165,7 @@ async fn run_app(
     fetch_chats(&state, &tx);
     // Сводки activity-mcp: демон может быть не запущен — тогда экран
     // сводок покажет причину, а чат работает как обычно.
-    spawn_activity_poller(&state.config, &tx);
+    state.activity.poller = spawn_activity_poller(&state.config, &tx);
     let mut events = EventStream::new();
     let mut tick = tokio::time::interval(Duration::from_millis(80));
     // Кадр рисуется только после изменения состояния: на длинной истории
@@ -2390,6 +2488,9 @@ fn handle_key(
                 &state.profile_choices,
             ));
             state.focus = Focus::Settings;
+            if state.config.activity_active() {
+                spawn_daemon_status(&state.config, tx);
+            }
         }
         return LoopControl::Continue;
     }
@@ -2654,6 +2755,7 @@ fn handle_settings_key(
                     let server_url = non_empty(&editor.server_url);
                     let client_token = non_empty(&editor.client_token);
                     let ollama_url = non_empty(&editor.ollama_url);
+                    let activity = editor.activity_values();
                     state.settings = None;
                     state.focus = Focus::Input;
                     if state.chat_index(&chat_id).is_some() {
@@ -2689,8 +2791,33 @@ fn handle_settings_key(
                         request_update_chat(state, &chat_id, None, Some(settings), tx);
                     }
                     save_connection(state, server_url, client_token, ollama_url);
+                    save_activity(state, activity, tx);
                 }
                 Err(err) => editor.error = Some(err),
+            }
+        }
+        KeyCode::Char('d')
+            if key.modifiers.contains(KeyModifiers::CONTROL)
+                && editor.pane == SettingsPane::Fields
+                && editor.current_field() == Some(FormatField::ActivityDaemon) =>
+        {
+            if !editor.activity_daemon_busy {
+                editor.activity_daemon_busy = true;
+                editor.activity_daemon = "останавливаю…".to_string();
+                spawn_daemon_stop(tx);
+            }
+        }
+        KeyCode::Enter
+            if editor.pane == SettingsPane::Fields && editor.current_field() == Some(FormatField::ActivityDaemon) =>
+        {
+            if !editor.activity_daemon_busy {
+                editor.activity_daemon_busy = true;
+                editor.activity_daemon = "запускаю…".to_string();
+                // Демон запускается с тем, что сейчас на экране: поля
+                // раздела сохраняются в конфиг до запуска.
+                let values = editor.activity_values();
+                save_activity(state, values, tx);
+                spawn_daemon_start(&state.config, tx);
             }
         }
         KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -2869,6 +2996,19 @@ fn handle_settings_key(
             let enabled = !editor.git_tools_enabled;
             editor.toggle_git_tools(enabled);
         }
+        KeyCode::Left | KeyCode::Right | KeyCode::Char(' ')
+            if editor.pane == SettingsPane::Fields
+                && editor.current_field() == Some(FormatField::ActivityEnabled) =>
+        {
+            let enabled = !editor.activity_enabled;
+            editor.toggle_activity(enabled);
+        }
+        KeyCode::Left | KeyCode::Right | KeyCode::Char(' ')
+            if editor.pane == SettingsPane::Fields
+                && editor.current_field() == Some(FormatField::ActivityChatTools) =>
+        {
+            editor.activity_chat_tools = !editor.activity_chat_tools;
+        }
         KeyCode::Left => {
             // из полей — обратно к списку разделов
             editor.pane = SettingsPane::Sections;
@@ -2911,6 +3051,125 @@ fn save_connection(
             state.notify("Настройки подключения сохранены");
         }
         Err(err) => state.notify(format!("Не удалось сохранить конфиг: {err}")),
+    }
+}
+
+/// Поля раздела «Сводки активности» для сохранения в конфиг.
+struct ActivityValues {
+    enabled: bool,
+    root: Option<String>,
+    schedule: Option<String>,
+    chat_tools: bool,
+}
+
+impl SettingsEditor {
+    fn activity_values(&self) -> ActivityValues {
+        ActivityValues {
+            enabled: self.activity_enabled,
+            root: non_empty(&self.activity_root),
+            schedule: non_empty(&self.activity_schedule),
+            chat_tools: self.activity_chat_tools,
+        }
+    }
+}
+
+/// Сохранить настройки сводок в конфиг. Они общие для всех чатов, как
+/// адрес сервиса; фоновый опрос демона перезапускается под новые значения,
+/// а выключение убирает уже полученные сводки с экрана.
+fn save_activity(state: &mut AppState, values: ActivityValues, tx: &mpsc::UnboundedSender<ChatEvent>) {
+    let config = &mut state.config;
+    if config.activity_active() == values.enabled
+        && config.activity_root == values.root
+        && config.activity_schedule == values.schedule
+        && (config.activity_chat_tools == Some(true)) == values.chat_tools
+    {
+        return;
+    }
+    let was_active = config.activity_active();
+    config.activity_enabled = Some(values.enabled);
+    config.activity_root = values.root;
+    config.activity_schedule = values.schedule;
+    config.activity_chat_tools = Some(values.chat_tools);
+    if let Err(err) = state.config.save() {
+        state.notify(format!("Не удалось сохранить конфиг: {err}"));
+        return;
+    }
+    state.notify("Настройки сводок сохранены");
+    if was_active != values.enabled {
+        if let Some(poller) = state.activity.poller.take() {
+            poller.abort();
+        }
+        state.activity = ActivityState {
+            poller: spawn_activity_poller(&state.config, tx),
+            ..ActivityState::default()
+        };
+    }
+}
+
+/// Запуск демона фоном: регистрация у супервизора и ожидание ответа —
+/// до 30 с, TUI при этом не замирает. Параметры собираются сразу: конфиг
+/// в задачу не передаётся.
+fn spawn_daemon_start(config: &Config, tx: &mpsc::UnboundedSender<ChatEvent>) {
+    let spec = crate::activity_daemon::DaemonSpec::from_config(config).map_err(|err| format!("{err:#}"));
+    let endpoint = crate::activity::Endpoint::from_config(config);
+    let tx = tx.clone();
+    tokio::spawn(async move {
+        let result = match spec {
+            Err(err) => Err(err),
+            Ok(spec) => match crate::activity_daemon::start(&spec).await {
+                Err(err) => Err(format!("{err:#}")),
+                Ok(place) => crate::activity_daemon::wait_ready(&endpoint, crate::logging::exchange_log())
+                    .await
+                    .map(|status| format!("{status} ({place})")),
+            },
+        };
+        let _ = tx.send(ChatEvent::ActivityDaemon { result, announce: true });
+    });
+}
+
+fn spawn_daemon_stop(tx: &mpsc::UnboundedSender<ChatEvent>) {
+    let tx = tx.clone();
+    tokio::spawn(async move {
+        let result = crate::activity_daemon::stop()
+            .await
+            .map(|()| "остановлен и снят с автозапуска".to_string())
+            .map_err(|err| format!("{err:#}"));
+        let _ = tx.send(ChatEvent::ActivityDaemon { result, announce: true });
+    });
+}
+
+/// Проверка, отвечает ли демон, — для строки «Демон» при открытии настроек.
+fn spawn_daemon_status(config: &Config, tx: &mpsc::UnboundedSender<ChatEvent>) {
+    let endpoint = crate::activity::Endpoint::from_config(config);
+    let tx = tx.clone();
+    tokio::spawn(async move {
+        let result = crate::activity_daemon::status(&endpoint, crate::logging::exchange_log())
+            .await
+            .map_err(|_| "не запущен или не отвечает".to_string());
+        let _ = tx.send(ChatEvent::ActivityDaemon { result, announce: false });
+    });
+}
+
+fn handle_daemon_state(
+    result: Result<String, String>,
+    announce: bool,
+    state: &mut AppState,
+    tx: &mpsc::UnboundedSender<ChatEvent>,
+) {
+    let started = result.is_ok();
+    let text = match result {
+        Ok(text) | Err(text) => text,
+    };
+    if let Some(editor) = state.settings.as_mut() {
+        editor.activity_daemon = text.clone();
+        editor.activity_daemon_busy = false;
+    }
+    if announce {
+        state.notify(format!("Демон activity-mcp: {text}"));
+        // Только что поднятый демон мог уже собрать пропущенную сводку.
+        if started && state.config.activity_active() {
+            refresh_activity(state, tx);
+        }
     }
 }
 
@@ -3806,9 +4065,12 @@ fn spawn_tool_turn(request: ToolTurnRequest) {
 /// Фоновый опрос демона activity-mcp: непрочитанные сводки сразу при старте
 /// и затем раз в `activity_poll_secs`. Задача заканчивается вместе с TUI:
 /// отправка в закрытый канал событий не проходит.
-fn spawn_activity_poller(config: &Config, tx: &mpsc::UnboundedSender<ChatEvent>) {
+fn spawn_activity_poller(
+    config: &Config,
+    tx: &mpsc::UnboundedSender<ChatEvent>,
+) -> Option<tokio::task::AbortHandle> {
     if !config.activity_active() {
-        return;
+        return None;
     }
     let endpoint = crate::activity::Endpoint::from_config(config);
     let period = Duration::from_secs(config.effective_activity_poll_secs());
@@ -3823,7 +4085,9 @@ fn spawn_activity_poller(config: &Config, tx: &mpsc::UnboundedSender<ChatEvent>)
             }
             tokio::time::sleep(period).await;
         }
-    });
+    })
+    .abort_handle()
+    .into()
 }
 
 /// Разовый запрос непрочитанных сводок вне расписания опроса.
@@ -4552,6 +4816,10 @@ fn handle_chat_event(
         }
         ChatEvent::ActivityNotice(text) => {
             state.notify(text);
+            return;
+        }
+        ChatEvent::ActivityDaemon { result, announce } => {
+            handle_daemon_state(result, announce, state, tx);
             return;
         }
         ChatEvent::OllamaModels(result) => {
@@ -6497,6 +6765,8 @@ fn empty_field_hint(field: FormatField, editor: &SettingsEditor) -> String {
             "не задан — действует операторский лимит сервиса".to_string()
         }
         FormatField::GitRepository => "не задан — укажите путь к git-репозиторию".to_string(),
+        FormatField::ActivityRoot => "не задан — укажите каталог с проектами, например ~/projects".to_string(),
+        FormatField::ActivitySchedule => "не задано — умолчание демона: 0 9,18 * * *".to_string(),
         FormatField::GitAllowedTools => "не заданы — только читающие инструменты".to_string(),
         FormatField::ToolMaxIterations => format!(
             "не задан — {}",
@@ -6595,6 +6865,19 @@ fn render_settings_fields(f: &mut Frame, editor: &SettingsEditor, area: Rect) {
             FormatField::GitRepository => editor.git_repository.clone(),
             FormatField::GitAllowedTools => editor.git_allowed_tools.clone(),
             FormatField::ToolMaxIterations => editor.tool_max_iterations.clone(),
+            FormatField::ActivityEnabled => {
+                if editor.activity_enabled { "Включены" } else { "Выключены" }.to_string()
+            }
+            FormatField::ActivityRoot => editor.activity_root.clone(),
+            FormatField::ActivitySchedule => editor.activity_schedule.clone(),
+            FormatField::ActivityChatTools => {
+                if editor.activity_chat_tools { "Включены" } else { "Выключены" }.to_string()
+            }
+            FormatField::ActivityDaemon => {
+                let hint = if editor.activity_daemon_busy { "" } else { " · Enter — запустить, Ctrl+D — остановить" };
+                let status = if editor.activity_daemon.is_empty() { "не проверен" } else { &editor.activity_daemon };
+                format!("{status}{hint}")
+            }
             FormatField::Mode => {
                 if editor.custom_mode {
                     "Кастомный".to_string()
@@ -8640,5 +8923,63 @@ mod tests {
         assert!(state.focus == Focus::Activity);
         handle_key(key(KeyCode::Esc), &mut state, &agent, &tx);
         assert!(state.focus == Focus::Input);
+    }
+
+    #[test]
+    fn activity_section_mirrors_config_and_hides_fields_when_off() {
+        let session = git_session(ChatSettings::default());
+        let config = Config {
+            activity_enabled: Some(true),
+            activity_root: Some("~/projects".into()),
+            activity_schedule: Some("0 9 * * *".into()),
+            activity_chat_tools: Some(true),
+            ..Config::default()
+        };
+        let mut editor = SettingsEditor::from_chat(&session, &config, &[], &[], &[]);
+        editor.section = SettingsSection::ALL
+            .iter()
+            .position(|s| *s == SettingsSection::Activity)
+            .expect("раздел «Сводки активности» существует");
+        assert_eq!(editor.visible_fields().len(), 5);
+        assert_eq!(editor.activity_daemon, "проверяю…");
+        let values = editor.activity_values();
+        assert!(values.enabled && values.chat_tools);
+        assert_eq!(values.root.as_deref(), Some("~/projects"));
+        assert_eq!(values.schedule.as_deref(), Some("0 9 * * *"));
+
+        // Текстовые поля правятся вводом, переключатели и строка демона — нет.
+        editor.pane = SettingsPane::Fields;
+        editor.field = 1;
+        assert!(editor.current_field() == Some(FormatField::ActivityRoot));
+        editor.field_value_mut().unwrap().push('/');
+        assert_eq!(editor.activity_values().root.as_deref(), Some("~/projects/"));
+        editor.field = 4;
+        assert!(editor.current_field() == Some(FormatField::ActivityDaemon));
+        assert!(editor.field_value_mut().is_none());
+
+        editor.toggle_activity(false);
+        assert!(editor.visible_fields() == vec![FormatField::ActivityEnabled]);
+        assert_eq!(editor.field, 0);
+    }
+
+    #[test]
+    fn daemon_result_updates_settings_row_and_announces() {
+        let mut state = test_state();
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let session = git_session(ChatSettings::default());
+        let mut editor = SettingsEditor::from_chat(&session, &state.config, &[], &[], &[]);
+        editor.activity_daemon_busy = true;
+        state.settings = Some(editor);
+
+        handle_daemon_state(Err("не найден activity-mcp".into()), true, &mut state, &tx);
+        let editor = state.settings.as_ref().unwrap();
+        assert!(!editor.activity_daemon_busy);
+        assert_eq!(editor.activity_daemon, "не найден activity-mcp");
+        assert!(state.active_notice().unwrap().contains("не найден activity-mcp"));
+
+        state.notice = None;
+        handle_daemon_state(Ok("работает, проектов: 3".into()), false, &mut state, &tx);
+        assert_eq!(state.settings.as_ref().unwrap().activity_daemon, "работает, проектов: 3");
+        assert!(state.active_notice().is_none(), "проверка статуса не объявляется");
     }
 }

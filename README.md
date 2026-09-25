@@ -936,29 +936,57 @@ agentcli chat», в stderr печатается предупреждение с 
 сводки. Клиент его не запускает: демон работает под launchd/systemd, а
 `agentcli` подключается к нему по MCP Streamable HTTP
 (`http://127.0.0.1:7878/mcp`) — сводки копятся, даже пока клиент закрыт.
-Cargo-зависимости между проектами нет ни в одну сторону. Установка и
-автозапуск демона — в README `activity-mcp-agent`; из подмодуля зонтичного
-репозитория:
+Cargo-зависимости между проектами нет ни в одну сторону. Установка
+демона — в README `activity-mcp-agent`; из подмодуля зонтичного репозитория:
 
 ```bash
-(cd ../mcp/activity && cargo build --release)
-../mcp/activity/target/release/activity-mcp --root ~/projects
+cargo install --path ../mcp/activity/crates/activity
 ```
 
 Подключение выключено, пока не включено явно: без демона клиент его не ищет.
+
+**Запуск демона из клиента.** Запустить демон можно прямо из TUI (`Ctrl+P` →
+«Сводки активности» → строка «Демон activity-mcp», `Enter`) или командой
+`agentcli activity start`. Клиент не держит демон дочерним процессом, а
+регистрирует его у системного супервизора: LaunchAgent
+`~/Library/LaunchAgents/com.github.egor-liadsky.activity-mcp.plist` в launchd
+на macOS (журнал — `~/Library/Logs/activity-mcp.log`) или пользовательский
+unit `activity-mcp.service` в systemd на Linux. Поэтому демон работает и после
+выхода из TUI, стартует при входе в систему и поднимается после падения.
+Аргументы берутся из конфига: `--root` — `activity_root`, `--schedule` —
+`activity_schedule`, `--listen` — хост и порт из `activity_url` (только
+loopback), токен — файлом `activity-token` рядом с конфигом (права `0600`),
+а не аргументом, который видят все пользователи машины. Уже запущенный демон
+перезапускается с новыми параметрами. Бинарник ищется так: путь из
+`AGENTCLI_ACTIVITY_MCP` → рядом с `agentcli` → `PATH`. `agentcli activity
+stop` (или `Ctrl+D` на той же строке) останавливает демон и снимает
+регистрацию — иначе он вернулся бы при следующем входе.
 
 ```bash
 cargo run -p agentcli -- config activity set on
 cargo run -p agentcli -- config activity set --url http://127.0.0.1:7878/mcp --poll-secs 300
 cargo run -p agentcli -- config activity set --token <токен>     # если демон с --token-file
 cargo run -p agentcli -- config activity set --chat-tools true   # инструменты модели
+cargo run -p agentcli -- config activity set --root ~/projects --schedule "0 9,18 * * *"
+cargo run -p agentcli -- activity start                          # запустить и поставить на автозапуск
+cargo run -p agentcli -- activity stop                           # остановить и снять с автозапуска
 cargo run -p agentcli -- config activity show
 cargo run -p agentcli -- config activity clear
 ```
 
 Поля конфига: `activity_enabled`, `activity_url`, `activity_token`,
-`activity_poll_secs` (не меньше 10, по умолчанию 300), `activity_chat_tools`.
-Это настройки клиента, а не умолчания чатов: демон один на машину.
+`activity_poll_secs` (не меньше 10, по умолчанию 300), `activity_chat_tools`,
+`activity_root` и `activity_schedule` (для запуска демона клиентом). Это
+настройки клиента, а не умолчания чатов: демон один на машину.
+
+**Настройки в TUI.** Раздел «Сводки активности» в `Ctrl+P` правит те же поля:
+переключатель сводок, каталог проектов, расписание (cron из 5 полей),
+инструменты модели и строку «Демон activity-mcp» — при открытии настроек
+клиент проверяет, отвечает ли демон, и показывает число его проектов.
+`Enter` на этой строке сохраняет поля раздела и запускает (перезапускает)
+демон, `Ctrl+D` — останавливает; итог виден в строке и в уведомлении.
+Остальные поля раздела сохраняются по `Ctrl+S`, включение и выключение
+сводок сразу перезапускает фоновый опрос.
 
 **TUI.** При старте и затем раз в `activity_poll_secs` клиент спрашивает у
 демона непрочитанные сводки. Пока они есть, в строке подсказок горит
@@ -992,3 +1020,6 @@ cargo run -p agentcli -- activity status              # связь с демон
 
 Живой тест против запущенного демона:
 `AGENTCLI_ACTIVITY_URL=http://127.0.0.1:7878/mcp cargo test -p agentcli live_daemon -- --ignored`.
+Живой тест запуска через супервизор (регистрирует демон на порту 7981 и
+снимает регистрацию):
+`AGENTCLI_ACTIVITY_MCP=$PWD/../mcp/activity/target/release/activity-mcp cargo test -p agentcli live_start_and_stop -- --ignored`.
