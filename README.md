@@ -166,14 +166,15 @@ AGENTCLI_LOG_DIR=/tmp/agentcli-logs cargo run -p agentcli -- ask "привет"
 | TUI                              | `ratatui`, `crossterm`, `futures` |
 | Рендер Markdown в терминале      | `termimad`, `ansi-to-tui`        |
 | Индикация прогресса/стиль текста | `indicatif`, `console`          |
-| Клиент MCP (git-инструменты, сводки) | `rmcp` (client, transport-child-process, transport-streamable-http-client-reqwest) |
+| Клиент MCP (git-инструменты, сводки, пайплайн) | `rmcp` (client, transport-child-process, transport-streamable-http-client-reqwest) |
+| Сверка записанного пайплайном файла | `sha2`, `hex` |
 
 Терминальные зависимости (`clap`, `ratatui`, `crossterm`, `termimad`,
 `ansi-to-tui`, `indicatif`, `console`, `arboard`) живут только в `agentcli`:
 `agentcore` от терминала не зависит. Там же живёт клиентская часть `rmcp`:
 процессы MCP-серверов запускает только клиент, ядро знает лишь типы вызовов
 (`ToolSpec`, `ToolCall`). Серверной части `rmcp` в этом workspace нет: она
-живёт в отдельных серверах `git-mcp` и `activity-mcp`.
+живёт в отдельных серверах `git-mcp`, `activity-mcp` и `pipeline-mcp`.
 
 ## Запуск
 
@@ -1023,3 +1024,62 @@ cargo run -p agentcli -- activity status              # связь с демон
 Живой тест запуска через супервизор (регистрирует демон на порту 7981 и
 снимает регистрацию):
 `AGENTCLI_ACTIVITY_MCP=$PWD/../mcp/activity/target/release/activity-mcp cargo test -p agentcli live_start_and_stop -- --ignored`.
+
+### Пайплайн MCP-инструментов (pipeline-mcp)
+
+Сервер `pipeline-mcp` из отдельного репозитория
+[`pipeline-mcp-agent`](https://github.com/Egor-Liadsky/pipeline-mcp-agent)
+даёт три инструмента, которые складываются в цепочку «получить → обработать →
+сохранить»:
+
+| Шаг | Инструмент | Вход | Выход |
+|-----|------------|------|-------|
+| 1 | `search` (читает) | `query` | `{query, matches:[{path,line,text}], files_scanned, truncated}` |
+| 2 | `summarize` (читает) | `query`, `matches` из шага 1 | `{summary, method, sources, input_matches}` |
+| 3 | `save_to_file` (пишет) | `file_name`, `content` = `summary` из шага 2 | `{path, bytes, sha256}` |
+
+Как и `git-mcp`, сервер запускается клиентом процессом (stdio) — на время
+команды или одного хода чата; cargo-зависимости между проектами нет. Своей
+модели у сервера нет: `summarize` просит сводку у клиента через MCP sampling
+(`sampling/createMessage`), и клиент отвечает моделью умолчаний конфига
+(команда) или моделью текущего чата (чат). Если sampling не удался, сервер
+делает экстрактивную сводку и сообщает причину — цепочка не рвётся.
+Бинарник ищется так: путь из `AGENTCLI_PIPELINE_MCP` → рядом с `agentcli` →
+`PATH`. Из подмодуля зонтичного репозитория:
+
+```bash
+cargo install --path ../mcp/pipeline/crates/pipeline
+```
+
+**Команда.** `agentcli pipeline run` выполняет цепочку сама: аргументы каждого
+шага собираются из JSON-выхода предыдущего (`matches` целиком, `summary` как
+`content`), а после шагов клиент проверяет, что данные дошли без потерь:
+`summarize` получил столько совпадений, сколько нашёл поиск, а SHA-256 файла
+совпадает с суммой сводки. Пустой поиск останавливает цепочку до записи.
+
+```bash
+cargo run -p agentcli -- pipeline run "ToolSet" --root . --output /tmp/out --out toolset.md
+cargo run -p agentcli -- pipeline run "ToolSet" --max-results 5 --overwrite   # каталоги из конфига
+cargo run -p agentcli -- pipeline run "ToolSet" --no-sampling                 # сводка без модели
+```
+
+Ход шагов печатается в stderr (`[1/3] search` …), итог — в stdout: число
+строк и файлов, метод сводки, путь, размер и SHA-256 файла, текст сводки.
+
+**Чат.** Заданный каталог поиска включает инструменты пайплайна во всех чатах
+(`agentcli chat`) и в `agentcli ask`; порядок вызовов выбирает модель, например
+по просьбе «найди упоминания ToolSet, сделай сводку и сохрани в toolset.md».
+`save_to_file` — пишущий: в TUI он требует подтверждения, в `ask` отклоняется.
+
+```bash
+cargo run -p agentcli -- config pipeline set --root ~/projects/ai --output ~/pipeline-out
+cargo run -p agentcli -- config pipeline show
+cargo run -p agentcli -- config pipeline clear
+```
+
+Поля конфига: `pipeline_root` (каталог поиска; не задан — инструменты
+выключены) и `pipeline_output` (каталог записи; по умолчанию
+`<pipeline_root>/pipeline-out`). Это настройки клиента, а не умолчания чатов.
+
+Живой тест против собранного сервера:
+`AGENTCLI_PIPELINE_MCP=$PWD/../mcp/pipeline/target/release/pipeline-mcp cargo test -p agentcli live_pipeline -- --ignored`.

@@ -54,6 +54,40 @@ pub enum Commands {
         #[command(subcommand)]
         action: ActivityAction,
     },
+    /// Пайплайн MCP-инструментов pipeline-mcp: search → summarize →
+    /// save_to_file (каталоги — `config pipeline`)
+    Pipeline {
+        #[command(subcommand)]
+        action: PipelineAction,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum PipelineAction {
+    /// Найти строки с запросом, сделать по ним сводку моделью чата и
+    /// сохранить её в файл — одной цепочкой
+    Run {
+        /// Что искать (подстрока без учёта регистра)
+        query: String,
+        /// Имя файла результата в каталоге записи
+        #[arg(long, default_value = "summary.md")]
+        out: String,
+        /// Каталог поиска; по умолчанию — из config pipeline
+        #[arg(long)]
+        root: Option<String>,
+        /// Каталог записи; по умолчанию — из config pipeline
+        #[arg(long)]
+        output: Option<String>,
+        /// Сколько строк передать в сводку (по умолчанию 20)
+        #[arg(long = "max-results")]
+        max_results: Option<u32>,
+        /// Перезаписать файл, если он уже есть
+        #[arg(long)]
+        overwrite: bool,
+        /// Не звать модель: сводка экстрактивная, на стороне сервера
+        #[arg(long = "no-sampling")]
+        no_sampling: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -210,6 +244,12 @@ pub enum ConfigAction {
         #[command(subcommand)]
         action: ActivityConfigAction,
     },
+    /// Каталоги пайплайна pipeline-mcp; заданный каталог поиска включает
+    /// инструменты search, summarize, save_to_file в чатах
+    Pipeline {
+        #[command(subcommand)]
+        action: PipelineConfigAction,
+    },
     /// Задать путь к файлу инвариантов (`invariants.toml`)
     SetInvariantsPath {
         /// Путь к файлу; пустая строка снимает умолчание
@@ -218,6 +258,23 @@ pub enum ConfigAction {
     /// Показать активные инварианты из настроенного файла (источник —
     /// конфигурация, не диалог)
     Invariants,
+}
+
+#[derive(Subcommand)]
+pub enum PipelineConfigAction {
+    /// Задать каталоги поиска и записи
+    Set {
+        /// Каталог, в котором ищет search; пустая строка снимает его
+        #[arg(long)]
+        root: Option<String>,
+        /// Каталог, куда пишет save_to_file; пустая строка — <root>/pipeline-out
+        #[arg(long)]
+        output: Option<String>,
+    },
+    /// Снять оба каталога: инструменты пайплайна в чатах выключаются
+    Clear,
+    /// Показать каталоги пайплайна
+    Show,
 }
 
 #[derive(Subcommand)]

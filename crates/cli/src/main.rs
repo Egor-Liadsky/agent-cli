@@ -7,6 +7,7 @@ mod cli;
 mod logging;
 mod markdown;
 mod mcp;
+mod pipeline;
 mod tool_loop;
 mod tui;
 
@@ -16,8 +17,9 @@ use anyhow::Context;
 use clap::Parser;
 use cli::{
     ActivityAction, ActivityConfigAction, BranchesAction, Cli, Commands, ConfigAction, ContextLimitAction, FactsAction, FormatAction,
-    GitToolsAction, OllamaAction, ProfilesAction, SamplingAction, SummaryAction,
+    GitToolsAction, OllamaAction, PipelineAction, PipelineConfigAction, ProfilesAction, SamplingAction, SummaryAction,
 };
+use std::sync::Arc;
 use agentcore::config::{Config, Provider, ReasoningMode, ThinkingMode};
 use console::style;
 use indicatif::{ProgressBar, ProgressStyle};
@@ -42,6 +44,7 @@ async fn main() -> anyhow::Result<()> {
         Commands::Branches { chat_id, action } => run_branches(chat_id, action).await?,
         Commands::Profiles { action } => run_profiles(action).await?,
         Commands::Activity { action } => run_activity(action).await?,
+        Commands::Pipeline { action } => run_pipeline_command(action).await?,
     }
 
     Ok(())
@@ -164,7 +167,7 @@ async fn run_ask(prompt: String) -> anyhow::Result<()> {
         CliAgent::from_config(&config, exchange_log())?.with_unauthorized_hint(UNAUTHORIZED_HINT);
     let history = vec![Message::user(prompt)];
     let settings = config.default_chat_settings();
-    let reply = if settings.git_tools_active() || config.activity_chat_tools_active() {
+    let reply = if settings.git_tools_active() || config.activity_chat_tools_active() || config.pipeline_active() {
         ask_with_tools(&agent, &history, &settings, &config).await?
     } else {
         ask_with_spinner(&agent, &history, &settings).await?
@@ -253,6 +256,7 @@ fn run_config(action: ConfigAction) -> anyhow::Result<()> {
         ConfigAction::Summary { action } => run_summary_action(action)?,
         ConfigAction::GitTools { action } => run_git_tools_action(action)?,
         ConfigAction::Activity { action } => run_activity_config(action)?,
+        ConfigAction::Pipeline { action } => run_pipeline_config(action)?,
         ConfigAction::SetInvariantsPath { path } => {
             let mut config = load_config()?;
             config.invariants_path = if path.trim().is_empty() { None } else { Some(path) };
@@ -464,6 +468,133 @@ fn run_git_tools_action(action: GitToolsAction) -> anyhow::Result<()> {
         }
     }
     Ok(())
+}
+
+fn run_pipeline_config(action: PipelineConfigAction) -> anyhow::Result<()> {
+    match action {
+        PipelineConfigAction::Set { root, output } => {
+            if root.is_none() && output.is_none() {
+                anyhow::bail!("укажите хотя бы одно значение: --root или --output");
+            }
+            let mut config = load_config()?;
+            if let Some(root) = root {
+                config.pipeline_root = Some(root).filter(|root| !root.trim().is_empty());
+            }
+            if let Some(output) = output {
+                config.pipeline_output = Some(output).filter(|output| !output.trim().is_empty());
+            }
+            config.save()?;
+            println!("{}", style("Настройки pipeline-mcp сохранены.").green().bold());
+            print_pipeline(&config);
+        }
+        PipelineConfigAction::Clear => {
+            let mut config = load_config()?;
+            config.pipeline_root = None;
+            config.pipeline_output = None;
+            config.save()?;
+            println!("{}", style("Настройки pipeline-mcp сняты.").green().bold());
+        }
+        PipelineConfigAction::Show => print_pipeline(&load_config()?),
+    }
+    Ok(())
+}
+
+fn print_pipeline(config: &Config) {
+    println!(
+        "{} {}",
+        style("инструменты пайплайна в чатах:").cyan().bold(),
+        if config.pipeline_active() { "включены" } else { "выключены" }
+    );
+    println!(
+        "{} {}",
+        style("каталог поиска:").cyan().bold(),
+        config.pipeline_root.as_deref().unwrap_or("(не задан)")
+    );
+    println!(
+        "{} {}",
+        style("каталог записи:").cyan().bold(),
+        config.effective_pipeline_output().as_deref().unwrap_or("(не задан)")
+    );
+}
+
+/// `agentcli pipeline run`: процесс `pipeline-mcp` на время команды и
+/// цепочка из трёх шагов. Сводку пишет модель умолчаний конфига через
+/// sampling, как написала бы её в новом чате.
+async fn run_pipeline_command(action: PipelineAction) -> anyhow::Result<()> {
+    let PipelineAction::Run {
+        query,
+        out,
+        root,
+        output,
+        max_results,
+        overwrite,
+        no_sampling,
+    } = action;
+    let config = load_config()?;
+    let root = root
+        .or_else(|| config.pipeline_root.clone())
+        .filter(|root| !root.trim().is_empty())
+        .ok_or_else(|| anyhow::anyhow!("не задан каталог поиска: --root <ПУТЬ> или agentcli config pipeline set --root <ПУТЬ>"))?;
+    let output = output
+        .filter(|output| !output.trim().is_empty())
+        .or_else(|| config.pipeline_output.clone().filter(|output| !output.trim().is_empty()))
+        .unwrap_or_else(|| format!("{}/{}", root.trim_end_matches('/'), agentcore::config::DEFAULT_PIPELINE_OUTPUT_DIR));
+    let sampler: Option<Arc<dyn pipeline::Sampler>> = if no_sampling {
+        None
+    } else {
+        let agent = CliAgent::from_config(&config, exchange_log())?.with_unauthorized_hint(UNAUTHORIZED_HINT);
+        Some(Arc::new(pipeline::AgentSampler {
+            agent: Arc::new(agent),
+            settings: config.default_chat_settings(),
+        }))
+    };
+    let server = pipeline::PipelineServer::start(&pipeline::server_program(), &root, &output, sampler, exchange_log()).await?;
+    let request = pipeline::PipelineRequest {
+        query: &query,
+        file_name: &out,
+        max_results,
+        overwrite,
+    };
+    let result = pipeline::run_pipeline(&server, &request, &StepPrinter).await;
+    server.shutdown().await;
+    let report = result?;
+
+    let matches = report.search["matches"].as_array().map(Vec::len).unwrap_or(0);
+    println!(
+        "{} {matches} строк в {} файлах{}",
+        style("search:").cyan().bold(),
+        report.summary["sources"].as_array().map(Vec::len).unwrap_or(0),
+        if report.search["truncated"] == true { " (список обрезан)" } else { "" }
+    );
+    println!(
+        "{} {} строк, метод {}",
+        style("summarize:").cyan().bold(),
+        report.summary["input_matches"],
+        report.summary["method"].as_str().unwrap_or("?")
+    );
+    if let Some(reason) = report.summary["fallback_reason"].as_str() {
+        println!("  {}", style(format!("sampling не использован: {reason}")).yellow());
+    }
+    println!(
+        "{} {} ({} байт, sha256 {})",
+        style("save_to_file:").cyan().bold(),
+        report.saved["path"].as_str().unwrap_or("?"),
+        report.saved["bytes"],
+        report.saved["sha256"].as_str().unwrap_or("?")
+    );
+    println!();
+    print_markdown(report.summary["summary"].as_str().unwrap_or_default());
+    Ok(())
+}
+
+/// Строка о каждом шаге цепочки — в stderr, чтобы итог в stdout оставался
+/// чистым.
+struct StepPrinter;
+
+impl pipeline::PipelineObserver for StepPrinter {
+    fn step(&self, index: usize, name: &str) {
+        eprintln!("{} {name}", style(format!("[{index}/3]")).dim());
+    }
 }
 
 fn run_activity_config(action: ActivityConfigAction) -> anyhow::Result<()> {
@@ -1263,6 +1394,27 @@ async fn ask_with_tools(
     } else {
         None
     };
+    // Пайплайн тоже необязателен. Sampling идёт отдельным агентом с теми же
+    // настройками: серверу нужен владеющий указатель, а `agent` заимствован.
+    let pipeline_tools = if config.pipeline_active() {
+        let sampler: Arc<dyn pipeline::Sampler> = Arc::new(pipeline::AgentSampler {
+            agent: Arc::new(CliAgent::from_config(config, exchange_log())?.with_unauthorized_hint(UNAUTHORIZED_HINT)),
+            settings: settings.clone(),
+        });
+        match pipeline::PipelineServer::start_from_config(config, Some(sampler), exchange_log()).await {
+            Ok(server) => Some(pipeline::PipelineTools { server }),
+            Err(err) => {
+                eprintln!(
+                    "{} {}",
+                    style("Внимание:").yellow().bold(),
+                    style(format!("инструменты пайплайна недоступны: {err}")).yellow()
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
     let spinner = ProgressBar::new_spinner();
     spinner.set_style(
         ProgressStyle::with_template("{spinner:.cyan} {msg}")
@@ -1275,7 +1427,8 @@ async fn ask_with_tools(
     let result = {
         let tools = tool_loop::ToolSet::default()
             .with(git_tools.as_ref().map(|tools| tools as &dyn tool_loop::ToolExecutor))
-            .with(activity_tools.as_ref().map(|tools| tools as &dyn tool_loop::ToolExecutor));
+            .with(activity_tools.as_ref().map(|tools| tools as &dyn tool_loop::ToolExecutor))
+            .with(pipeline_tools.as_ref().map(|tools| tools as &dyn tool_loop::ToolExecutor));
         let mut backend = tool_loop::HistoryTurn {
             agent,
             history,
@@ -1297,6 +1450,9 @@ async fn ask_with_tools(
     }
     if let Some(tools) = activity_tools {
         tools.close().await;
+    }
+    if let Some(tools) = pipeline_tools {
+        tools.server.shutdown().await;
     }
     result.map_err(|err| err.error)
 }

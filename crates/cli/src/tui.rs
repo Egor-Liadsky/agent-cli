@@ -3869,12 +3869,18 @@ fn submit_line(
         .config
         .activity_chat_tools_active()
         .then(|| crate::activity::Endpoint::from_config(&state.config));
-    if tool_repository.is_some() || activity.is_some() {
+    // Пайплайн — тоже свойство клиента (`config pipeline`).
+    let pipeline = state.config.pipeline_active().then(|| PipelineDirs {
+        root: state.config.pipeline_root.clone().unwrap_or_default(),
+        output: state.config.effective_pipeline_output().unwrap_or_default(),
+    });
+    if tool_repository.is_some() || activity.is_some() || pipeline.is_some() {
         spawn_tool_turn(ToolTurnRequest {
             agent,
             servers: state.tool_servers.clone(),
             repository: tool_repository,
             activity,
+            pipeline,
             chat_id,
             chat_title: state.chats[chat_index].title.clone(),
             line,
@@ -3894,6 +3900,11 @@ fn submit_line(
 }
 
 /// Всё, что нужно фоновой задаче хода с инструментами.
+struct PipelineDirs {
+    root: String,
+    output: String,
+}
+
 struct ToolTurnRequest {
     agent: Arc<CliAgent>,
     servers: ToolServers,
@@ -3901,6 +3912,8 @@ struct ToolTurnRequest {
     repository: Option<PathBuf>,
     /// Демон activity-mcp, если его инструменты включены в конфиге.
     activity: Option<crate::activity::Endpoint>,
+    /// Каталоги pipeline-mcp, если его инструменты включены в конфиге.
+    pipeline: Option<PipelineDirs>,
     chat_id: String,
     chat_title: String,
     line: String,
@@ -3964,6 +3977,7 @@ fn spawn_tool_turn(request: ToolTurnRequest) {
             servers,
             repository,
             activity,
+            pipeline,
             chat_id,
             chat_title,
             line,
@@ -4019,9 +4033,38 @@ fn spawn_tool_turn(request: ToolTurnRequest) {
             },
             None => None,
         };
+        // Процесс pipeline-mcp живёт один ход; `summarize` просит сводку у
+        // модели этого же чата через sampling.
+        let pipeline_tools = match pipeline {
+            Some(dirs) => {
+                let sampler: Arc<dyn crate::pipeline::Sampler> = Arc::new(crate::pipeline::AgentSampler {
+                    agent: agent.clone(),
+                    settings: settings.clone(),
+                });
+                let started = crate::pipeline::PipelineServer::start(
+                    &crate::pipeline::server_program(),
+                    &dirs.root,
+                    &dirs.output,
+                    Some(sampler),
+                    crate::logging::exchange_log(),
+                )
+                .await;
+                match started {
+                    Ok(server) => Some(crate::pipeline::PipelineTools { server }),
+                    Err(err) => {
+                        let _ = tx.send(ChatEvent::ActivityNotice(format!(
+                            "Инструменты пайплайна недоступны в этом ходе: {err}"
+                        )));
+                        None
+                    }
+                }
+            }
+            None => None,
+        };
         let tools = tool_loop::ToolSet::default()
             .with(git_tools.as_ref().map(|tools| tools as &dyn tool_loop::ToolExecutor))
-            .with(activity_tools.as_ref().map(|tools| tools as &dyn tool_loop::ToolExecutor));
+            .with(activity_tools.as_ref().map(|tools| tools as &dyn tool_loop::ToolExecutor))
+            .with(pipeline_tools.as_ref().map(|tools| tools as &dyn tool_loop::ToolExecutor));
         let approver = TuiApprover {
             chat_title,
             tx: tx.clone(),
@@ -4053,6 +4096,9 @@ fn spawn_tool_turn(request: ToolTurnRequest) {
         drop(tools);
         if let Some(tools) = activity_tools {
             tools.close().await;
+        }
+        if let Some(tools) = pipeline_tools {
+            tools.server.shutdown().await;
         }
         let event = match result {
             Ok(reply) => ChatEvent::Response(chat_id, Ok(reply)),

@@ -599,6 +599,36 @@ pub struct Config {
     /// умолчание демона.
     #[serde(default)]
     pub activity_schedule: Option<String>,
+    /// Каталог, в котором ищет инструмент `search` сервера `pipeline-mcp`.
+    /// Свойство клиента, как `activity_*`: пайплайн не привязан к чату.
+    /// Не задан — инструменты пайплайна в чатах выключены.
+    #[serde(default)]
+    pub pipeline_root: Option<String>,
+    /// Каталог, в который пишет `save_to_file`. Пусто —
+    /// `<pipeline_root>/pipeline-out`.
+    #[serde(default)]
+    pub pipeline_output: Option<String>,
+}
+
+/// Подкаталог корня поиска, куда пишет пайплайн, если `pipeline_output` не
+/// задан.
+pub const DEFAULT_PIPELINE_OUTPUT_DIR: &str = "pipeline-out";
+
+impl Config {
+    pub fn pipeline_active(&self) -> bool {
+        self.pipeline_root.as_deref().is_some_and(|root| !root.trim().is_empty())
+    }
+
+    pub fn effective_pipeline_output(&self) -> Option<String> {
+        match self.pipeline_output.as_deref().filter(|dir| !dir.trim().is_empty()) {
+            Some(dir) => Some(dir.to_string()),
+            None => self
+                .pipeline_root
+                .as_deref()
+                .filter(|root| !root.trim().is_empty())
+                .map(|root| format!("{}/{DEFAULT_PIPELINE_OUTPUT_DIR}", root.trim_end_matches('/'))),
+        }
+    }
 }
 
 /// Адрес `activity-mcp` по умолчанию — тот, что слушает демон без `--listen`.
@@ -1084,5 +1114,19 @@ client_token = "t"
         let (config, legacy) = Config::parse_with_legacy_fields(content).expect("конфиг");
         assert_eq!(config.effective_server_url(), "http://127.0.0.1:9000");
         assert!(legacy.is_empty());
+    }
+
+    #[test]
+    fn pipeline_output_defaults_to_subdir_of_root() {
+        let mut config = Config::default();
+        assert!(!config.pipeline_active());
+        assert_eq!(config.effective_pipeline_output(), None);
+        config.pipeline_root = Some("/work/".to_string());
+        assert!(config.pipeline_active());
+        assert_eq!(config.effective_pipeline_output().as_deref(), Some("/work/pipeline-out"));
+        config.pipeline_output = Some("/out".to_string());
+        assert_eq!(config.effective_pipeline_output().as_deref(), Some("/out"));
+        config.pipeline_root = Some("  ".to_string());
+        assert!(!config.pipeline_active());
     }
 }

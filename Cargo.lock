@@ -18,11 +18,13 @@ dependencies = [
  "crossterm",
  "dirs",
  "futures",
+ "hex",
  "indicatif",
  "ratatui",
  "rmcp",
  "serde",
  "serde_json",
+ "sha2",
  "termimad",
  "tokio",
 ]
