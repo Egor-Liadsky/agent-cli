@@ -79,7 +79,7 @@ enum ChatEvent {
     /// Непрочитанные сводки activity-mcp: фоновый опрос демона.
     ActivityDigests(Result<Vec<crate::activity::Digest>, String>),
     /// Итог действия со сводкой или с демоном — в строку уведомлений.
-    ActivityNotice(String),
+    ActivityNotice(NoticeKind, String),
     /// Состояние демона для строки «Демон» в настройках; `announce` —
     /// итог запуска или остановки, о нём нужно уведомление.
     ActivityDaemon {
@@ -160,6 +160,45 @@ enum Focus {
     Task,
     /// Экран сводок activity-mcp (`Ctrl+A`).
     Activity,
+}
+
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum NoticeKind {
+    Info,
+    Error,
+}
+
+/// Сколько видно обычное сообщение.
+const NOTICE_INFO_TTL: Duration = Duration::from_secs(4);
+/// Сколько ошибка висит без снятия: клавиша, набранная в момент прихода
+/// асинхронной ошибки, не должна сразу её убрать.
+const NOTICE_ERROR_GRACE: Duration = Duration::from_millis(1500);
+/// Сколько записей хранит журнал уведомлений.
+const NOTICE_LOG_LIMIT: usize = 50;
+
+struct Notice {
+    text: String,
+    kind: NoticeKind,
+    at: Instant,
+}
+
+impl Notice {
+    fn dismissable(&self) -> bool {
+        self.at.elapsed() >= NOTICE_ERROR_GRACE
+    }
+}
+
+struct LoggedNotice {
+    kind: NoticeKind,
+    text: String,
+    /// Местное время появления, `HH:MM:SS`.
+    time: String,
+}
+
+/// Окно журнала; курсор считается от самой новой записи.
+#[derive(Default)]
+struct NoticeLogView {
+    cursor: usize,
 }
 
 /// Запрос подтверждения пишущего вызова инструмента. Ответ уходит циклу
@@ -1942,9 +1981,16 @@ fn pick_folder_for_field(
             picked
         }
     };
+    // Отмена — обычный исход, а недоступный диалог и путь не в UTF-8 надо
+    // успеть прочитать: поле при них не изменилось.
+    let failed = match &picked {
+        Err(_) => true,
+        Ok(Some(path)) => path.to_str().is_none(),
+        Ok(None) => false,
+    };
     if let Some(editor) = state.settings.as_mut() {
         let message = editor.apply_picked_folder(field, picked);
-        state.notify(message);
+        if failed { state.notify_error(message) } else { state.notify(message) }
     }
     Ok(())
 }
@@ -2157,8 +2203,13 @@ struct AppState {
     task: Option<TaskPicker>,
     /// Сводки activity-mcp: непрочитанные и экран `Ctrl+A`.
     activity: ActivityState,
-    /// Короткое уведомление внизу экрана (например, «скопировано»).
-    notice: Option<(String, Instant)>,
+    /// Уведомление внизу экрана: сообщение живёт несколько секунд, ошибка —
+    /// пока её не сняли клавишей.
+    notice: Option<Notice>,
+    /// Последние уведомления для журнала (`Ctrl+Q`), новые в конце.
+    notice_log: VecDeque<LoggedNotice>,
+    /// Открытое окно журнала уведомлений.
+    notice_log_view: Option<NoticeLogView>,
     /// Поле-каталог, для которого нажали Ctrl+X в настройках. Диалог
     /// открывает `run_app`: только у него есть терминал, который нужно
     /// освободить на время диалога.
@@ -2238,15 +2289,52 @@ impl AppState {
     }
 
     fn notify(&mut self, text: impl Into<String>) {
-        self.notice = Some((text.into(), Instant::now()));
+        self.push_notice(NoticeKind::Info, text.into());
     }
 
-    /// Уведомление живёт пару секунд, дальше снова показываем подсказки.
+    /// Ошибка остаётся на экране, пока её не снимут клавишей: за пару
+    /// секунд длинную причину не прочитать.
+    fn notify_error(&mut self, text: impl Into<String>) {
+        self.push_notice(NoticeKind::Error, text.into());
+    }
+
+    fn push_notice(&mut self, kind: NoticeKind, text: String) {
+        self.notice_log.push_back(LoggedNotice {
+            kind,
+            text: text.clone(),
+            time: chrono::Local::now().format("%H:%M:%S").to_string(),
+        });
+        while self.notice_log.len() > NOTICE_LOG_LIMIT {
+            self.notice_log.pop_front();
+        }
+        // Сообщение вслед за свежей ошибкой («сохранено» соседнего раздела)
+        // спрятало бы её раньше, чем её прочитают; в журнал оно всё равно
+        // попало.
+        if kind == NoticeKind::Info
+            && self.notice.as_ref().is_some_and(|notice| notice.kind == NoticeKind::Error && !notice.dismissable())
+        {
+            return;
+        }
+        self.notice = Some(Notice { text, kind, at: Instant::now() });
+    }
+
+    fn active_notice_entry(&self) -> Option<&Notice> {
+        self.notice.as_ref().filter(|notice| match notice.kind {
+            NoticeKind::Info => notice.at.elapsed() < NOTICE_INFO_TTL,
+            NoticeKind::Error => true,
+        })
+    }
+
+    /// Текст видимого уведомления; без него снова показываем подсказки.
     fn active_notice(&self) -> Option<&str> {
-        self.notice
-            .as_ref()
-            .filter(|(_, at)| at.elapsed() < Duration::from_secs(2))
-            .map(|(text, _)| text.as_str())
+        self.active_notice_entry().map(|notice| notice.text.as_str())
+    }
+
+    /// Любая клавиша снимает ошибку, провисевшую хотя бы NOTICE_ERROR_GRACE.
+    fn dismiss_error_notice(&mut self) {
+        if self.notice.as_ref().is_some_and(|notice| notice.kind == NoticeKind::Error && notice.dismissable()) {
+            self.notice = None;
+        }
     }
 
     /// Текст, введённый пользователем в активной панели.
@@ -2325,6 +2413,8 @@ async fn run_app(
         history_areas: Vec::new(),
         tool_servers: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
         tool_approvals: VecDeque::new(),
+        notice_log: VecDeque::new(),
+        notice_log_view: None,
         folder_pick: None,
     };
 
@@ -2468,7 +2558,7 @@ fn handle_terminal_event(
                     .map(|agent| agent.with_unauthorized_hint(crate::logging::UNAUTHORIZED_HINT))
                 {
                     Ok(updated) => *agent = Arc::new(updated),
-                    Err(err) => state.notify(format!(
+                    Err(err) => state.notify_error(format!(
                         "Не удалось применить настройки подключения: {err}"
                     )),
                 }
@@ -2512,7 +2602,7 @@ fn handle_global_key(
         }
         // Чат создаёт сервис: пока список чатов не получен, писать некуда.
         if let Some(reason) = state.blocked_reason() {
-            state.notify(format!("Чат не создать: {reason}"));
+            state.notify_error(format!("Чат не создать: {reason}"));
             return Some(LoopControl::Continue);
         }
         request_create_chat(state, tx);
@@ -2531,7 +2621,7 @@ fn handle_global_key(
         } else {
             match crate::clipboard::copy(&text) {
                 Ok(()) => state.notify("Текст ввода скопирован в буфер обмена"),
-                Err(err) => state.notify(format!("Не удалось скопировать: {err}")),
+                Err(err) => state.notify_error(format!("Не удалось скопировать: {err}")),
             }
         }
         return Some(LoopControl::Continue);
@@ -2641,6 +2731,25 @@ fn handle_key(
         handle_tool_approval_key(key, state);
         return LoopControl::Continue;
     }
+    // Журнал уведомлений открывается поверх любого окна, в том числе
+    // настроек: ошибка сохранения видна там же, где случилась. `й` — та же
+    // клавиша на русской раскладке.
+    if matches!(key.code, KeyCode::Char('q' | 'й')) && key.modifiers.contains(KeyModifiers::CONTROL) {
+        if state.notice_log_view.take().is_none() {
+            state.notice_log_view = Some(NoticeLogView::default());
+            // Ошибку открыли, чтобы прочитать, — внизу она больше не нужна.
+            if state.notice.as_ref().is_some_and(|notice| notice.kind == NoticeKind::Error) {
+                state.notice = None;
+            }
+        }
+        return LoopControl::Continue;
+    }
+    let quit = key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL);
+    if state.notice_log_view.is_some() && !quit {
+        handle_notice_log_key(key, state);
+        return LoopControl::Continue;
+    }
+    state.dismiss_error_notice();
     if let Some(control) = handle_global_key(key, state, tx) {
         return control;
     }
@@ -3253,7 +3362,7 @@ fn save_connection(
             state.agent_dirty = true;
             state.notify("Настройки подключения сохранены");
         }
-        Err(err) => state.notify(format!("Не удалось сохранить конфиг: {err}")),
+        Err(err) => state.notify_error(format!("Не удалось сохранить конфиг: {err}")),
     }
 }
 
@@ -3294,7 +3403,7 @@ fn save_activity(state: &mut AppState, values: ActivityValues, tx: &mpsc::Unboun
     config.activity_schedule = values.schedule;
     config.activity_chat_tools = Some(values.chat_tools);
     if let Err(err) = state.config.save() {
-        state.notify(format!("Не удалось сохранить конфиг: {err}"));
+        state.notify_error(format!("Не удалось сохранить конфиг: {err}"));
         return;
     }
     state.notify("Настройки сводок сохранены");
@@ -3350,7 +3459,7 @@ fn save_pipeline_with(state: &mut AppState, values: PipelineValues, save: impl F
     match save(&state.config) {
         Ok(()) if state.config.pipeline_active() => state.notify("Настройки пайплайна сохранены"),
         Ok(()) => state.notify("Настройки пайплайна сохранены — инструменты пайплайна выключены"),
-        Err(err) => state.notify(format!("Не удалось сохранить конфиг: {err}")),
+        Err(err) => state.notify_error(format!("Не удалось сохранить конфиг: {err}")),
     }
 }
 
@@ -3413,7 +3522,8 @@ fn handle_daemon_state(
         editor.activity_daemon_busy = false;
     }
     if announce {
-        state.notify(format!("Демон activity-mcp: {text}"));
+        let text = format!("Демон activity-mcp: {text}");
+        if started { state.notify(text) } else { state.notify_error(text) }
         // Только что поднятый демон мог уже собрать пропущенную сводку.
         if started && state.config.activity_active() {
             refresh_activity(state, tx);
@@ -3584,7 +3694,7 @@ fn handle_facts_key(
                 let key_text = editor.key.trim().to_string();
                 let value_text = editor.value.trim().to_string();
                 if key_text.is_empty() {
-                    state.notify("Ключ факта не может быть пустым");
+                    state.notify_error("Ключ факта не может быть пустым");
                     return LoopControl::Continue;
                 }
                 let chat_id = picker.chat_id.clone();
@@ -3738,7 +3848,7 @@ fn handle_memory_key(
                 let key_text = editor.key.trim().to_string();
                 let value_text = editor.value.trim().to_string();
                 if key_text.is_empty() {
-                    state.notify("Ключ записи памяти не может быть пустым");
+                    state.notify_error("Ключ записи памяти не может быть пустым");
                     return LoopControl::Continue;
                 }
                 let chat_id = picker.chat_id.clone();
@@ -3955,6 +4065,32 @@ fn handle_tool_approval_key(key: crossterm::event::KeyEvent, state: &mut AppStat
     }
 }
 
+/// Клавиши окна журнала уведомлений.
+fn handle_notice_log_key(key: crossterm::event::KeyEvent, state: &mut AppState) {
+    let last = state.notice_log.len().saturating_sub(1);
+    let Some(view) = state.notice_log_view.as_mut() else {
+        return;
+    };
+    match key.code {
+        KeyCode::Esc => state.notice_log_view = None,
+        KeyCode::Up => view.cursor = view.cursor.saturating_sub(1),
+        KeyCode::Down => view.cursor = (view.cursor + 1).min(last),
+        KeyCode::PageUp => view.cursor = view.cursor.saturating_sub(5),
+        KeyCode::PageDown => view.cursor = (view.cursor + 5).min(last),
+        KeyCode::Char('y' | 'н') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            let cursor = view.cursor;
+            let Some(entry) = state.notice_log.iter().rev().nth(cursor) else {
+                return;
+            };
+            match crate::clipboard::copy(&entry.text) {
+                Ok(()) => state.notify("Текст уведомления скопирован в буфер обмена"),
+                Err(err) => state.notify_error(format!("Не удалось скопировать: {err}")),
+            }
+        }
+        _ => {}
+    }
+}
+
 fn handle_confirm_key(
     key: crossterm::event::KeyEvent,
     state: &mut AppState,
@@ -4067,7 +4203,7 @@ fn submit_line(
     // Отправлять некуда, пока список чатов не получен от сервиса:
     // обмену негде записаться.
     if let Some(reason) = state.blocked_reason() {
-        state.notify(format!("Сообщение не отправлено: {reason}"));
+        state.notify_error(format!("Сообщение не отправлено: {reason}"));
         return false;
     }
     // Неполная история испортила бы контекст запроса к модели.
@@ -4084,7 +4220,7 @@ fn submit_line(
             Ok(repository) => Some(repository),
             Err(err) => {
                 state.chat_ui.entry(chat_id.clone()).or_default().input = line;
-                state.notify(format!("Сообщение не отправлено: {err}"));
+                state.notify_error(format!("Сообщение не отправлено: {err}"));
                 return false;
             }
         }
@@ -4273,7 +4409,7 @@ fn spawn_tool_turn(request: ToolTurnRequest) {
             Some(endpoint) => match ActivityTools::connect(&endpoint, crate::logging::exchange_log()).await {
                 Ok(tools) => Some(tools),
                 Err(err) => {
-                    let _ = tx.send(ChatEvent::ActivityNotice(format!(
+                    let _ = tx.send(ChatEvent::ActivityNotice(NoticeKind::Error, format!(
                         "Инструменты activity_* недоступны в этом ходе: {err}"
                     )));
                     None
@@ -4300,7 +4436,7 @@ fn spawn_tool_turn(request: ToolTurnRequest) {
                 match started {
                     Ok(server) => Some(crate::pipeline::PipelineTools { server }),
                     Err(err) => {
-                        let _ = tx.send(ChatEvent::ActivityNotice(format!(
+                        let _ = tx.send(ChatEvent::ActivityNotice(NoticeKind::Error, format!(
                             "Инструменты пайплайна недоступны в этом ходе: {err}"
                         )));
                         None
@@ -4420,7 +4556,7 @@ fn spawn_activity_ack(state: &AppState, id: i64, tx: &mpsc::UnboundedSender<Chat
     let tx = tx.clone();
     tokio::spawn(async move {
         if let Err(err) = crate::activity::ack(&endpoint, crate::logging::exchange_log(), id).await {
-            let _ = tx.send(ChatEvent::ActivityNotice(format!(
+            let _ = tx.send(ChatEvent::ActivityNotice(NoticeKind::Error, format!(
                 "Сводка #{id} не отмечена прочитанной: {}",
                 failure_text(&err)
             )));
@@ -4442,11 +4578,11 @@ fn spawn_activity_build(state: &AppState, tx: &mpsc::UnboundedSender<ChatEvent>)
         }
         .await;
         let notice = match &built {
-            Ok(Some(digest)) => format!("Собрана сводка #{}", digest.id),
-            Ok(None) => "С прошлой сводки изменений нет".to_string(),
-            Err(err) => format!("Сводка не собрана: {}", failure_text(err)),
+            Ok(Some(digest)) => (NoticeKind::Info, format!("Собрана сводка #{}", digest.id)),
+            Ok(None) => (NoticeKind::Info, "С прошлой сводки изменений нет".to_string()),
+            Err(err) => (NoticeKind::Error, format!("Сводка не собрана: {}", failure_text(err))),
         };
-        let _ = tx.send(ChatEvent::ActivityNotice(notice));
+        let _ = tx.send(ChatEvent::ActivityNotice(notice.0, notice.1));
         let result = crate::activity::fetch_unread(&endpoint, log)
             .await
             .map_err(|err| failure_text(&err));
@@ -4598,7 +4734,7 @@ fn copy_selected_message(state: &mut AppState, chat_id: &str, selected: usize) {
     };
     match crate::clipboard::copy(&text) {
         Ok(()) => state.notify("Текст сообщения скопирован в буфер обмена"),
-        Err(err) => state.notify(format!("Не удалось скопировать: {err}")),
+        Err(err) => state.notify_error(format!("Не удалось скопировать: {err}")),
     }
 }
 
@@ -5108,8 +5244,8 @@ fn handle_chat_event(
             handle_activity_digests(result, state);
             return;
         }
-        ChatEvent::ActivityNotice(text) => {
-            state.notify(text);
+        ChatEvent::ActivityNotice(kind, text) => {
+            state.push_notice(kind, text);
             return;
         }
         ChatEvent::ActivityDaemon { result, announce } => {
@@ -5279,7 +5415,7 @@ fn handle_tool_server_failed(chat_id: String, line: String, error: String, state
     if ui.input.is_empty() {
         ui.input = line;
     }
-    state.notify(format!("Сообщение не отправлено: {error}"));
+    state.notify_error(format!("Сообщение не отправлено: {error}"));
 }
 
 /// Сообщения текущего хода: от последней реплики пользователя до конца.
@@ -5449,7 +5585,7 @@ fn handle_history_loaded(chat_id: String, result: Result<ChatHistory, String>, s
             let ui = state.chat_ui.entry(chat_id).or_default();
             ui.history_loading = false;
             ui.history_error = Some(reason.clone());
-            state.notify(format!("История чата не загружена: {reason}"));
+            state.notify_error(format!("История чата не загружена: {reason}"));
         }
     }
 }
@@ -5465,7 +5601,7 @@ fn handle_chat_created(result: Result<ChatSummary, String>, state: &mut AppState
             state.sidebar_selected = 0;
             state.focus = Focus::Input;
         }
-        Err(reason) => state.notify(format!("Чат не создан: {reason}")),
+        Err(reason) => state.notify_error(format!("Чат не создан: {reason}")),
     }
 }
 
@@ -5482,14 +5618,14 @@ fn handle_chat_updated(chat_id: String, result: Result<ChatSummary, String>, sta
             // который больше никому не нужен, останавливается.
             release_unused_tool_servers(state);
         }
-        Err(reason) => state.notify(format!("Изменение чата не сохранено: {reason}")),
+        Err(reason) => state.notify_error(format!("Изменение чата не сохранено: {reason}")),
     }
 }
 
 fn handle_chat_deleted(chat_id: String, result: Result<(), String>, state: &mut AppState) {
     match result {
         Ok(()) => forget_chat(state, &chat_id),
-        Err(reason) => state.notify(format!("Чат не удалён: {reason}")),
+        Err(reason) => state.notify_error(format!("Чат не удалён: {reason}")),
     }
 }
 
@@ -5500,7 +5636,7 @@ fn handle_exchange_saved(chat_id: String, result: Result<(), String>, state: &mu
             ui.unsaved = None;
         }
         Err(reason) => {
-            state.notify(format!(
+            state.notify_error(format!(
                 "Обмен не сохранён в сервисе: {reason}. Ctrl+U — повторить"
             ));
             if let Some(ui) = state.chat_ui.get_mut(&chat_id)
@@ -5542,7 +5678,7 @@ fn handle_fact_set(chat_id: String, result: Result<Fact, String>, state: &mut Ap
                 picker.facts.sort_by(|a, b| a.key.cmp(&b.key));
             }
         }
-        Err(reason) => state.notify(format!("Не удалось сохранить факт: {reason}")),
+        Err(reason) => state.notify_error(format!("Не удалось сохранить факт: {reason}")),
     }
 }
 
@@ -5556,7 +5692,7 @@ fn handle_fact_deleted(chat_id: String, result: Result<String, String>, state: &
             picker.facts.retain(|f| f.key != key);
             picker.cursor = picker.cursor.min(picker.facts.len().saturating_sub(1));
         }
-        Err(reason) => state.notify(format!("Не удалось удалить факт: {reason}")),
+        Err(reason) => state.notify_error(format!("Не удалось удалить факт: {reason}")),
     }
 }
 
@@ -5612,7 +5748,7 @@ fn handle_branch_created(
     picker.creating = None;
     match result {
         Ok(_) => request_branches(state, &chat_id, tx),
-        Err(reason) => state.notify(format!("Не удалось создать ветку: {reason}")),
+        Err(reason) => state.notify_error(format!("Не удалось создать ветку: {reason}")),
     }
 }
 
@@ -5638,7 +5774,7 @@ fn handle_branch_activated(
             }
             fetch_history(state, &chat_id, tx);
         }
-        Err(reason) => state.notify(format!("Не удалось переключить ветку: {reason}")),
+        Err(reason) => state.notify_error(format!("Не удалось переключить ветку: {reason}")),
     }
 }
 
@@ -5675,7 +5811,7 @@ fn handle_working_memory_set(chat_id: String, result: Result<WorkingMemoryEntry,
                 picker.working.sort_by(|a, b| a.key.cmp(&b.key));
             }
         }
-        Err(reason) => state.notify(format!("Не удалось сохранить запись рабочей памяти: {reason}")),
+        Err(reason) => state.notify_error(format!("Не удалось сохранить запись рабочей памяти: {reason}")),
     }
 }
 
@@ -5689,7 +5825,7 @@ fn handle_working_memory_deleted(chat_id: String, result: Result<String, String>
             picker.working.retain(|e| e.key != key);
             picker.working_cursor = picker.working_cursor.min(picker.working.len().saturating_sub(1));
         }
-        Err(reason) => state.notify(format!("Не удалось удалить запись рабочей памяти: {reason}")),
+        Err(reason) => state.notify_error(format!("Не удалось удалить запись рабочей памяти: {reason}")),
     }
 }
 
@@ -5709,7 +5845,7 @@ fn handle_task_finished(
                 request_long_term_memory(state, &chat_id, tx);
             }
         }
-        Err(reason) => state.notify(format!("Не удалось завершить задачу: {reason}")),
+        Err(reason) => state.notify_error(format!("Не удалось завершить задачу: {reason}")),
     }
 }
 
@@ -5743,7 +5879,7 @@ fn handle_long_term_memory_set(chat_id: String, result: Result<LongTermMemoryEnt
                 picker.long_term.push(entry);
             }
         }
-        Err(reason) => state.notify(format!("Не удалось сохранить запись долговременной памяти: {reason}")),
+        Err(reason) => state.notify_error(format!("Не удалось сохранить запись долговременной памяти: {reason}")),
     }
 }
 
@@ -5757,7 +5893,7 @@ fn handle_long_term_memory_deleted(chat_id: String, result: Result<String, Strin
             picker.long_term.retain(|e| e.id != id);
             picker.long_term_cursor = picker.long_term_cursor.min(picker.long_term.len().saturating_sub(1));
         }
-        Err(reason) => state.notify(format!("Не удалось удалить запись долговременной памяти: {reason}")),
+        Err(reason) => state.notify_error(format!("Не удалось удалить запись долговременной памяти: {reason}")),
     }
 }
 
@@ -5800,7 +5936,7 @@ fn handle_task_transitioned(
             picker.editor = None;
             picker.error = None;
         }
-        Err(reason) => state.notify(format!("Не удалось изменить состояние задачи: {reason}")),
+        Err(reason) => state.notify_error(format!("Не удалось изменить состояние задачи: {reason}")),
     }
 }
 
@@ -5825,7 +5961,7 @@ fn handle_ollama_models(result: Result<Vec<String>, String>, state: &mut AppStat
                 editor.error = Some(err.clone());
             }
             if state.focus == Focus::Settings {
-                state.notify(format!("Ollama недоступен: {err}"));
+                state.notify_error(format!("Ollama недоступен: {err}"));
             }
         }
     }
@@ -5855,7 +5991,7 @@ fn handle_cloud_models(result: Result<Vec<String>, String>, state: &mut AppState
         }
         Err(err) => {
             if state.focus == Focus::Settings {
-                state.notify(format!("Список моделей сервиса недоступен: {err}"));
+                state.notify_error(format!("Список моделей сервиса недоступен: {err}"));
             }
             if let Some(editor) = state.settings.as_mut() {
                 editor.error = Some(err);
@@ -5881,7 +6017,7 @@ fn handle_profiles(result: Result<Vec<ProfileChoice>, String>, state: &mut AppSt
         }
         Err(err) => {
             if state.focus == Focus::Settings {
-                state.notify(format!("Список профилей сервиса недоступен: {err}"));
+                state.notify_error(format!("Список профилей сервиса недоступен: {err}"));
             }
         }
     }
@@ -5952,6 +6088,9 @@ fn render_ui(f: &mut Frame, state: &mut AppState) {
     if state.focus == Focus::Activity {
         render_activity_popup(f, &mut state.activity);
     }
+    if let Some(view) = &state.notice_log_view {
+        render_notice_log_popup(f, &state.notice_log, view);
+    }
     // Последним: подтверждение перекрывает любое окно.
     if let Some(request) = state.tool_approvals.front() {
         render_tool_approval_popup(f, request, state.tool_approvals.len());
@@ -5986,6 +6125,61 @@ fn tool_arguments_lines(arguments: &serde_json::Value) -> Vec<String> {
         }
     }
     lines
+}
+
+/// Журнал уведомлений: новые сверху, текст целиком с переносом строк.
+fn render_notice_log_popup(f: &mut Frame, log: &VecDeque<LoggedNotice>, view: &NoticeLogView) {
+    let height = f.area().height.saturating_sub(4).max(8);
+    let area = centered_rect(90, height, f.area());
+    f.render_widget(Clear, area);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan))
+        .title(format!(" Журнал уведомлений ({}) ", log.len()));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(0), Constraint::Length(1)])
+        .split(inner);
+
+    let lines: Vec<Line> = if log.is_empty() {
+        vec![Line::from(Span::styled(" Уведомлений пока не было", Style::default().fg(Color::DarkGray)))]
+    } else {
+        // Прокрутки внутри абзаца нет: список начинается чуть выше курсора,
+        // чтобы выбранная запись была видна и при длинных соседях.
+        let start = view.cursor.saturating_sub(2);
+        log.iter()
+            .rev()
+            .enumerate()
+            .skip(start)
+            .flat_map(|(index, entry)| {
+                let color = match entry.kind {
+                    NoticeKind::Error => Color::Red,
+                    NoticeKind::Info => Color::Green,
+                };
+                let mut style = Style::default().fg(color);
+                if index == view.cursor {
+                    style = style.add_modifier(Modifier::REVERSED);
+                }
+                let label = if entry.kind == NoticeKind::Error { "ошибка" } else { "" };
+                [
+                    Line::from(vec![
+                        Span::styled(format!(" {} ", entry.time), Style::default().fg(Color::DarkGray)),
+                        Span::styled(format!("{label} "), Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)),
+                        Span::styled(entry.text.clone(), style),
+                    ]),
+                    Line::raw(""),
+                ]
+            })
+            .collect()
+    };
+    f.render_widget(Paragraph::new(Text::from(lines)).wrap(Wrap { trim: false }), rows[0]);
+    f.render_widget(
+        Paragraph::new(" ↑/↓, PageUp/PageDown — запись · Ctrl+Y — копировать · Esc/Ctrl+Q — закрыть")
+            .style(Style::default().fg(Color::DarkGray)),
+        rows[1],
+    );
 }
 
 /// Подтверждение пишущего вызова инструмента: имя, аргументы целиком.
@@ -6883,8 +7077,10 @@ fn render_input(f: &mut Frame, state: &AppState, chat_id: &str, is_active_pane: 
 }
 
 fn render_help(f: &mut Frame, state: &AppState, area: Rect) {
-    let (text, color) = match state.active_notice() {
-        Some(notice) => (notice, Color::Green),
+    let notice = state.active_notice_entry();
+    let (text, color) = match notice {
+        Some(Notice { text, kind: NoticeKind::Info, .. }) => (text.as_str(), Color::Green),
+        Some(Notice { text, kind: NoticeKind::Error, .. }) => (text.as_str(), Color::Red),
         // В режиме выбора клавиши другие, и у Ctrl+Y другой смысл: подсказка
         // показывает именно их, пока режим открыт.
         None if state.focus == Focus::MessageSelect => (
@@ -6892,7 +7088,7 @@ fn render_help(f: &mut Frame, state: &AppState, area: Rect) {
             Color::DarkGray,
         ),
         None => (
-            "Tab — панель · ←/→ — окно · колесо/PageUp/PageDown — история · Ctrl+W — закрыть · Ctrl+P — настройки · Ctrl+O — импорт контекста · Ctrl+N — новый чат · Ctrl+E — обновить список · Ctrl+U — повторить запись · Ctrl+Y — копировать ввод · Ctrl+G — выбрать сообщение · Ctrl+R — рассуждение · Esc/Ctrl+C — выход",
+            "Tab — панель · ←/→ — окно · колесо/PageUp/PageDown — история · Ctrl+W — закрыть · Ctrl+P — настройки · Ctrl+O — импорт контекста · Ctrl+N — новый чат · Ctrl+E — обновить список · Ctrl+U — повторить запись · Ctrl+Y — копировать ввод · Ctrl+G — выбрать сообщение · Ctrl+R — рассуждение · Ctrl+Q — журнал уведомлений · Esc/Ctrl+C — выход",
             Color::DarkGray,
         ),
     };
@@ -6904,6 +7100,12 @@ fn render_help(f: &mut Frame, state: &AppState, area: Rect) {
         spans.push(Span::styled(
             format!("Сводок активности: {unread} — Ctrl+A · "),
             Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+        ));
+    }
+    if notice.is_some_and(|notice| notice.kind == NoticeKind::Error) {
+        spans.push(Span::styled(
+            "Ошибка (любая клавиша — скрыть, Ctrl+Q — журнал): ",
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
         ));
     }
     spans.push(Span::styled(text, Style::default().fg(color)));
@@ -6961,7 +7163,7 @@ fn render_settings_popup(f: &mut Frame, editor: &SettingsEditor) {
     f.render_widget(
         Paragraph::new(Line::from(Span::styled(
             " Tab — панель/поле · ↑/↓ — выбор · Ctrl+D — сброс · Ctrl+L — модели Ollama · \
-Ctrl+X — выбрать каталог · Ctrl+S — сохранить · Esc — отмена",
+Ctrl+X — выбрать каталог · Ctrl+Q — журнал · Ctrl+S — сохранить · Esc — отмена",
             Style::default().fg(Color::DarkGray),
         ))),
         rows[2],
@@ -7905,6 +8107,8 @@ mod tests {
             history_areas: Vec::new(),
             tool_servers: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             tool_approvals: VecDeque::new(),
+            notice_log: VecDeque::new(),
+            notice_log_view: None,
             folder_pick: None,
         }
     }
@@ -9550,5 +9754,105 @@ mod tests {
         // Пустой каталог поиска тоже выключает пайплайн.
         save_pipeline_with(&mut state, PipelineValues { enabled: true, root: None, output: None }, |_| Ok(()));
         assert!(!state.config.pipeline_active());
+    }
+
+    /// Сдвинуть момент появления уведомления в прошлое.
+    fn age_notice(state: &mut AppState, by: Duration) {
+        let notice = state.notice.as_mut().expect("уведомление");
+        notice.at = Instant::now() - by;
+    }
+
+    #[test]
+    fn error_notice_stays_while_info_expires() {
+        let mut state = test_state();
+        state.notify("Настройки сохранены");
+        age_notice(&mut state, Duration::from_secs(10));
+        assert!(state.active_notice().is_none());
+
+        state.notify_error("Не удалось сохранить конфиг: диск полон");
+        age_notice(&mut state, Duration::from_secs(60));
+        assert_eq!(state.active_notice(), Some("Не удалось сохранить конфиг: диск полон"));
+        assert!(state.active_notice_entry().unwrap().kind == NoticeKind::Error);
+    }
+
+    #[test]
+    fn info_does_not_hide_fresh_error_but_is_logged() {
+        let mut state = test_state();
+        state.notify_error("Не удалось сохранить конфиг");
+        state.notify("Настройки пайплайна сохранены");
+        assert_eq!(state.active_notice(), Some("Не удалось сохранить конфиг"));
+        assert_eq!(state.notice_log.len(), 2);
+
+        // Провисевшую ошибку следующее сообщение уже заменяет.
+        age_notice(&mut state, Duration::from_secs(2));
+        state.notify("Настройки сохранены");
+        assert_eq!(state.active_notice(), Some("Настройки сохранены"));
+    }
+
+    #[tokio::test]
+    async fn key_dismisses_only_aged_error_and_is_still_handled() {
+        let mut state = test_state();
+        let log = Arc::new(agentcore::logging::ExchangeLog::disabled());
+        let agent = Arc::new(CliAgent::from_config(&state.config, log).unwrap());
+        let (tx, _rx) = mpsc::unbounded_channel();
+
+        state.notify_error("Сообщение не отправлено: сервис недоступен");
+        handle_key(key(KeyCode::Tab), &mut state, &agent, &tx);
+        assert!(state.active_notice().is_some(), "свежую ошибку клавиша не снимает");
+
+        age_notice(&mut state, Duration::from_secs(2));
+        let was_input = state.focus == Focus::Input;
+        handle_key(key(KeyCode::Tab), &mut state, &agent, &tx);
+        assert!(state.active_notice().is_none());
+        assert!(was_input != (state.focus == Focus::Input), "клавиша, снявшая ошибку, обработана как обычно");
+    }
+
+    #[test]
+    fn notice_log_keeps_last_entries() {
+        let mut state = test_state();
+        for index in 0..(NOTICE_LOG_LIMIT + 5) {
+            state.notify(format!("сообщение {index}"));
+        }
+        assert_eq!(state.notice_log.len(), NOTICE_LOG_LIMIT);
+        assert_eq!(state.notice_log.front().unwrap().text, "сообщение 5");
+        assert_eq!(state.notice_log.back().unwrap().text, format!("сообщение {}", NOTICE_LOG_LIMIT + 4));
+    }
+
+    #[tokio::test]
+    async fn ctrl_q_opens_log_over_any_window() {
+        let mut state = test_state();
+        let log = Arc::new(agentcore::logging::ExchangeLog::disabled());
+        let agent = Arc::new(CliAgent::from_config(&state.config, log).unwrap());
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let ctrl_q = crossterm::event::KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL);
+        let ctrl_q_ru = crossterm::event::KeyEvent::new(KeyCode::Char('й'), KeyModifiers::CONTROL);
+
+        state.notify("первое");
+        state.notify_error("второе");
+        state.notify("третье");
+        handle_key(ctrl_q, &mut state, &agent, &tx);
+        assert!(state.notice_log_view.is_some());
+        assert!(state.active_notice().is_none(), "открытый журнал снимает ошибку внизу");
+
+        // Курсор ходит по записям в пределах журнала, клавиши окну под ним не достаются.
+        handle_key(key(KeyCode::Down), &mut state, &agent, &tx);
+        handle_key(key(KeyCode::Down), &mut state, &agent, &tx);
+        handle_key(key(KeyCode::Down), &mut state, &agent, &tx);
+        assert_eq!(state.notice_log_view.as_ref().unwrap().cursor, 2);
+        handle_key(key(KeyCode::Up), &mut state, &agent, &tx);
+        assert_eq!(state.notice_log_view.as_ref().unwrap().cursor, 1);
+        handle_key(key(KeyCode::Esc), &mut state, &agent, &tx);
+        assert!(state.notice_log_view.is_none());
+
+        // Поверх настроек — и закрывается той же клавишей, настройки остаются.
+        state.settings = Some(editor_on_pipeline(&state.config));
+        state.focus = Focus::Settings;
+        handle_key(ctrl_q_ru, &mut state, &agent, &tx);
+        assert!(state.notice_log_view.is_some());
+        handle_key(key(KeyCode::Esc), &mut state, &agent, &tx);
+        handle_key(ctrl_q, &mut state, &agent, &tx);
+        handle_key(ctrl_q, &mut state, &agent, &tx);
+        assert!(state.notice_log_view.is_none());
+        assert!(state.focus == Focus::Settings && state.settings.is_some());
     }
 }
