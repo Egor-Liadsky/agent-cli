@@ -477,6 +477,7 @@ enum FormatField {
     ActivitySchedule,
     ActivityChatTools,
     ActivityDaemon,
+    PipelineEnabled,
     PipelineRoot,
     PipelineOutput,
     Mode,
@@ -561,7 +562,7 @@ impl SettingsSection {
                 "Демон activity-mcp: журнал изменений git-проектов и сводки по расписанию. Настройки общие для всех чатов; демон можно запустить отсюда — он встанет на автозапуск и будет работать и без TUI."
             }
             SettingsSection::Pipeline => {
-                "Сервер pipeline-mcp: инструменты search → summarize → save_to_file во всех чатах. Настройки общие для всех чатов; заданный каталог поиска включает инструменты, пустой — выключает."
+                "Сервер pipeline-mcp: инструменты search → summarize → save_to_file во всех чатах. Настройки общие для всех чатов; инструменты работают при включённом переключателе и заданном каталоге поиска."
             }
             SettingsSection::Format => "Формат ответа: кастомный режим, длина, стоп-условия.",
             SettingsSection::Reasoning => {
@@ -612,7 +613,11 @@ impl SettingsSection {
                 FormatField::ActivityChatTools,
                 FormatField::ActivityDaemon,
             ],
-            SettingsSection::Pipeline => &[FormatField::PipelineRoot, FormatField::PipelineOutput],
+            SettingsSection::Pipeline => &[
+                FormatField::PipelineEnabled,
+                FormatField::PipelineRoot,
+                FormatField::PipelineOutput,
+            ],
             SettingsSection::Format => &[
                 FormatField::Mode,
                 FormatField::Description,
@@ -734,6 +739,7 @@ impl FormatField {
             FormatField::ActivitySchedule => "Расписание сводок (cron)",
             FormatField::ActivityChatTools => "Инструменты activity_* для модели",
             FormatField::ActivityDaemon => "Демон activity-mcp",
+            FormatField::PipelineEnabled => "Инструменты пайплайна",
             FormatField::PipelineRoot => "Каталог поиска",
             FormatField::PipelineOutput => "Каталог записи",
             FormatField::Mode => "Режим",
@@ -878,10 +884,14 @@ git_reset, git_create_branch, git_checkout. Пусто — только чита
 Демон регистрируется в launchd (macOS) или systemd --user (Linux): работает без TUI, стартует при входе в систему \
 и поднимается после падения. Поля раздела сохраняются в конфиг перед запуском."
             }
+            FormatField::PipelineEnabled => {
+                "◀/▶ или Space — переключить. Давать модели во всех чатах инструменты search, summarize и save_to_file \
+(pipeline_enabled конфига). Выключение сохраняет каталоги ниже. Общая настройка клиента, сохраняется по Ctrl+S и \
+действует со следующего хода."
+            }
             FormatField::PipelineRoot => {
-                "Каталог, в котором ищет инструмент search (pipeline_root конфига). Заданный — включает инструменты пайплайна \
-во всех чатах, пустой — выключает. Общая настройка клиента, сохраняется по Ctrl+S и действует со следующего хода. \
-Ctrl+X — выбрать каталог в системном диалоге, Ctrl+D — очистить."
+                "Каталог, в котором ищет инструмент search (pipeline_root конфига). Без него инструменты не работают и при \
+включённом переключателе. Ctrl+X — выбрать каталог в системном диалоге, Ctrl+D — очистить."
             }
             FormatField::PipelineOutput => {
                 "Каталог, в который пишет save_to_file (pipeline_output конфига). Пусто — подкаталог pipeline-out каталога \
@@ -936,6 +946,7 @@ Ctrl+X — выбрать каталог в системном диалоге, C
                 | FormatField::ActivityEnabled
                 | FormatField::ActivityChatTools
                 | FormatField::ActivityDaemon
+                | FormatField::PipelineEnabled
         )
     }
 
@@ -970,6 +981,7 @@ Ctrl+X — выбрать каталог в системном диалоге, C
                 | FormatField::ActivitySchedule
                 | FormatField::ActivityChatTools
                 | FormatField::ActivityDaemon
+                | FormatField::PipelineEnabled
                 | FormatField::PipelineRoot
                 | FormatField::PipelineOutput
         )
@@ -1012,8 +1024,9 @@ struct SettingsEditor {
     activity_daemon: String,
     /// Идёт запуск или остановка: повторный Enter не ставит вторую.
     activity_daemon_busy: bool,
-    /// Раздел «Пайплайн»: каталоги pipeline-mcp из конфига клиента. Флага
-    /// «включено» нет — пайплайн включает непустой каталог поиска.
+    /// Раздел «Пайплайн»: переключатель и каталоги pipeline-mcp из конфига
+    /// клиента, как у сводок активности.
+    pipeline_enabled: bool,
     pipeline_root: String,
     pipeline_output: String,
     /// Чат, чьи параметры редактируются.
@@ -1136,6 +1149,7 @@ impl SettingsEditor {
             activity_chat_tools: config.activity_chat_tools == Some(true),
             activity_daemon: if config.activity_active() { "проверяю…".to_string() } else { String::new() },
             activity_daemon_busy: false,
+            pipeline_enabled: config.pipeline_switch_on(),
             pipeline_root: config.pipeline_root.clone().unwrap_or_default(),
             pipeline_output: config.pipeline_output.clone().unwrap_or_default(),
             chat_id: chat.id.clone(),
@@ -1277,6 +1291,7 @@ impl SettingsEditor {
                 | FormatField::ActivitySchedule
                 | FormatField::ActivityChatTools
                 | FormatField::ActivityDaemon => self.activity_enabled,
+                FormatField::PipelineRoot | FormatField::PipelineOutput => self.pipeline_enabled,
                 _ => true,
             })
             .collect()
@@ -1507,6 +1522,7 @@ impl SettingsEditor {
             Some(FormatField::GitToolsEnabled) => self.toggle_git_tools(false),
             Some(FormatField::ActivityEnabled) => self.toggle_activity(false),
             Some(FormatField::ActivityChatTools) => self.activity_chat_tools = false,
+            Some(FormatField::PipelineEnabled) => self.toggle_pipeline(false),
             // Ctrl+D на строке демона — остановка, её обрабатывает
             // handle_settings_key: редактору не хватает канала событий.
             Some(FormatField::ActivityDaemon) => {}
@@ -1533,7 +1549,8 @@ impl SettingsEditor {
             | FormatField::GitToolsEnabled
             | FormatField::ActivityEnabled
             | FormatField::ActivityChatTools
-            | FormatField::ActivityDaemon => None,
+            | FormatField::ActivityDaemon
+            | FormatField::PipelineEnabled => None,
             FormatField::ActivityRoot => Some(&mut self.activity_root),
             FormatField::ActivitySchedule => Some(&mut self.activity_schedule),
             FormatField::PipelineRoot => Some(&mut self.pipeline_root),
@@ -1788,6 +1805,13 @@ impl SettingsEditor {
     /// переключателем.
     fn toggle_activity(&mut self, enabled: bool) {
         self.activity_enabled = enabled;
+        let len = self.visible_fields().len();
+        self.field = self.field.min(len.saturating_sub(1));
+    }
+
+    /// Каталоги пайплайна видны только при включённом переключателе.
+    fn toggle_pipeline(&mut self, enabled: bool) {
+        self.pipeline_enabled = enabled;
         let len = self.visible_fields().len();
         self.field = self.field.min(len.saturating_sub(1));
     }
@@ -3170,6 +3194,13 @@ fn handle_settings_key(
         {
             editor.activity_chat_tools = !editor.activity_chat_tools;
         }
+        KeyCode::Left | KeyCode::Right | KeyCode::Char(' ')
+            if editor.pane == SettingsPane::Fields
+                && editor.current_field() == Some(FormatField::PipelineEnabled) =>
+        {
+            let enabled = !editor.pipeline_enabled;
+            editor.toggle_pipeline(enabled);
+        }
         KeyCode::Left => {
             // из полей — обратно к списку разделов
             editor.pane = SettingsPane::Sections;
@@ -3281,6 +3312,7 @@ fn save_activity(state: &mut AppState, values: ActivityValues, tx: &mpsc::Unboun
 /// Поля раздела «Пайплайн» для сохранения в конфиг.
 #[derive(Debug, PartialEq)]
 struct PipelineValues {
+    enabled: bool,
     root: Option<String>,
     output: Option<String>,
 }
@@ -3288,6 +3320,7 @@ struct PipelineValues {
 impl SettingsEditor {
     fn pipeline_values(&self) -> PipelineValues {
         PipelineValues {
+            enabled: self.pipeline_enabled,
             root: non_empty(&self.pipeline_root),
             output: non_empty(&self.pipeline_output),
         }
@@ -3305,9 +3338,13 @@ fn save_pipeline(state: &mut AppState, values: PipelineValues) {
 /// каталог конфигов ОС, и тест без этого переписал бы конфиг пользователя.
 fn save_pipeline_with(state: &mut AppState, values: PipelineValues, save: impl FnOnce(&Config) -> anyhow::Result<()>) {
     let config = &mut state.config;
-    if config.pipeline_root == values.root && config.pipeline_output == values.output {
+    if config.pipeline_switch_on() == values.enabled
+        && config.pipeline_root == values.root
+        && config.pipeline_output == values.output
+    {
         return;
     }
+    config.pipeline_enabled = Some(values.enabled);
     config.pipeline_root = values.root;
     config.pipeline_output = values.output;
     match save(&state.config) {
@@ -7024,7 +7061,7 @@ fn empty_field_hint(field: FormatField, editor: &SettingsEditor) -> String {
         FormatField::GitRepository => "не задан — укажите путь к git-репозиторию".to_string(),
         FormatField::ActivityRoot => "не задан — укажите каталог с проектами, например ~/projects".to_string(),
         FormatField::ActivitySchedule => "не задано — умолчание демона: 0 9,18 * * *".to_string(),
-        FormatField::PipelineRoot => "не задан — инструменты пайплайна выключены".to_string(),
+        FormatField::PipelineRoot => "не задан — без него инструменты пайплайна не работают".to_string(),
         // Путь считает ядро по введённому, но ещё не сохранённому каталогу
         // поиска: подсказка совпадает с тем, куда запишет следующий ход.
         FormatField::PipelineOutput => {
@@ -7137,6 +7174,9 @@ fn render_settings_fields(f: &mut Frame, editor: &SettingsEditor, area: Rect) {
             }
             FormatField::ActivityRoot => editor.activity_root.clone(),
             FormatField::ActivitySchedule => editor.activity_schedule.clone(),
+            FormatField::PipelineEnabled => {
+                if editor.pipeline_enabled { "Включены" } else { "Выключены" }.to_string()
+            }
             FormatField::PipelineRoot => editor.pipeline_root.clone(),
             FormatField::PipelineOutput => editor.pipeline_output.clone(),
             FormatField::ActivityChatTools => {
@@ -9353,16 +9393,20 @@ mod tests {
             ..Config::default()
         };
         let mut editor = editor_on_pipeline(&config);
-        assert!(editor.visible_fields() == vec![FormatField::PipelineRoot, FormatField::PipelineOutput]);
+        assert!(
+            editor.visible_fields()
+                == vec![FormatField::PipelineEnabled, FormatField::PipelineRoot, FormatField::PipelineOutput]
+        );
+        assert!(editor.pipeline_enabled, "без поля в конфиге переключатель следует каталогу поиска");
         assert_eq!(editor.pipeline_root, "~/projects/ai");
         assert_eq!(editor.pipeline_output, "~/out");
         assert_eq!(
             editor.pipeline_values(),
-            PipelineValues { root: Some("~/projects/ai".into()), output: Some("~/out".into()) }
+            PipelineValues { enabled: true, root: Some("~/projects/ai".into()), output: Some("~/out".into()) }
         );
 
         // Ввод и Ctrl+D идут через общий путь текстовых полей.
-        editor.field = 1;
+        editor.field = 2;
         editor.field_value_mut().unwrap().push('2');
         assert_eq!(editor.pipeline_output, "~/out2");
         editor.reset_field();
@@ -9370,10 +9414,44 @@ mod tests {
         assert_eq!(editor.pipeline_root, "~/projects/ai");
 
         let empty = editor_on_pipeline(&Config::default());
+        assert!(!empty.pipeline_enabled);
+        assert!(empty.visible_fields() == vec![FormatField::PipelineEnabled], "каталоги скрыты при выключенном");
         assert_eq!(empty.pipeline_root, "");
         assert_eq!(empty.pipeline_output, "");
-        assert!(empty_field_hint(FormatField::PipelineRoot, &empty).contains("выключены"));
+        assert!(empty_field_hint(FormatField::PipelineRoot, &empty).contains("не работают"));
         assert!(empty_field_hint(FormatField::PipelineOutput, &empty).contains("каталог поиска"));
+
+        // Выключенный переключатель в конфиге не прячет сохранённые каталоги.
+        let off = Config { pipeline_enabled: Some(false), ..config };
+        let editor = editor_on_pipeline(&off);
+        assert!(!editor.pipeline_enabled);
+        assert_eq!(editor.pipeline_root, "~/projects/ai");
+    }
+
+    #[test]
+    fn pipeline_section_toggle_switches_and_ctrl_d_turns_off() {
+        let mut state = test_state();
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let config = Config { pipeline_root: Some("/work".into()), ..Config::default() };
+        state.settings = Some(editor_on_pipeline(&config));
+        state.focus = Focus::Settings;
+
+        handle_settings_key(key(KeyCode::Char(' ')), &mut state, &tx);
+        let editor = state.settings.as_mut().unwrap();
+        assert!(!editor.pipeline_enabled);
+        assert!(editor.visible_fields() == vec![FormatField::PipelineEnabled]);
+        assert_eq!(editor.pipeline_values().root.as_deref(), Some("/work"), "выключение не стирает каталог");
+
+        handle_settings_key(key(KeyCode::Right), &mut state, &tx);
+        let editor = state.settings.as_mut().unwrap();
+        assert!(editor.pipeline_enabled);
+        assert_eq!(editor.visible_fields().len(), 3);
+
+        // Ctrl+D на переключателе выключает, а не очищает каталоги.
+        editor.field = 0;
+        editor.reset_field();
+        assert!(!editor.pipeline_enabled);
+        assert_eq!(editor.pipeline_root, "/work");
     }
 
     #[test]
@@ -9389,10 +9467,16 @@ mod tests {
         let mut state = test_state();
         let (tx, _rx) = mpsc::unbounded_channel();
         let ctrl_x = crossterm::event::KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL);
-        state.settings = Some(editor_on_pipeline(&state.config));
+        let mut editor = editor_on_pipeline(&state.config);
+        editor.toggle_pipeline(true);
+        state.settings = Some(editor);
         state.focus = Focus::Settings;
 
-        for (index, field) in [(0, FormatField::PipelineRoot), (1, FormatField::PipelineOutput)] {
+        // На переключателе диалога нет.
+        handle_settings_key(ctrl_x, &mut state, &tx);
+        assert!(state.folder_pick.is_none());
+
+        for (index, field) in [(1, FormatField::PipelineRoot), (2, FormatField::PipelineOutput)] {
             state.folder_pick = None;
             state.settings.as_mut().unwrap().field = index;
             handle_settings_key(ctrl_x, &mut state, &tx);
@@ -9421,20 +9505,24 @@ mod tests {
     #[test]
     fn pipeline_section_values_turn_blank_into_none() {
         let mut editor = editor_on_pipeline(&Config::default());
-        assert_eq!(editor.pipeline_values(), PipelineValues { root: None, output: None });
+        assert_eq!(editor.pipeline_values(), PipelineValues { enabled: false, root: None, output: None });
         editor.pipeline_root = "  /work  ".into();
         editor.pipeline_output = "   ".into();
-        assert_eq!(editor.pipeline_values(), PipelineValues { root: Some("/work".into()), output: None });
+        assert_eq!(
+            editor.pipeline_values(),
+            PipelineValues { enabled: false, root: Some("/work".into()), output: None }
+        );
     }
 
     #[test]
     fn pipeline_section_save_updates_config_only_on_change() {
         let mut state = test_state();
         let mut saves = 0;
-        let values = PipelineValues { root: Some("/work".into()), output: None };
+        let values = PipelineValues { enabled: true, root: Some("/work".into()), output: None };
         save_pipeline_with(&mut state, values, |config| {
             saves += 1;
             assert_eq!(config.pipeline_root.as_deref(), Some("/work"));
+            assert_eq!(config.pipeline_enabled, Some(true));
             Ok(())
         });
         assert_eq!(saves, 1);
@@ -9444,16 +9532,23 @@ mod tests {
         assert!(state.active_notice().unwrap().contains("пайплайна сохранены"));
 
         // Те же значения — файл не переписывается.
-        let same = PipelineValues { root: Some("/work".into()), output: None };
+        let same = PipelineValues { enabled: true, root: Some("/work".into()), output: None };
         save_pipeline_with(&mut state, same, |_| {
             saves += 1;
             Ok(())
         });
         assert_eq!(saves, 1);
 
-        // Пустой каталог поиска выключает пайплайн.
-        save_pipeline_with(&mut state, PipelineValues { root: None, output: None }, |_| Ok(()));
+        // Выключение переключателем сохраняет каталог в конфиге.
+        let off = PipelineValues { enabled: false, root: Some("/work".into()), output: None };
+        save_pipeline_with(&mut state, off, |_| Ok(()));
         assert!(!state.config.pipeline_active());
+        assert_eq!(state.config.pipeline_enabled, Some(false));
+        assert_eq!(state.config.pipeline_root.as_deref(), Some("/work"));
         assert!(state.active_notice().unwrap().contains("выключены"));
+
+        // Пустой каталог поиска тоже выключает пайплайн.
+        save_pipeline_with(&mut state, PipelineValues { enabled: true, root: None, output: None }, |_| Ok(()));
+        assert!(!state.config.pipeline_active());
     }
 }

@@ -608,6 +608,12 @@ pub struct Config {
     /// `<pipeline_root>/pipeline-out`.
     #[serde(default)]
     pub pipeline_output: Option<String>,
+    /// Переключатель инструментов пайплайна. `None` — прежнее поведение:
+    /// решает только заданный `pipeline_root`, поэтому конфиги без поля
+    /// работают как раньше. `Some(false)` выключает инструменты, не стирая
+    /// каталоги, — их не нужно вводить заново при включении.
+    #[serde(default)]
+    pub pipeline_enabled: Option<bool>,
 }
 
 /// Подкаталог корня поиска, куда пишет пайплайн, если `pipeline_output` не
@@ -616,6 +622,16 @@ pub const DEFAULT_PIPELINE_OUTPUT_DIR: &str = "pipeline-out";
 
 impl Config {
     pub fn pipeline_active(&self) -> bool {
+        self.pipeline_switch_on() && self.pipeline_root_set()
+    }
+
+    /// Положение переключателя, как его показывают TUI и `config pipeline
+    /// show`: без явного значения — включён, если задан каталог поиска.
+    pub fn pipeline_switch_on(&self) -> bool {
+        self.pipeline_enabled.unwrap_or_else(|| self.pipeline_root_set())
+    }
+
+    fn pipeline_root_set(&self) -> bool {
         self.pipeline_root.as_deref().is_some_and(|root| !root.trim().is_empty())
     }
 
@@ -1128,5 +1144,24 @@ client_token = "t"
         assert_eq!(config.effective_pipeline_output().as_deref(), Some("/out"));
         config.pipeline_root = Some("  ".to_string());
         assert!(!config.pipeline_active());
+    }
+
+    #[test]
+    fn pipeline_switch_keeps_directories_when_off() {
+        let mut config = Config { pipeline_root: Some("/work".to_string()), ..Config::default() };
+        assert!(config.pipeline_switch_on() && config.pipeline_active());
+
+        config.pipeline_enabled = Some(false);
+        assert!(!config.pipeline_switch_on() && !config.pipeline_active());
+        assert_eq!(config.effective_pipeline_output().as_deref(), Some("/work/pipeline-out"));
+
+        // Включённый переключатель без каталога поиска инструменты не даёт.
+        let empty = Config { pipeline_enabled: Some(true), ..Config::default() };
+        assert!(empty.pipeline_switch_on() && !empty.pipeline_active());
+        assert!(!Config::default().pipeline_switch_on());
+
+        let parsed: Config = toml::from_str("pipeline_root = \"/work\"\n").unwrap();
+        assert_eq!(parsed.pipeline_enabled, None);
+        assert!(parsed.pipeline_active(), "конфиг без поля работает как раньше");
     }
 }

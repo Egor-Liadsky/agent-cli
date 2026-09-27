@@ -244,8 +244,9 @@ pub enum ConfigAction {
         #[command(subcommand)]
         action: ActivityConfigAction,
     },
-    /// Каталоги пайплайна pipeline-mcp; заданный каталог поиска включает
-    /// инструменты search, summarize, save_to_file в чатах
+    /// Каталоги и переключатель пайплайна pipeline-mcp; инструменты search,
+    /// summarize, save_to_file в чатах работают при включённом переключателе
+    /// и заданном каталоге поиска
     Pipeline {
         #[command(subcommand)]
         action: PipelineConfigAction,
@@ -262,8 +263,10 @@ pub enum ConfigAction {
 
 #[derive(Subcommand)]
 pub enum PipelineConfigAction {
-    /// Задать каталоги поиска и записи
+    /// Включить или выключить инструменты и задать каталоги поиска и записи
     Set {
+        /// true/false, on/off, yes/no; выключение сохраняет каталоги
+        enabled: Option<String>,
         /// Каталог, в котором ищет search; пустая строка снимает его
         #[arg(long)]
         root: Option<String>,
@@ -271,7 +274,8 @@ pub enum PipelineConfigAction {
         #[arg(long)]
         output: Option<String>,
     },
-    /// Снять оба каталога: инструменты пайплайна в чатах выключаются
+    /// Снять оба каталога и переключатель: инструменты пайплайна в чатах
+    /// выключаются
     Clear,
     /// Показать каталоги пайплайна
     Show,

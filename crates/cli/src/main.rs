@@ -473,11 +473,14 @@ fn run_git_tools_action(action: GitToolsAction) -> anyhow::Result<()> {
 
 fn run_pipeline_config(action: PipelineConfigAction) -> anyhow::Result<()> {
     match action {
-        PipelineConfigAction::Set { root, output } => {
-            if root.is_none() && output.is_none() {
-                anyhow::bail!("укажите хотя бы одно значение: --root или --output");
+        PipelineConfigAction::Set { enabled, root, output } => {
+            if enabled.is_none() && root.is_none() && output.is_none() {
+                anyhow::bail!("укажите хотя бы одно значение: enabled, --root или --output");
             }
             let mut config = load_config()?;
+            if let Some(enabled) = enabled {
+                config.pipeline_enabled = Some(parse_bool_flag(&enabled)?);
+            }
             if let Some(root) = root {
                 config.pipeline_root = Some(root).filter(|root| !root.trim().is_empty());
             }
@@ -492,6 +495,7 @@ fn run_pipeline_config(action: PipelineConfigAction) -> anyhow::Result<()> {
             let mut config = load_config()?;
             config.pipeline_root = None;
             config.pipeline_output = None;
+            config.pipeline_enabled = None;
             config.save()?;
             println!("{}", style("Настройки pipeline-mcp сняты.").green().bold());
         }
@@ -505,6 +509,11 @@ fn print_pipeline(config: &Config) {
         "{} {}",
         style("инструменты пайплайна в чатах:").cyan().bold(),
         if config.pipeline_active() { "включены" } else { "выключены" }
+    );
+    println!(
+        "{} {}",
+        style("переключатель:").cyan().bold(),
+        if config.pipeline_switch_on() { "вкл" } else { "выкл" }
     );
     println!(
         "{} {}",
