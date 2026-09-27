@@ -1066,9 +1066,11 @@ cargo run -p agentcli -- activity status              # связь с демон
 (команда) или моделью текущего чата (чат). Если sampling не удался, сервер
 делает экстрактивную сводку и сообщает причину — цепочка не рвётся.
 Бинарник ищется так: путь из `AGENTCLI_PIPELINE_MCP` → рядом с `agentcli` →
-`PATH`. Из подмодуля зонтичного репозитория:
+`PATH`. Установка:
 
 ```bash
+cargo install --git https://github.com/Egor-Liadsky/pipeline-mcp-agent pipeline-mcp
+# или из подмодуля зонтичного репозитория:
 cargo install --path ../mcp/pipeline/crates/pipeline
 ```
 
