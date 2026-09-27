@@ -4,6 +4,7 @@ mod agent;
 mod chats;
 mod clipboard;
 mod cli;
+mod folder_picker;
 mod logging;
 mod markdown;
 mod mcp;

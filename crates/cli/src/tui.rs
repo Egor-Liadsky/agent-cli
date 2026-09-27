@@ -836,7 +836,7 @@ AGENTD_TASK_STATE_ENABLED (по умолчанию выключено)."
             }
             FormatField::GitRepository => {
                 "Путь к git-репозиторию на этой машине. Модель работает только с ним: путь подставляет клиент, \
-а не модель."
+а не модель. Ctrl+X — выбрать каталог в системном диалоге."
             }
             FormatField::GitAllowedTools => {
                 "Пишущие инструменты, которые модели разрешено запрашивать, через запятую: git_add, git_commit, \
@@ -852,7 +852,7 @@ git_reset, git_create_branch, git_checkout. Пусто — только чита
             }
             FormatField::ActivityRoot => {
                 "Каталог, под которым лежат проекты (git-репозитории ищутся на глубину до 3). Нужен для запуска демона отсюда; \
-после смены — перезапустить демон (Enter на строке «Демон»)."
+после смены — перезапустить демон (Enter на строке «Демон»). Ctrl+X — выбрать каталог в системном диалоге."
             }
             FormatField::ActivitySchedule => {
                 "Когда демон собирает сводку: cron из 5 полей в местном времени, например «0 9,18 * * *» — в 9:00 и 18:00. \
@@ -951,6 +951,12 @@ git_reset, git_create_branch, git_checkout. Пусто — только чита
                 | FormatField::ActivityChatTools
                 | FormatField::ActivityDaemon
         )
+    }
+
+    /// Поля с путём к каталогу для MCP-сервера: их можно заполнить
+    /// системным диалогом (Ctrl+X).
+    fn is_directory(self) -> bool {
+        matches!(self, FormatField::ActivityRoot | FormatField::GitRepository)
     }
 
     /// Поля, не зависящие от режима формата (доступны всегда).
@@ -1523,6 +1529,39 @@ impl SettingsEditor {
         }
     }
 
+    /// Значение поля-каталога; для остальных полей — `None`.
+    fn directory_value_mut(&mut self, field: FormatField) -> Option<&mut String> {
+        match field {
+            FormatField::ActivityRoot => Some(&mut self.activity_root),
+            FormatField::GitRepository => Some(&mut self.git_repository),
+            _ => None,
+        }
+    }
+
+    /// Применить итог диалога выбора папки к полю и вернуть текст для
+    /// строки статуса. Поле меняется только при удачном выборе; в конфиг
+    /// значение попадает по Ctrl+S, как и введённое вручную.
+    fn apply_picked_folder(
+        &mut self,
+        field: FormatField,
+        picked: anyhow::Result<Option<PathBuf>>,
+    ) -> String {
+        match picked {
+            Ok(Some(path)) => match (path.to_str(), self.directory_value_mut(field)) {
+                (Some(text), Some(value)) => {
+                    *value = text.to_string();
+                    format!("Выбран каталог {text} — Ctrl+S сохранит")
+                }
+                // Поле строковое, а конфиг — TOML: путь не в UTF-8 в нём не
+                // сохранить без искажения.
+                (None, _) => format!("Путь {} не в UTF-8 — введите другой вручную", path.display()),
+                (Some(_), None) => "Это поле не принимает каталог".to_string(),
+            },
+            Ok(None) => "Каталог не выбран — поле не изменилось".to_string(),
+            Err(err) => format!("Диалог выбора папки недоступен: {err:#}. Введите путь вручную"),
+        }
+    }
+
     /// Собрать ResponseFormat из введённых значений. Возвращает ошибку текстом,
     /// если "макс. длина" не парсится в число.
     fn build(&mut self) -> Result<Option<ResponseFormat>, String> {
@@ -1804,6 +1843,78 @@ pub async fn run(agent: CliAgent, config: Config) -> anyhow::Result<()> {
     result
 }
 
+/// Выбрать каталог для поля настроек системным диалогом.
+///
+/// Диалог вызывается синхронно прямо из цикла `run_app`: тот исполняется в
+/// главном потоке (`#[tokio::main]` крутит его через `block_on`), а AppKit
+/// открывает окна только оттуда. Цикл на это время стоит — TUI всё равно
+/// скрыт за модальным окном, а фоновые задачи копят события в канале.
+fn pick_folder_for_field(
+    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    state: &mut AppState,
+    events: &mut EventStream,
+    field: FormatField,
+) -> anyhow::Result<()> {
+    let Some(current) = state
+        .settings
+        .as_mut()
+        .and_then(|editor| editor.directory_value_mut(field))
+        .map(|value| value.clone())
+    else {
+        return Ok(());
+    };
+    // Без графической сессии терминал не трогаем вовсе: освобождать его
+    // ради диалога, который не откроется, — лишнее мигание экрана.
+    let picked = match crate::folder_picker::gui_unavailable() {
+        Some(reason) => Err(anyhow::anyhow!(reason)),
+        None => {
+            let start = crate::folder_picker::start_dir(&current, dirs::home_dir().as_deref());
+            let suspended = suspend_terminal(terminal);
+            let picked = suspended.and_then(|()| crate::folder_picker::pick_folder(start.as_deref()));
+            // Восстанавливаем и после сбоя: частично освобождённый терминал
+            // хуже любой ошибки диалога.
+            resume_terminal(terminal)?;
+            // Нажатия, набранные в терминале, пока он был в обычном режиме,
+            // адресовались не TUI — отбрасываем их.
+            while let Some(Some(_)) = events.next().now_or_never() {}
+            picked
+        }
+    };
+    if let Some(editor) = state.settings.as_mut() {
+        let message = editor.apply_picked_folder(field, picked);
+        state.notify(message);
+    }
+    Ok(())
+}
+
+/// Вернуть терминалу обычный режим на время внешнего окна: та же
+/// последовательность, что при выходе из `run`.
+fn suspend_terminal(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> anyhow::Result<()> {
+    disable_raw_mode()?;
+    execute!(
+        terminal.backend_mut(),
+        DisableMouseCapture,
+        DisableBracketedPaste,
+        LeaveAlternateScreen
+    )?;
+    terminal.show_cursor()?;
+    Ok(())
+}
+
+/// Обратная к `suspend_terminal`: режимы, как при входе в `run`, и полная
+/// перерисовка — буфер ratatui не знает, что экран был чужим.
+fn resume_terminal(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> anyhow::Result<()> {
+    enable_raw_mode()?;
+    execute!(
+        terminal.backend_mut(),
+        EnterAlternateScreen,
+        EnableBracketedPaste,
+        EnableMouseCapture
+    )?;
+    terminal.clear()?;
+    Ok(())
+}
+
 /// Итог обработки одного события клавиатуры/канала на текущей итерации цикла.
 enum LoopControl {
     Continue,
@@ -1986,6 +2097,10 @@ struct AppState {
     activity: ActivityState,
     /// Короткое уведомление внизу экрана (например, «скопировано»).
     notice: Option<(String, Instant)>,
+    /// Поле-каталог, для которого нажали Ctrl+X в настройках. Диалог
+    /// открывает `run_app`: только у него есть терминал, который нужно
+    /// освободить на время диалога.
+    folder_pick: Option<FormatField>,
     /// Показывать ли цепочку рассуждений модели в истории.
     show_reasoning: bool,
     /// Локально скачанные модели Ollama: подгружаются фоном при старте
@@ -2148,6 +2263,7 @@ async fn run_app(
         history_areas: Vec::new(),
         tool_servers: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
         tool_approvals: VecDeque::new(),
+        folder_pick: None,
     };
 
     let (tx, mut rx) = mpsc::unbounded_channel::<ChatEvent>();
@@ -2220,6 +2336,11 @@ async fn run_app(
                     handle_chat_event(chat_event, &mut state, &tx);
                 }
             }
+        }
+
+        if let Some(field) = state.folder_pick.take() {
+            pick_folder_for_field(terminal, &mut state, &mut events, field)?;
+            dirty = true;
         }
     }
 
@@ -3012,6 +3133,17 @@ fn handle_settings_key(
         KeyCode::Left => {
             // из полей — обратно к списку разделов
             editor.pane = SettingsPane::Sections;
+        }
+        // Ctrl+O и Ctrl+F («открыть», «папка») перехватывают глобальные
+        // обработчики импорта и фактов раньше настроек, поэтому Ctrl+X; `ч` —
+        // та же клавиша на русской раскладке. На остальных полях клавиша
+        // ничего не делает, а не печатает «x».
+        KeyCode::Char('x' | 'ч') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            if editor.pane == SettingsPane::Fields
+                && let Some(field) = editor.current_field().filter(|field| field.is_directory())
+            {
+                state.folder_pick = Some(field);
+            }
         }
         KeyCode::Char(c) if editor.pane == SettingsPane::Fields => {
             if let Some(value) = editor.field_value_mut() {
@@ -6713,7 +6845,7 @@ fn render_settings_popup(f: &mut Frame, editor: &SettingsEditor) {
     f.render_widget(
         Paragraph::new(Line::from(Span::styled(
             " Tab — панель/поле · ↑/↓ — выбор · Ctrl+D — сброс · Ctrl+L — модели Ollama · \
-Ctrl+S — сохранить · Esc — отмена",
+Ctrl+X — выбрать каталог · Ctrl+S — сохранить · Esc — отмена",
             Style::default().fg(Color::DarkGray),
         ))),
         rows[2],
@@ -7642,6 +7774,7 @@ mod tests {
             history_areas: Vec::new(),
             tool_servers: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             tool_approvals: VecDeque::new(),
+            folder_pick: None,
         }
     }
 
@@ -9027,5 +9160,83 @@ mod tests {
         handle_daemon_state(Ok("работает, проектов: 3".into()), false, &mut state, &tx);
         assert_eq!(state.settings.as_ref().unwrap().activity_daemon, "работает, проектов: 3");
         assert!(state.active_notice().is_none(), "проверка статуса не объявляется");
+    }
+
+    /// Редактор с курсором на поле «Каталог проектов» раздела активности.
+    fn editor_on_activity_root() -> SettingsEditor {
+        let config = Config {
+            activity_enabled: Some(true),
+            activity_root: Some("~/projects".into()),
+            ..Config::default()
+        };
+        let mut editor = SettingsEditor::from_chat(&git_session(ChatSettings::default()), &config, &[], &[], &[]);
+        editor.section = SettingsSection::ALL
+            .iter()
+            .position(|s| *s == SettingsSection::Activity)
+            .expect("раздел «Сводки активности» существует");
+        editor.pane = SettingsPane::Fields;
+        editor.field = 1;
+        assert!(editor.current_field() == Some(FormatField::ActivityRoot));
+        editor
+    }
+
+    #[test]
+    fn ctrl_x_requests_folder_dialog_only_on_directory_fields() {
+        let mut state = test_state();
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let ctrl_x = crossterm::event::KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL);
+
+        state.settings = Some(editor_on_activity_root());
+        state.focus = Focus::Settings;
+        handle_settings_key(ctrl_x, &mut state, &tx);
+        assert!(state.folder_pick == Some(FormatField::ActivityRoot));
+        assert_eq!(state.settings.as_ref().unwrap().activity_root, "~/projects", "клавиша не печатает «x»");
+
+        // Не каталог: запроса нет, и значение поля не меняется.
+        state.folder_pick = None;
+        let editor = state.settings.as_mut().unwrap();
+        editor.field = 2;
+        assert!(editor.current_field() == Some(FormatField::ActivitySchedule));
+        let schedule = editor.activity_schedule.clone();
+        handle_settings_key(ctrl_x, &mut state, &tx);
+        assert!(state.folder_pick.is_none());
+        assert_eq!(state.settings.as_ref().unwrap().activity_schedule, schedule);
+    }
+
+    #[test]
+    fn picked_folder_fills_field_and_cancel_or_error_keeps_it() {
+        let mut editor = editor_on_activity_root();
+
+        let message = editor.apply_picked_folder(FormatField::ActivityRoot, Ok(None));
+        assert_eq!(editor.activity_root, "~/projects");
+        assert!(message.contains("не выбран"));
+
+        let message = editor.apply_picked_folder(
+            FormatField::ActivityRoot,
+            Err(anyhow::anyhow!("сеанс SSH")),
+        );
+        assert_eq!(editor.activity_root, "~/projects");
+        assert!(message.contains("сеанс SSH") && message.contains("вручную"));
+
+        let message = editor.apply_picked_folder(FormatField::ActivityRoot, Ok(Some(PathBuf::from("/Users/me/code"))));
+        assert_eq!(editor.activity_root, "/Users/me/code");
+        assert!(message.contains("Ctrl+S"));
+        // Сохраняется тем же путём, что и ручной ввод.
+        assert_eq!(editor.activity_values().root.as_deref(), Some("/Users/me/code"));
+
+        editor.apply_picked_folder(FormatField::GitRepository, Ok(Some(PathBuf::from("/repo"))));
+        assert_eq!(editor.git_repository, "/repo");
+        assert_eq!(editor.build_git_repository().as_deref(), Some("/repo"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn picked_non_utf8_folder_keeps_field() {
+        use std::os::unix::ffi::OsStrExt;
+        let mut editor = editor_on_activity_root();
+        let path = PathBuf::from(std::ffi::OsStr::from_bytes(b"/tmp/\xff"));
+        let message = editor.apply_picked_folder(FormatField::ActivityRoot, Ok(Some(path)));
+        assert_eq!(editor.activity_root, "~/projects");
+        assert!(message.contains("UTF-8"));
     }
 }
