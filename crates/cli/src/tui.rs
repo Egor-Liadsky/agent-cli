@@ -86,6 +86,13 @@ enum ChatEvent {
         result: Result<String, String>,
         announce: bool,
     },
+    /// Модели Ollama с эмбеддингами от `index_models` для поля «Модель
+    /// эмбеддингов»: пришли фоновой задачей.
+    IndexModels(Result<Vec<String>, String>),
+    /// Строка хода сборки индекса (stderr `index-mcp`) — в строку раздела.
+    IndexProgress(String),
+    /// Итог сборки индекса из настроек.
+    IndexBuilt(Result<String, String>),
     /// Список локальных моделей Ollama: пришёл фоновой задачей.
     OllamaModels(Result<Vec<String>, String>),
     /// Список облачных моделей сервиса: пришёл фоновой задачей.
@@ -519,6 +526,17 @@ enum FormatField {
     PipelineEnabled,
     PipelineRoot,
     PipelineOutput,
+    IndexRoot,
+    IndexDb,
+    IndexStrategy,
+    IndexModel,
+    IndexUnit,
+    IndexChunkSize,
+    IndexOverlap,
+    IndexMaxSection,
+    IndexMinSection,
+    IndexOllamaUrl,
+    IndexBuild,
     Mode,
     Reasoning,
     Thinking,
@@ -544,13 +562,14 @@ enum SettingsSection {
     Tools,
     Activity,
     Pipeline,
+    Index,
     Format,
     Reasoning,
     Sampling,
 }
 
 impl SettingsSection {
-    const ALL: [SettingsSection; 10] = [
+    const ALL: [SettingsSection; 11] = [
         SettingsSection::Connection,
         SettingsSection::Context,
         SettingsSection::Memory,
@@ -558,6 +577,7 @@ impl SettingsSection {
         SettingsSection::Tools,
         SettingsSection::Activity,
         SettingsSection::Pipeline,
+        SettingsSection::Index,
         SettingsSection::Format,
         SettingsSection::Reasoning,
         SettingsSection::Sampling,
@@ -572,6 +592,7 @@ impl SettingsSection {
             SettingsSection::Tools => "Инструменты",
             SettingsSection::Activity => "Сводки активности",
             SettingsSection::Pipeline => "Пайплайн",
+            SettingsSection::Index => "Индекс документов",
             SettingsSection::Format => "Формат ответа",
             SettingsSection::Reasoning => "Рассуждение",
             SettingsSection::Sampling => "Сэмплинг",
@@ -602,6 +623,9 @@ impl SettingsSection {
             }
             SettingsSection::Pipeline => {
                 "Сервер pipeline-mcp: инструменты search → summarize → save_to_file во всех чатах. Настройки общие для всех чатов; инструменты работают при включённом переключателе и заданном каталоге поиска."
+            }
+            SettingsSection::Index => {
+                "Сервер index-mcp: индекс конспектов .docx для поиска по смыслу. Настройки общие для всех чатов; при заданной базе модель получает index_search и index_status, а index_build — только после подтверждения. Строить индекс можно отсюда."
             }
             SettingsSection::Format => "Формат ответа: кастомный режим, длина, стоп-условия.",
             SettingsSection::Reasoning => {
@@ -656,6 +680,19 @@ impl SettingsSection {
                 FormatField::PipelineEnabled,
                 FormatField::PipelineRoot,
                 FormatField::PipelineOutput,
+            ],
+            SettingsSection::Index => &[
+                FormatField::IndexRoot,
+                FormatField::IndexDb,
+                FormatField::IndexStrategy,
+                FormatField::IndexModel,
+                FormatField::IndexUnit,
+                FormatField::IndexChunkSize,
+                FormatField::IndexOverlap,
+                FormatField::IndexMaxSection,
+                FormatField::IndexMinSection,
+                FormatField::IndexOllamaUrl,
+                FormatField::IndexBuild,
             ],
             SettingsSection::Format => &[
                 FormatField::Mode,
@@ -781,6 +818,17 @@ impl FormatField {
             FormatField::PipelineEnabled => "Инструменты пайплайна",
             FormatField::PipelineRoot => "Каталог поиска",
             FormatField::PipelineOutput => "Каталог записи",
+            FormatField::IndexRoot => "Каталог с .docx",
+            FormatField::IndexDb => "Файл базы",
+            FormatField::IndexStrategy => "Стратегия chunking",
+            FormatField::IndexModel => "Модель эмбеддингов",
+            FormatField::IndexUnit => "Единица размеров",
+            FormatField::IndexChunkSize => "fixed: размер окна",
+            FormatField::IndexOverlap => "fixed: перекрытие",
+            FormatField::IndexMaxSection => "structure: потолок чанка",
+            FormatField::IndexMinSection => "structure: минимум чанка",
+            FormatField::IndexOllamaUrl => "Адрес Ollama",
+            FormatField::IndexBuild => "Сборка индекса",
             FormatField::Mode => "Режим",
             FormatField::Reasoning => "Стратегия рассуждения",
             FormatField::Thinking => "Режим thinking у модели",
@@ -936,6 +984,38 @@ git_reset, git_create_branch, git_checkout. Пусто — только чита
                 "Каталог, в который пишет save_to_file (pipeline_output конфига). Пусто — подкаталог pipeline-out каталога \
 поиска. Ctrl+X — выбрать каталог в системном диалоге, Ctrl+D — очистить."
             }
+            FormatField::IndexRoot => {
+                "Каталог с .docx (обходится рекурсивно; index_root конфига): из него строит индекс «Сборка индекса» и \
+index_build. Ctrl+X — выбрать каталог в системном диалоге, Ctrl+D — очистить."
+            }
+            FormatField::IndexDb => {
+                "Файл базы SQLite (index_db конфига). Заданная база включает модели во всех чатах index_search и index_status \
+со следующего хода; файл создаётся при первой сборке."
+            }
+            FormatField::IndexStrategy => {
+                "◀/▶ или Space — fixed (окна фиксированной длины), structure (по разделам документа) или all (обе). \
+Пусто — all. Поиск по базе с двумя стратегиями берёт выбранную здесь; при all модель называет её сама."
+            }
+            FormatField::IndexModel => {
+                "Модель эмбеддингов Ollama (index_model конфига). ◀/▶ — выбрать из моделей Ollama с эмбеддингами, Ctrl+L — обновить \
+список. Пусто — nomic-embed-text. Поиск не смешивает модели: база, построенная другой моделью, ответит ошибкой, пока индекс не пересобран."
+            }
+            FormatField::IndexUnit => {
+                "◀/▶ или Space — в чём меряются размеры ниже: chars (символы) или tokens (токены модели). Пусто — chars."
+            }
+            FormatField::IndexChunkSize => "fixed: размер окна в выбранных единицах. Пусто — 1200.",
+            FormatField::IndexOverlap => "fixed: перекрытие соседних окон, меньше половины окна. Пусто — 200.",
+            FormatField::IndexMaxSection => {
+                "structure: потолок чанка; раздел длиннее режется по абзацам. Пусто — 1500 (под контекст 2048 токенов nomic-embed-text)."
+            }
+            FormatField::IndexMinSection => "structure: кусок короче склеивается с соседним. Пусто — 200.",
+            FormatField::IndexOllamaUrl => {
+                "Адрес Ollama для index-mcp (index_ollama_url конфига). Пусто — http://localhost:11434."
+            }
+            FormatField::IndexBuild => {
+                "Enter — построить индекс из каталога с текущими настройками (поля сохраняются в конфиг до запуска). Долго: \
+эмбеддинг идёт по всем чанкам; ход виден в строке ниже. Прежний индекс стратегии заменяется целиком только при успехе."
+            }
             FormatField::Mode => {
                 "◀/▶ или Space — переключить. Кастомный режим задаёт свой формат ответа вместо формата по умолчанию."
             }
@@ -986,6 +1066,9 @@ git_reset, git_create_branch, git_checkout. Пусто — только чита
                 | FormatField::ActivityChatTools
                 | FormatField::ActivityDaemon
                 | FormatField::PipelineEnabled
+                | FormatField::IndexStrategy
+                | FormatField::IndexUnit
+                | FormatField::IndexBuild
         )
     }
 
@@ -1023,6 +1106,17 @@ git_reset, git_create_branch, git_checkout. Пусто — только чита
                 | FormatField::PipelineEnabled
                 | FormatField::PipelineRoot
                 | FormatField::PipelineOutput
+                | FormatField::IndexRoot
+                | FormatField::IndexDb
+                | FormatField::IndexStrategy
+                | FormatField::IndexModel
+                | FormatField::IndexUnit
+                | FormatField::IndexChunkSize
+                | FormatField::IndexOverlap
+                | FormatField::IndexMaxSection
+                | FormatField::IndexMinSection
+                | FormatField::IndexOllamaUrl
+                | FormatField::IndexBuild
         )
     }
 
@@ -1035,6 +1129,7 @@ git_reset, git_create_branch, git_checkout. Пусто — только чита
                 | FormatField::GitRepository
                 | FormatField::PipelineRoot
                 | FormatField::PipelineOutput
+                | FormatField::IndexRoot
         )
     }
 
@@ -1068,6 +1163,23 @@ struct SettingsEditor {
     pipeline_enabled: bool,
     pipeline_root: String,
     pipeline_output: String,
+    /// Раздел «Индекс документов»: поля `index_*` конфига клиента.
+    index_root: String,
+    index_db: String,
+    index_strategy: String,
+    index_model: String,
+    index_unit: String,
+    index_chunk_size: String,
+    index_overlap: String,
+    index_max_section: String,
+    index_min_section: String,
+    index_ollama_url: String,
+    /// Модели Ollama с эмбеддингами для стрелок в поле модели; грузятся
+    /// по первой стрелке или Ctrl+L.
+    index_models: Vec<String>,
+    /// Строка сборки: ход и итог. Пока идёт сборка, Enter не ставит вторую.
+    index_status: String,
+    index_busy: bool,
     /// Чат, чьи параметры редактируются.
     chat_id: String,
     chat_title: String,
@@ -1191,6 +1303,19 @@ impl SettingsEditor {
             pipeline_enabled: config.pipeline_switch_on(),
             pipeline_root: config.pipeline_root.clone().unwrap_or_default(),
             pipeline_output: config.pipeline_output.clone().unwrap_or_default(),
+            index_root: config.index_root.clone().unwrap_or_default(),
+            index_db: config.index_db.clone().unwrap_or_default(),
+            index_strategy: config.index_strategy.clone().unwrap_or_default(),
+            index_model: config.index_model.clone().unwrap_or_default(),
+            index_unit: config.index_unit.clone().unwrap_or_default(),
+            index_chunk_size: config.index_chunk_size.map(|n| n.to_string()).unwrap_or_default(),
+            index_overlap: config.index_overlap.map(|n| n.to_string()).unwrap_or_default(),
+            index_max_section: config.index_max_section.map(|n| n.to_string()).unwrap_or_default(),
+            index_min_section: config.index_min_section.map(|n| n.to_string()).unwrap_or_default(),
+            index_ollama_url: config.index_ollama_url.clone().unwrap_or_default(),
+            index_models: Vec::new(),
+            index_status: String::new(),
+            index_busy: false,
             chat_id: chat.id.clone(),
             chat_title: chat.title.clone(),
             provider: settings.provider,
@@ -1523,6 +1648,35 @@ impl SettingsEditor {
         self.model = choices[next as usize].clone();
     }
 
+    /// Стратегия индекса: не задано → fixed → structure → all → снова не задано.
+    fn cycle_index_strategy(&mut self, delta: i32) {
+        const STATES: [&str; 4] = ["", "fixed", "structure", "all"];
+        let current = STATES.iter().position(|s| *s == self.index_strategy).unwrap_or(0) as i32;
+        self.index_strategy = STATES[(current + delta).rem_euclid(STATES.len() as i32) as usize].to_string();
+    }
+
+    fn cycle_index_unit(&mut self, delta: i32) {
+        const STATES: [&str; 3] = ["", "chars", "tokens"];
+        let current = STATES.iter().position(|s| *s == self.index_unit).unwrap_or(0) as i32;
+        self.index_unit = STATES[(current + delta).rem_euclid(STATES.len() as i32) as usize].to_string();
+    }
+
+    /// Перебор моделей эмбеддингов стрелками, как у поля «Модель»; `false`,
+    /// если список ещё не загружен — тогда вызывающий его запрашивает.
+    fn cycle_index_model(&mut self, delta: i32) -> bool {
+        if self.index_models.is_empty() {
+            return false;
+        }
+        let len = self.index_models.len() as i32;
+        let next = match self.index_models.iter().position(|m| *m == self.index_model) {
+            Some(current) => (current as i32 + delta).rem_euclid(len),
+            None if delta >= 0 => 0,
+            None => len - 1,
+        };
+        self.index_model = self.index_models[next as usize].clone();
+        true
+    }
+
     /// Перебор профилей, доступных владельцу, стрелками: пусто → первый →
     /// … → последний → снова пусто. Если в поле введён id, которого нет в
     /// списке, перебор начинается с первого профиля.
@@ -1562,6 +1716,9 @@ impl SettingsEditor {
             Some(FormatField::ActivityEnabled) => self.toggle_activity(false),
             Some(FormatField::ActivityChatTools) => self.activity_chat_tools = false,
             Some(FormatField::PipelineEnabled) => self.toggle_pipeline(false),
+            Some(FormatField::IndexStrategy) => self.index_strategy.clear(),
+            Some(FormatField::IndexUnit) => self.index_unit.clear(),
+            Some(FormatField::IndexBuild) => {}
             // Ctrl+D на строке демона — остановка, её обрабатывает
             // handle_settings_key: редактору не хватает канала событий.
             Some(FormatField::ActivityDaemon) => {}
@@ -1589,7 +1746,18 @@ impl SettingsEditor {
             | FormatField::ActivityEnabled
             | FormatField::ActivityChatTools
             | FormatField::ActivityDaemon
-            | FormatField::PipelineEnabled => None,
+            | FormatField::PipelineEnabled
+            | FormatField::IndexStrategy
+            | FormatField::IndexUnit
+            | FormatField::IndexBuild => None,
+            FormatField::IndexRoot => Some(&mut self.index_root),
+            FormatField::IndexDb => Some(&mut self.index_db),
+            FormatField::IndexModel => Some(&mut self.index_model),
+            FormatField::IndexChunkSize => Some(&mut self.index_chunk_size),
+            FormatField::IndexOverlap => Some(&mut self.index_overlap),
+            FormatField::IndexMaxSection => Some(&mut self.index_max_section),
+            FormatField::IndexMinSection => Some(&mut self.index_min_section),
+            FormatField::IndexOllamaUrl => Some(&mut self.index_ollama_url),
             FormatField::ActivityRoot => Some(&mut self.activity_root),
             FormatField::ActivitySchedule => Some(&mut self.activity_schedule),
             FormatField::PipelineRoot => Some(&mut self.pipeline_root),
@@ -1628,6 +1796,7 @@ impl SettingsEditor {
             FormatField::GitRepository => Some(&mut self.git_repository),
             FormatField::PipelineRoot => Some(&mut self.pipeline_root),
             FormatField::PipelineOutput => Some(&mut self.pipeline_output),
+            FormatField::IndexRoot => Some(&mut self.index_root),
             _ => None,
         }
     }
@@ -2920,6 +3089,13 @@ fn handle_settings_key(
             state.focus = Focus::Input;
         }
         KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            let index = match editor.index_values() {
+                Ok(index) => index,
+                Err(err) => {
+                    editor.error = Some(err);
+                    return LoopControl::Continue;
+                }
+            };
             let tool_max_iterations = match editor.build_tool_max_iterations() {
                 Ok(value) => value,
                 Err(err) => {
@@ -3086,6 +3262,7 @@ fn handle_settings_key(
                     save_connection(state, server_url, client_token, ollama_url);
                     save_activity(state, activity, tx);
                     save_pipeline(state, pipeline);
+                    save_index(state, index);
                 }
                 Err(err) => editor.error = Some(err),
             }
@@ -3114,6 +3291,21 @@ fn handle_settings_key(
                 spawn_daemon_start(&state.config, tx);
             }
         }
+        KeyCode::Enter
+            if editor.pane == SettingsPane::Fields && editor.current_field() == Some(FormatField::IndexBuild) =>
+        {
+            if !editor.index_busy {
+                match editor.index_values() {
+                    Err(err) => editor.error = Some(err),
+                    Ok(values) => {
+                        editor.error = None;
+                        // Собирается то, что сейчас на экране: поля сохраняются до запуска.
+                        save_index(state, values);
+                        start_index_build(state, tx);
+                    }
+                }
+            }
+        }
         KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
             if editor.pane == SettingsPane::Fields {
                 editor.reset_field();
@@ -3140,6 +3332,48 @@ fn handle_settings_key(
                 && editor.current_field() == Some(FormatField::Reasoning) =>
         {
             editor.cycle_reasoning(1);
+        }
+        KeyCode::Char('l')
+            if key.modifiers.contains(KeyModifiers::CONTROL)
+                && editor.pane == SettingsPane::Fields
+                && editor.current_field() == Some(FormatField::IndexModel) =>
+        {
+            editor.error = None;
+            request_index_models(state, tx);
+        }
+        KeyCode::Left
+            if editor.pane == SettingsPane::Fields && editor.current_field() == Some(FormatField::IndexModel) =>
+        {
+            if !editor.cycle_index_model(-1) {
+                request_index_models(state, tx);
+            }
+        }
+        KeyCode::Right
+            if editor.pane == SettingsPane::Fields && editor.current_field() == Some(FormatField::IndexModel) =>
+        {
+            if !editor.cycle_index_model(1) {
+                request_index_models(state, tx);
+            }
+        }
+        KeyCode::Left
+            if editor.pane == SettingsPane::Fields && editor.current_field() == Some(FormatField::IndexStrategy) =>
+        {
+            editor.cycle_index_strategy(-1);
+        }
+        KeyCode::Right | KeyCode::Char(' ')
+            if editor.pane == SettingsPane::Fields && editor.current_field() == Some(FormatField::IndexStrategy) =>
+        {
+            editor.cycle_index_strategy(1);
+        }
+        KeyCode::Left
+            if editor.pane == SettingsPane::Fields && editor.current_field() == Some(FormatField::IndexUnit) =>
+        {
+            editor.cycle_index_unit(-1);
+        }
+        KeyCode::Right | KeyCode::Char(' ')
+            if editor.pane == SettingsPane::Fields && editor.current_field() == Some(FormatField::IndexUnit) =>
+        {
+            editor.cycle_index_unit(1);
         }
         KeyCode::Char('l') if key.modifiers.contains(KeyModifiers::CONTROL) => {
             // одна клавиша на обоих провайдеров: обновляем список активного,
@@ -3461,6 +3695,198 @@ fn save_pipeline_with(state: &mut AppState, values: PipelineValues, save: impl F
         Ok(()) => state.notify("Настройки пайплайна сохранены — инструменты пайплайна выключены"),
         Err(err) => state.notify_error(format!("Не удалось сохранить конфиг: {err}")),
     }
+}
+
+/// Поля раздела «Индекс документов» для сохранения в конфиг.
+#[derive(Debug, PartialEq)]
+struct IndexValues {
+    root: Option<String>,
+    db: Option<String>,
+    strategy: Option<String>,
+    model: Option<String>,
+    unit: Option<String>,
+    chunk_size: Option<usize>,
+    overlap: Option<usize>,
+    max_section: Option<usize>,
+    min_section: Option<usize>,
+    ollama_url: Option<String>,
+}
+
+/// Размер chunking: пусто — умолчание сервера, иначе целое больше нуля.
+fn parse_index_size(text: &str, label: &str) -> Result<Option<usize>, String> {
+    let text = text.trim();
+    if text.is_empty() {
+        return Ok(None);
+    }
+    match text.parse::<usize>() {
+        Ok(value) if value > 0 => Ok(Some(value)),
+        _ => Err(format!("{label} должен быть целым числом больше нуля")),
+    }
+}
+
+impl SettingsEditor {
+    fn index_values(&self) -> Result<IndexValues, String> {
+        Ok(IndexValues {
+            root: non_empty(&self.index_root),
+            db: non_empty(&self.index_db),
+            strategy: non_empty(&self.index_strategy),
+            model: non_empty(&self.index_model),
+            unit: non_empty(&self.index_unit),
+            chunk_size: parse_index_size(&self.index_chunk_size, "Размер окна")?,
+            overlap: parse_index_size(&self.index_overlap, "Перекрытие")?,
+            max_section: parse_index_size(&self.index_max_section, "Потолок чанка")?,
+            min_section: parse_index_size(&self.index_min_section, "Минимум чанка")?,
+            ollama_url: non_empty(&self.index_ollama_url),
+        })
+    }
+}
+
+/// Сохранить настройки индекса в конфиг. Перезапускать ничего не нужно:
+/// процесс index-mcp живёт один ход или одну сборку и читает конфиг заново.
+fn save_index(state: &mut AppState, values: IndexValues) {
+    save_index_with(state, values, Config::save);
+}
+
+/// Запись файла передаётся параметром: `Config::save` пишет в настоящий
+/// каталог конфигов ОС, и тест без этого переписал бы конфиг пользователя.
+fn save_index_with(state: &mut AppState, values: IndexValues, save: impl FnOnce(&Config) -> anyhow::Result<()>) {
+    let config = &mut state.config;
+    let unchanged = config.index_root == values.root
+        && config.index_db == values.db
+        && config.index_strategy == values.strategy
+        && config.index_model == values.model
+        && config.index_unit == values.unit
+        && config.index_chunk_size == values.chunk_size
+        && config.index_overlap == values.overlap
+        && config.index_max_section == values.max_section
+        && config.index_min_section == values.min_section
+        && config.index_ollama_url == values.ollama_url;
+    if unchanged {
+        return;
+    }
+    config.index_root = values.root;
+    config.index_db = values.db;
+    config.index_strategy = values.strategy;
+    config.index_model = values.model;
+    config.index_unit = values.unit;
+    config.index_chunk_size = values.chunk_size;
+    config.index_overlap = values.overlap;
+    config.index_max_section = values.max_section;
+    config.index_min_section = values.min_section;
+    config.index_ollama_url = values.ollama_url;
+    match save(&state.config) {
+        Ok(()) if state.config.index_active() => state.notify("Настройки индекса сохранены"),
+        Ok(()) => state.notify("Настройки индекса сохранены — инструменты индекса выключены: не задана база"),
+        Err(err) => state.notify_error(format!("Не удалось сохранить конфиг: {err}")),
+    }
+}
+
+/// Список моделей с эмбеддингами: отдельный короткоживущий процесс сервера.
+/// Адрес Ollama берётся с экрана — им можно проверить ещё не сохранённое.
+fn request_index_models(state: &mut AppState, tx: &mpsc::UnboundedSender<ChatEvent>) {
+    let Some(editor) = state.settings.as_ref() else { return };
+    let settings = crate::index::IndexSettings {
+        db: non_empty(&editor.index_db).unwrap_or_else(|| "index.db".to_string()),
+        ollama_url: non_empty(&editor.index_ollama_url),
+        ..Default::default()
+    };
+    state.notify("Запрашиваю модели с эмбеддингами у Ollama…");
+    let tx = tx.clone();
+    tokio::spawn(async move {
+        let result = async {
+            let server = crate::index::IndexServer::start(
+                &crate::index::server_program(),
+                &settings,
+                crate::index::Progress::Discard,
+                crate::logging::exchange_log(),
+            )
+            .await
+            .map_err(|err| format!("{err:#}"))?;
+            let result = server.call_json(crate::index::INDEX_MODELS, serde_json::json!({})).await;
+            server.shutdown().await;
+            let value = result.map_err(|err| format!("{err:#}"))??;
+            Ok(value["models"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|model| model["name"].as_str().map(str::to_string))
+                .collect::<Vec<_>>())
+        }
+        .await;
+        let _ = tx.send(ChatEvent::IndexModels(result));
+    });
+}
+
+fn handle_index_models(result: Result<Vec<String>, String>, state: &mut AppState) {
+    match result {
+        Ok(models) if models.is_empty() => {
+            state.notify_error("Ollama не сообщил моделей с эмбеддингами (ollama pull nomic-embed-text)")
+        }
+        Ok(models) => {
+            state.notify(format!("Моделей с эмбеддингами: {}", models.len()));
+            if let Some(editor) = state.settings.as_mut() {
+                editor.index_models = models;
+            }
+        }
+        Err(err) => state.notify_error(format!("Не удалось получить модели индекса: {err}")),
+    }
+}
+
+/// Сборка индекса из сохранённых настроек: фоновая задача, TUI не замирает.
+fn start_index_build(state: &mut AppState, tx: &mpsc::UnboundedSender<ChatEvent>) {
+    let prepared = crate::index::IndexSettings::from_config(&state.config).and_then(|settings| {
+        let arguments = settings
+            .build_arguments()
+            .ok_or_else(|| anyhow::anyhow!("не задан каталог с .docx"))?;
+        Ok((settings, arguments))
+    });
+    let Some(editor) = state.settings.as_mut() else { return };
+    let (settings, arguments) = match prepared {
+        Ok(prepared) => prepared,
+        Err(err) => {
+            editor.error = Some(format!("{err:#}"));
+            return;
+        }
+    };
+    editor.index_busy = true;
+    editor.index_status = "запускаю index-mcp…".to_string();
+    let tx = tx.clone();
+    tokio::spawn(async move {
+        let sink_tx = tx.clone();
+        let progress = crate::index::Progress::Lines(Arc::new(move |line| {
+            let _ = sink_tx.send(ChatEvent::IndexProgress(line));
+        }));
+        let result = async {
+            let server = crate::index::IndexServer::start(
+                &crate::index::server_program(),
+                &settings,
+                progress,
+                crate::logging::exchange_log(),
+            )
+            .await
+            .map_err(|err| format!("{err:#}"))?;
+            let result = server.call_json(crate::index::INDEX_BUILD, arguments).await;
+            server.shutdown().await;
+            result
+                .map_err(|err| format!("{err:#}"))?
+                .map(|value| crate::index::build_summary(&value))
+        }
+        .await;
+        let _ = tx.send(ChatEvent::IndexBuilt(result));
+    });
+}
+
+fn handle_index_built(result: Result<String, String>, state: &mut AppState) {
+    let (ok, text) = match result {
+        Ok(text) => (true, text),
+        Err(text) => (false, text),
+    };
+    if let Some(editor) = state.settings.as_mut() {
+        editor.index_busy = false;
+        editor.index_status = text.clone();
+    }
+    let text = format!("Индекс: {text}");
+    if ok { state.notify(text) } else { state.notify_error(text) }
 }
 
 /// Запуск демона фоном: регистрация у супервизора и ожидание ответа —
@@ -4258,13 +4684,20 @@ fn submit_line(
         root: state.config.pipeline_root.clone().unwrap_or_default(),
         output: state.config.effective_pipeline_output().unwrap_or_default(),
     });
-    if tool_repository.is_some() || activity.is_some() || pipeline.is_some() {
+    // Индекс документов — свойство клиента (`config index`), включается базой.
+    let index = state
+        .config
+        .index_active()
+        .then(|| crate::index::IndexSettings::from_config(&state.config).ok())
+        .flatten();
+    if tool_repository.is_some() || activity.is_some() || pipeline.is_some() || index.is_some() {
         spawn_tool_turn(ToolTurnRequest {
             agent,
             servers: state.tool_servers.clone(),
             repository: tool_repository,
             activity,
             pipeline,
+            index,
             chat_id,
             chat_title: state.chats[chat_index].title.clone(),
             line,
@@ -4298,6 +4731,8 @@ struct ToolTurnRequest {
     activity: Option<crate::activity::Endpoint>,
     /// Каталоги pipeline-mcp, если его инструменты включены в конфиге.
     pipeline: Option<PipelineDirs>,
+    /// Настройки index-mcp, если инструменты индекса включены в конфиге.
+    index: Option<crate::index::IndexSettings>,
     chat_id: String,
     chat_title: String,
     line: String,
@@ -4362,6 +4797,7 @@ fn spawn_tool_turn(request: ToolTurnRequest) {
             repository,
             activity,
             pipeline,
+            index,
             chat_id,
             chat_title,
             line,
@@ -4445,10 +4881,28 @@ fn spawn_tool_turn(request: ToolTurnRequest) {
             }
             None => None,
         };
+        // Процесс index-mcp тоже живёт один ход. Ход сборки (`index_build`
+        // идёт только после подтверждения) в чат не выводится: stderr
+        // рисовал бы поверх экрана.
+        let index_tools = match index {
+            Some(settings) => {
+                match crate::index::IndexTools::start(&settings, crate::index::Progress::Discard, crate::logging::exchange_log()).await {
+                    Ok(tools) => Some(tools),
+                    Err(err) => {
+                        let _ = tx.send(ChatEvent::ActivityNotice(NoticeKind::Error, format!(
+                            "Инструменты индекса недоступны в этом ходе: {err}"
+                        )));
+                        None
+                    }
+                }
+            }
+            None => None,
+        };
         let tools = tool_loop::ToolSet::default()
             .with(git_tools.as_ref().map(|tools| tools as &dyn tool_loop::ToolExecutor))
             .with(activity_tools.as_ref().map(|tools| tools as &dyn tool_loop::ToolExecutor))
-            .with(pipeline_tools.as_ref().map(|tools| tools as &dyn tool_loop::ToolExecutor));
+            .with(pipeline_tools.as_ref().map(|tools| tools as &dyn tool_loop::ToolExecutor))
+            .with(index_tools.as_ref().map(|tools| tools as &dyn tool_loop::ToolExecutor));
         let approver = TuiApprover {
             chat_title,
             tx: tx.clone(),
@@ -4482,6 +4936,9 @@ fn spawn_tool_turn(request: ToolTurnRequest) {
             tools.close().await;
         }
         if let Some(tools) = pipeline_tools {
+            tools.server.shutdown().await;
+        }
+        if let Some(tools) = index_tools {
             tools.server.shutdown().await;
         }
         let event = match result {
@@ -5250,6 +5707,20 @@ fn handle_chat_event(
         }
         ChatEvent::ActivityDaemon { result, announce } => {
             handle_daemon_state(result, announce, state, tx);
+            return;
+        }
+        ChatEvent::IndexModels(result) => {
+            handle_index_models(result, state);
+            return;
+        }
+        ChatEvent::IndexProgress(line) => {
+            if let Some(editor) = state.settings.as_mut().filter(|editor| editor.index_busy) {
+                editor.index_status = line;
+            }
+            return;
+        }
+        ChatEvent::IndexBuilt(result) => {
+            handle_index_built(result, state);
             return;
         }
         ChatEvent::OllamaModels(result) => {
@@ -7273,6 +7744,14 @@ fn empty_field_hint(field: FormatField, editor: &SettingsEditor) -> String {
                 None => "не задан — сначала укажите каталог поиска".to_string(),
             }
         }
+        FormatField::IndexRoot => "не задан — без него нечего собирать".to_string(),
+        FormatField::IndexDb => "не задан — без базы инструменты индекса в чатах выключены".to_string(),
+        FormatField::IndexModel => "не задана — nomic-embed-text".to_string(),
+        FormatField::IndexChunkSize => "не задан — 1200".to_string(),
+        FormatField::IndexOverlap => "не задано — 200".to_string(),
+        FormatField::IndexMaxSection => "не задан — 1500".to_string(),
+        FormatField::IndexMinSection => "не задан — 200".to_string(),
+        FormatField::IndexOllamaUrl => "не задан — http://localhost:11434".to_string(),
         FormatField::GitAllowedTools => "не заданы — только читающие инструменты".to_string(),
         FormatField::ToolMaxIterations => format!(
             "не задан — {}",
@@ -7381,6 +7860,27 @@ fn render_settings_fields(f: &mut Frame, editor: &SettingsEditor, area: Rect) {
             }
             FormatField::PipelineRoot => editor.pipeline_root.clone(),
             FormatField::PipelineOutput => editor.pipeline_output.clone(),
+            FormatField::IndexRoot => editor.index_root.clone(),
+            FormatField::IndexDb => editor.index_db.clone(),
+            FormatField::IndexStrategy => match editor.index_strategy.as_str() {
+                "" => "all (умолчание)".to_string(),
+                other => other.to_string(),
+            },
+            FormatField::IndexModel => editor.index_model.clone(),
+            FormatField::IndexUnit => match editor.index_unit.as_str() {
+                "" => "chars (умолчание)".to_string(),
+                other => other.to_string(),
+            },
+            FormatField::IndexChunkSize => editor.index_chunk_size.clone(),
+            FormatField::IndexOverlap => editor.index_overlap.clone(),
+            FormatField::IndexMaxSection => editor.index_max_section.clone(),
+            FormatField::IndexMinSection => editor.index_min_section.clone(),
+            FormatField::IndexOllamaUrl => editor.index_ollama_url.clone(),
+            FormatField::IndexBuild => {
+                let hint = if editor.index_busy { "" } else { " · Enter — построить" };
+                let status = if editor.index_status.is_empty() { "не запускалась" } else { &editor.index_status };
+                format!("{status}{hint}")
+            }
             FormatField::ActivityChatTools => {
                 if editor.activity_chat_tools { "Включены" } else { "Выключены" }.to_string()
             }
@@ -9573,6 +10073,141 @@ mod tests {
         let message = editor.apply_picked_folder(FormatField::ActivityRoot, Ok(Some(path)));
         assert_eq!(editor.activity_root, "~/projects");
         assert!(message.contains("UTF-8"));
+    }
+
+    /// Редактор на разделе «Индекс документов» с курсором в полях.
+    fn editor_on_index(config: &Config) -> SettingsEditor {
+        let mut editor = SettingsEditor::from_chat(&git_session(ChatSettings::default()), config, &[], &[], &[]);
+        editor.section = SettingsSection::ALL
+            .iter()
+            .position(|s| *s == SettingsSection::Index)
+            .expect("раздел «Индекс документов» существует");
+        editor.pane = SettingsPane::Fields;
+        editor
+    }
+
+    fn index_config() -> Config {
+        Config {
+            index_root: Some("~/notes".into()),
+            index_db: Some("/tmp/idx.db".into()),
+            index_strategy: Some("structure".into()),
+            index_model: Some("bge-m3".into()),
+            index_chunk_size: Some(900),
+            ..Config::default()
+        }
+    }
+
+    #[test]
+    fn index_section_mirrors_config_and_cycles_choices() {
+        let mut editor = editor_on_index(&index_config());
+        assert_eq!(editor.visible_fields().len(), 11);
+        assert_eq!(
+            editor.index_values().unwrap(),
+            IndexValues {
+                root: Some("~/notes".into()),
+                db: Some("/tmp/idx.db".into()),
+                strategy: Some("structure".into()),
+                model: Some("bge-m3".into()),
+                unit: None,
+                chunk_size: Some(900),
+                overlap: None,
+                max_section: None,
+                min_section: None,
+                ollama_url: None,
+            }
+        );
+        // Стратегия и единица — круг «не задано → … → не задано».
+        editor.cycle_index_strategy(1);
+        assert_eq!(editor.index_strategy, "all");
+        editor.cycle_index_strategy(1);
+        assert_eq!(editor.index_strategy, "");
+        editor.cycle_index_unit(-1);
+        assert_eq!(editor.index_unit, "tokens");
+        // Модели: пока список не загружен, стрелка ничего не меняет и просит загрузку.
+        assert!(!editor.cycle_index_model(1));
+        assert_eq!(editor.index_model, "bge-m3");
+        editor.index_models = vec!["bge-m3".into(), "nomic-embed-text:latest".into()];
+        assert!(editor.cycle_index_model(1));
+        assert_eq!(editor.index_model, "nomic-embed-text:latest");
+        assert!(editor.cycle_index_model(1));
+        assert_eq!(editor.index_model, "bge-m3");
+        // Ввод и Ctrl+D идут через общий путь текстовых полей.
+        editor.field = 5;
+        assert!(editor.current_field() == Some(FormatField::IndexChunkSize));
+        editor.field_value_mut().unwrap().push('0');
+        assert_eq!(editor.index_chunk_size, "9000");
+        editor.reset_field();
+        assert_eq!(editor.index_chunk_size, "");
+        assert!(empty_field_hint(FormatField::IndexRoot, &editor).contains("нечего собирать"));
+        assert!(Config::default().index_db.is_none() && !SettingsSection::Index.fields().is_empty());
+    }
+
+    #[test]
+    fn index_sizes_must_be_positive_integers() {
+        let mut editor = editor_on_index(&index_config());
+        editor.index_overlap = "abc".into();
+        assert!(editor.index_values().unwrap_err().contains("Перекрытие"));
+        editor.index_overlap = "0".into();
+        assert!(editor.index_values().is_err(), "0 не размер");
+        editor.index_overlap = " 150 ".into();
+        assert_eq!(editor.index_values().unwrap().overlap, Some(150));
+    }
+
+    #[test]
+    fn saving_index_settings_writes_only_changes() {
+        let mut state = test_state();
+        let mut editor = editor_on_index(&index_config());
+        editor.index_model = "nomic-embed-text".into();
+        let values = editor.index_values().unwrap();
+        let mut saved = false;
+        save_index_with(&mut state, values, |config| {
+            saved = true;
+            assert_eq!(config.index_db.as_deref(), Some("/tmp/idx.db"));
+            assert_eq!(config.index_model.as_deref(), Some("nomic-embed-text"));
+            assert_eq!(config.index_chunk_size, Some(900));
+            Ok(())
+        });
+        assert!(saved);
+        assert!(state.config.index_active());
+        // Те же значения — файл не трогается.
+        let same = editor.index_values().unwrap();
+        save_index_with(&mut state, same, |_| panic!("значения не менялись"));
+        // Пустая база выключает инструменты, но сохраняется.
+        editor.index_db.clear();
+        save_index_with(&mut state, editor.index_values().unwrap(), |_| Ok(()));
+        assert!(!state.config.index_active());
+        assert_eq!(state.config.index_root.as_deref(), Some("~/notes"));
+    }
+
+    #[tokio::test]
+    async fn build_button_needs_a_directory_and_ignores_repeated_enter() {
+        let mut state = test_state();
+        let (tx, _rx) = mpsc::unbounded_channel();
+        state.config = Config { index_db: Some("/tmp/idx.db".into()), ..Config::default() };
+        let mut editor = editor_on_index(&state.config);
+        editor.field = 10;
+        assert!(editor.current_field() == Some(FormatField::IndexBuild));
+        state.settings = Some(editor);
+        state.focus = Focus::Settings;
+        handle_settings_key(key(KeyCode::Enter), &mut state, &tx);
+        let editor = state.settings.as_mut().unwrap();
+        assert!(!editor.index_busy);
+        assert!(editor.error.as_deref().unwrap().contains("каталог"), "{:?}", editor.error);
+
+        // Идущая сборка не запускает вторую.
+        editor.error = None;
+        editor.index_busy = true;
+        editor.index_status = "structure: 10 чанков".into();
+        handle_settings_key(key(KeyCode::Enter), &mut state, &tx);
+        let editor = state.settings.as_ref().unwrap();
+        assert_eq!(editor.index_status, "structure: 10 чанков");
+        assert!(editor.error.is_none());
+
+        // Итог сборки снимает занятость и показывается в строке раздела.
+        handle_index_built(Ok("готово: fixed — 3 чанков".into()), &mut state);
+        let editor = state.settings.as_ref().unwrap();
+        assert!(!editor.index_busy);
+        assert_eq!(editor.index_status, "готово: fixed — 3 чанков");
     }
 
     /// Редактор на разделе «Пайплайн» с курсором в полях.

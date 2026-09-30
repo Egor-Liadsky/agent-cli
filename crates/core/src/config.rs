@@ -614,6 +614,36 @@ pub struct Config {
     /// каталоги, — их не нужно вводить заново при включении.
     #[serde(default)]
     pub pipeline_enabled: Option<bool>,
+    /// Каталог с `.docx`, из которого `index_build` строит индекс. Свойство
+    /// клиента, как `pipeline_*`: индекс не привязан к чату.
+    #[serde(default)]
+    pub index_root: Option<String>,
+    /// Файл базы SQLite индекса. Задан — модели в чатах доступны
+    /// `index_search` и `index_status`; не задан — инструменты выключены.
+    #[serde(default)]
+    pub index_db: Option<String>,
+    /// Стратегия chunking: `fixed`, `structure` или `all`. Пусто —
+    /// умолчание `index-mcp build`.
+    #[serde(default)]
+    pub index_strategy: Option<String>,
+    /// Модель эмбеддингов Ollama. Пусто — умолчание `index-mcp`
+    /// (`nomic-embed-text`).
+    #[serde(default)]
+    pub index_model: Option<String>,
+    /// Единица размеров chunking: `chars` или `tokens`.
+    #[serde(default)]
+    pub index_unit: Option<String>,
+    #[serde(default)]
+    pub index_chunk_size: Option<usize>,
+    #[serde(default)]
+    pub index_overlap: Option<usize>,
+    #[serde(default)]
+    pub index_max_section: Option<usize>,
+    #[serde(default)]
+    pub index_min_section: Option<usize>,
+    /// Адрес Ollama для `index-mcp`. Пусто — `http://localhost:11434`.
+    #[serde(default)]
+    pub index_ollama_url: Option<String>,
 }
 
 /// Подкаталог корня поиска, куда пишет пайплайн, если `pipeline_output` не
@@ -629,6 +659,11 @@ impl Config {
     /// show`: без явного значения — включён, если задан каталог поиска.
     pub fn pipeline_switch_on(&self) -> bool {
         self.pipeline_enabled.unwrap_or_else(|| self.pipeline_root_set())
+    }
+
+    /// Инструменты индекса документов в чатах включены заданной базой.
+    pub fn index_active(&self) -> bool {
+        self.index_db.as_deref().is_some_and(|db| !db.trim().is_empty())
     }
 
     fn pipeline_root_set(&self) -> bool {
@@ -1144,6 +1179,19 @@ client_token = "t"
         assert_eq!(config.effective_pipeline_output().as_deref(), Some("/out"));
         config.pipeline_root = Some("  ".to_string());
         assert!(!config.pipeline_active());
+    }
+
+    #[test]
+    fn index_tools_follow_the_database_path() {
+        assert!(!Config::default().index_active());
+        let config = Config { index_db: Some("  ".to_string()), ..Config::default() };
+        assert!(!config.index_active());
+        let config = Config { index_db: Some("/tmp/idx.db".to_string()), ..Config::default() };
+        assert!(config.index_active());
+        let parsed: Config = toml::from_str("index_db = \"/i.db\"\nindex_chunk_size = 900\n").unwrap();
+        assert!(parsed.index_active());
+        assert_eq!(parsed.index_chunk_size, Some(900));
+        assert_eq!(parsed.index_model, None);
     }
 
     #[test]

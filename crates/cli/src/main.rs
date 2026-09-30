@@ -5,6 +5,7 @@ mod chats;
 mod clipboard;
 mod cli;
 mod folder_picker;
+mod index;
 mod logging;
 mod markdown;
 mod mcp;
@@ -18,7 +19,7 @@ use anyhow::Context;
 use clap::Parser;
 use cli::{
     ActivityAction, ActivityConfigAction, BranchesAction, Cli, Commands, ConfigAction, ContextLimitAction, FactsAction, FormatAction,
-    GitToolsAction, OllamaAction, PipelineAction, PipelineConfigAction, ProfilesAction, SamplingAction, SummaryAction,
+    GitToolsAction, IndexAction, IndexConfigAction, OllamaAction, PipelineAction, PipelineConfigAction, ProfilesAction, SamplingAction, SummaryAction,
 };
 use std::sync::Arc;
 use agentcore::config::{Config, Provider, ReasoningMode, ThinkingMode};
@@ -46,6 +47,7 @@ async fn main() -> anyhow::Result<()> {
         Commands::Profiles { action } => run_profiles(action).await?,
         Commands::Activity { action } => run_activity(action).await?,
         Commands::Pipeline { action } => run_pipeline_command(action).await?,
+        Commands::Index { action } => run_index_command(action).await?,
     }
 
     Ok(())
@@ -168,7 +170,7 @@ async fn run_ask(prompt: String) -> anyhow::Result<()> {
         CliAgent::from_config(&config, exchange_log())?.with_unauthorized_hint(UNAUTHORIZED_HINT);
     let history = vec![Message::user(prompt)];
     let settings = config.default_chat_settings();
-    let reply = if settings.git_tools_active() || config.activity_chat_tools_active() || config.pipeline_active() {
+    let reply = if settings.git_tools_active() || config.activity_chat_tools_active() || config.pipeline_active() || config.index_active() {
         ask_with_tools(&agent, &history, &settings, &config).await?
     } else {
         ask_with_spinner(&agent, &history, &settings).await?
@@ -258,6 +260,7 @@ fn run_config(action: ConfigAction) -> anyhow::Result<()> {
         ConfigAction::GitTools { action } => run_git_tools_action(action)?,
         ConfigAction::Activity { action } => run_activity_config(action)?,
         ConfigAction::Pipeline { action } => run_pipeline_config(action)?,
+        ConfigAction::Index { action } => run_index_config(action)?,
         ConfigAction::SetInvariantsPath { path } => {
             let mut config = load_config()?;
             config.invariants_path = if path.trim().is_empty() { None } else { Some(path) };
@@ -604,6 +607,254 @@ struct StepPrinter;
 impl pipeline::PipelineObserver for StepPrinter {
     fn step(&self, index: usize, name: &str) {
         eprintln!("{} {name}", style(format!("[{index}/3]")).dim());
+    }
+}
+
+const INDEX_STRATEGIES: [&str; 3] = ["fixed", "structure", "all"];
+const INDEX_UNITS: [&str; 2] = ["chars", "tokens"];
+
+/// Значение текстового поля конфига: пустая строка снимает его.
+fn set_text(slot: &mut Option<String>, value: Option<String>) {
+    if let Some(value) = value {
+        *slot = Some(value.trim().to_string()).filter(|value| !value.is_empty());
+    }
+}
+
+/// Число из флага: 0 снимает значение (размер чанка в 0 всё равно невозможен).
+fn set_number(slot: &mut Option<usize>, value: Option<usize>) {
+    if let Some(value) = value {
+        *slot = Some(value).filter(|value| *value > 0);
+    }
+}
+
+fn check_choice(what: &str, value: &Option<String>, allowed: &[&str]) -> anyhow::Result<()> {
+    match value.as_deref().map(str::trim).filter(|value| !value.is_empty()) {
+        Some(value) if !allowed.contains(&value) => {
+            anyhow::bail!("неизвестное значение {what}: «{value}». Доступны: {}", allowed.join(", "))
+        }
+        _ => Ok(()),
+    }
+}
+
+fn run_index_config(action: IndexConfigAction) -> anyhow::Result<()> {
+    match action {
+        IndexConfigAction::Set {
+            root,
+            db,
+            strategy,
+            model,
+            unit,
+            chunk_size,
+            overlap,
+            max_section,
+            min_section,
+            ollama_url,
+        } => {
+            if [&root, &db, &strategy, &model, &unit, &ollama_url].iter().all(|value| value.is_none())
+                && [chunk_size, overlap, max_section, min_section].iter().all(Option::is_none)
+            {
+                anyhow::bail!("укажите хотя бы одно значение: --root, --db, --strategy, --model, --unit, --chunk-size и т. д.");
+            }
+            check_choice("--strategy", &strategy, &INDEX_STRATEGIES)?;
+            check_choice("--unit", &unit, &INDEX_UNITS)?;
+            let mut config = load_config()?;
+            set_text(&mut config.index_root, root);
+            set_text(&mut config.index_db, db);
+            set_text(&mut config.index_strategy, strategy);
+            set_text(&mut config.index_model, model);
+            set_text(&mut config.index_unit, unit);
+            set_text(&mut config.index_ollama_url, ollama_url);
+            set_number(&mut config.index_chunk_size, chunk_size);
+            set_number(&mut config.index_overlap, overlap);
+            set_number(&mut config.index_max_section, max_section);
+            set_number(&mut config.index_min_section, min_section);
+            config.save()?;
+            println!("{}", style("Настройки индекса сохранены.").green().bold());
+            print_index(&config);
+        }
+        IndexConfigAction::Clear => {
+            let mut config = load_config()?;
+            config.index_root = None;
+            config.index_db = None;
+            config.index_strategy = None;
+            config.index_model = None;
+            config.index_unit = None;
+            config.index_chunk_size = None;
+            config.index_overlap = None;
+            config.index_max_section = None;
+            config.index_min_section = None;
+            config.index_ollama_url = None;
+            config.save()?;
+            println!("{}", style("Настройки индекса сняты.").green().bold());
+        }
+        IndexConfigAction::Show => print_index(&load_config()?),
+    }
+    Ok(())
+}
+
+fn print_index(config: &Config) {
+    let text = |value: &Option<String>, default: &str| value.clone().filter(|v| !v.trim().is_empty()).unwrap_or_else(|| default.to_string());
+    let number = |value: Option<usize>, default: usize| value.map(|v| v.to_string()).unwrap_or_else(|| format!("{default} (умолчание)"));
+    let line = |label: &str, value: String| println!("{} {value}", style(format!("{label}:")).cyan().bold());
+    line("инструменты индекса в чатах", if config.index_active() { "включены".into() } else { "выключены (не задана база)".into() });
+    line("каталог .docx", text(&config.index_root, "(не задан)"));
+    line("база", text(&config.index_db, "(не задана)"));
+    line("стратегия", text(&config.index_strategy, "all (умолчание)"));
+    line("модель", text(&config.index_model, "nomic-embed-text (умолчание)"));
+    line("единица размеров", text(&config.index_unit, "chars (умолчание)"));
+    line("chunk-size", number(config.index_chunk_size, 1200));
+    line("overlap", number(config.index_overlap, 200));
+    line("max-section", number(config.index_max_section, 1500));
+    line("min-section", number(config.index_min_section, 200));
+    line("Ollama", text(&config.index_ollama_url, "http://localhost:11434 (умолчание)"));
+}
+
+/// Текст ошибки инструмента индекса — как ошибка команды.
+fn index_tool_error(name: &str, message: String) -> anyhow::Error {
+    anyhow::anyhow!("{name}: {message}")
+}
+
+/// `agentcli index …`: процесс `index-mcp` на время команды. Ход сборки идёт
+/// в stderr самого сервера, итог — сюда, в stdout.
+async fn run_index_command(action: IndexAction) -> anyhow::Result<()> {
+    let mut config = load_config()?;
+    let (tool, arguments, progress) = match action {
+        IndexAction::Build {
+            root,
+            db,
+            strategy,
+            model,
+            unit,
+            chunk_size,
+            overlap,
+            max_section,
+            min_section,
+            min_chars,
+        } => {
+            check_choice("--strategy", &strategy, &INDEX_STRATEGIES)?;
+            check_choice("--unit", &unit, &INDEX_UNITS)?;
+            set_text(&mut config.index_root, root);
+            set_text(&mut config.index_db, db);
+            set_text(&mut config.index_strategy, strategy);
+            set_text(&mut config.index_model, model);
+            set_text(&mut config.index_unit, unit);
+            set_number(&mut config.index_chunk_size, chunk_size);
+            set_number(&mut config.index_overlap, overlap);
+            set_number(&mut config.index_max_section, max_section);
+            set_number(&mut config.index_min_section, min_section);
+            let settings = index::IndexSettings::from_config(&config)?;
+            let mut arguments = settings.build_arguments().ok_or_else(|| {
+                anyhow::anyhow!("не задан каталог с .docx: --root <ПУТЬ> или agentcli config index set --root <ПУТЬ>")
+            })?;
+            if let Some(min_chars) = min_chars {
+                arguments["min_chars"] = serde_json::json!(min_chars);
+            }
+            (index::INDEX_BUILD, arguments, settings)
+        }
+        IndexAction::Search { query, strategy, top_k } => {
+            check_choice("--strategy", &strategy, &["fixed", "structure"])?;
+            set_text(&mut config.index_strategy, strategy);
+            let settings = index::IndexSettings::from_config(&config)?;
+            let mut arguments = serde_json::json!({ "query": query });
+            if let Some(top_k) = top_k {
+                arguments["top_k"] = serde_json::json!(top_k);
+            }
+            (index::INDEX_SEARCH, arguments, settings)
+        }
+        IndexAction::Status => (index::INDEX_STATUS, serde_json::json!({}), index::IndexSettings::from_config(&config)?),
+        // Модели не зависят от базы: без заданной пойдёт умолчание сервера.
+        IndexAction::Models => {
+            let mut settings = index::IndexSettings::from_config(&config).unwrap_or_default();
+            if settings.db.is_empty() {
+                settings.db = "index.db".to_string();
+            }
+            settings.model = None;
+            (index::INDEX_MODELS, serde_json::json!({}), settings)
+        }
+    };
+    let server = index::IndexServer::start(&index::server_program(), &progress, index::Progress::Terminal, exchange_log()).await?;
+    let result = server.call_json(tool, arguments).await;
+    server.shutdown().await;
+    let value = result?.map_err(|message| index_tool_error(tool, message))?;
+    print_index_result(tool, &value);
+    Ok(())
+}
+
+fn print_index_result(tool: &str, value: &serde_json::Value) {
+    let head = |text: &str| style(text.to_string()).cyan().bold();
+    match tool {
+        index::INDEX_BUILD => {
+            println!("{} {} (dim {}), база {}", head("модель:"), value["model"].as_str().unwrap_or("?"), value["dim"], value["db"].as_str().unwrap_or("?"));
+            for strategy in value["strategies"].as_array().into_iter().flatten() {
+                println!(
+                    "{} {} чанков из {} файлов ({} символов), эмбеддинг {} мс",
+                    head(&format!("{}:", strategy["strategy"].as_str().unwrap_or("?"))),
+                    strategy["chunks"],
+                    strategy["files"],
+                    strategy["chars"],
+                    strategy["embed_ms"]
+                );
+            }
+        }
+        index::INDEX_SEARCH => {
+            println!(
+                "{} {} (модель {}, dim {})",
+                head("стратегия:"),
+                value["strategy"].as_str().unwrap_or("?"),
+                value["model"].as_str().unwrap_or("?"),
+                value["dim"]
+            );
+            let hits = value["hits"].as_array().cloned().unwrap_or_default();
+            if hits.is_empty() {
+                println!("ничего не найдено");
+            }
+            for (i, hit) in hits.iter().enumerate() {
+                println!(
+                    "\n{} {:.3}  {}  {}",
+                    head(&format!("{}.", i + 1)),
+                    hit["score"].as_f64().unwrap_or(0.0),
+                    hit["section"].as_str().filter(|s| !s.is_empty()).unwrap_or("(без раздела)"),
+                    style(hit["source"].as_str().unwrap_or("?")).dim()
+                );
+                let text = hit["text"].as_str().unwrap_or_default();
+                let preview: String = text.chars().take(300).collect();
+                println!("   {}{}", preview.replace('\n', " "), if text.chars().count() > 300 { "…" } else { "" });
+            }
+        }
+        index::INDEX_STATUS => {
+            println!("{} {}", head("база:"), value["db"].as_str().unwrap_or("?"));
+            if value["exists"] == false {
+                println!("файла базы ещё нет: agentcli index build");
+                return;
+            }
+            println!("{} {}", head("модель запросов:"), value["search_model"].as_str().unwrap_or("?"));
+            for strategy in value["strategies"].as_array().into_iter().flatten() {
+                println!(
+                    "{} {} чанков, {} файлов, модель {} (dim {}), собрано {}",
+                    head(&format!("{}:", strategy["strategy"].as_str().unwrap_or("?"))),
+                    strategy["chunks"],
+                    strategy["files"],
+                    strategy["model"].as_str().unwrap_or("?"),
+                    strategy["dim"],
+                    strategy["built_at"].as_str().unwrap_or("?")
+                );
+                println!("   параметры: {}", strategy["params"]);
+            }
+        }
+        _ => {
+            let models = value["models"].as_array().cloned().unwrap_or_default();
+            if models.is_empty() {
+                println!("Ollama не сообщил моделей с эмбеддингами (ollama pull nomic-embed-text)");
+            }
+            for model in &models {
+                println!(
+                    "{}  dim {}  контекст {}",
+                    model["name"].as_str().unwrap_or("?"),
+                    model["dim"].as_u64().map(|v| v.to_string()).unwrap_or_else(|| "?".into()),
+                    model["context_length"].as_u64().map(|v| v.to_string()).unwrap_or_else(|| "?".into())
+                );
+            }
+        }
     }
 }
 
@@ -1425,6 +1676,27 @@ async fn ask_with_tools(
     } else {
         None
     };
+    // Индекс документов тоже необязателен; `index_build` в `ask` отклоняет
+    // `DenyWrites`, поэтому ход сборки показывать некому.
+    let index_tools = if config.index_active() {
+        let started = match index::IndexSettings::from_config(config) {
+            Ok(settings) => index::IndexTools::start(&settings, index::Progress::Discard, exchange_log()).await,
+            Err(err) => Err(err),
+        };
+        match started {
+            Ok(tools) => Some(tools),
+            Err(err) => {
+                eprintln!(
+                    "{} {}",
+                    style("Внимание:").yellow().bold(),
+                    style(format!("инструменты индекса недоступны: {err}")).yellow()
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
     let spinner = ProgressBar::new_spinner();
     spinner.set_style(
         ProgressStyle::with_template("{spinner:.cyan} {msg}")
@@ -1438,7 +1710,8 @@ async fn ask_with_tools(
         let tools = tool_loop::ToolSet::default()
             .with(git_tools.as_ref().map(|tools| tools as &dyn tool_loop::ToolExecutor))
             .with(activity_tools.as_ref().map(|tools| tools as &dyn tool_loop::ToolExecutor))
-            .with(pipeline_tools.as_ref().map(|tools| tools as &dyn tool_loop::ToolExecutor));
+            .with(pipeline_tools.as_ref().map(|tools| tools as &dyn tool_loop::ToolExecutor))
+            .with(index_tools.as_ref().map(|tools| tools as &dyn tool_loop::ToolExecutor));
         let mut backend = tool_loop::HistoryTurn {
             agent,
             history,
@@ -1462,6 +1735,9 @@ async fn ask_with_tools(
         tools.close().await;
     }
     if let Some(tools) = pipeline_tools {
+        tools.server.shutdown().await;
+    }
+    if let Some(tools) = index_tools {
         tools.server.shutdown().await;
     }
     result.map_err(|err| err.error)

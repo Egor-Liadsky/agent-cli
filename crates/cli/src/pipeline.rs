@@ -328,7 +328,7 @@ impl PipelineServer {
     }
 }
 
-fn expand(path: &str) -> PathBuf {
+pub(crate) fn expand(path: &str) -> PathBuf {
     let trimmed = path.trim();
     match trimmed.strip_prefix("~/") {
         Some(rest) => dirs::home_dir()

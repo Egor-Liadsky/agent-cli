@@ -60,6 +60,63 @@ pub enum Commands {
         #[command(subcommand)]
         action: PipelineAction,
     },
+    /// Индекс документов index-mcp: построить индекс из .docx, искать по
+    /// смыслу, посмотреть состояние и модели (настройки — `config index`)
+    Index {
+        #[command(subcommand)]
+        action: IndexAction,
+    },
+}
+
+// Разбирается один раз при старте: разница размеров вариантов ничего не стоит.
+#[allow(clippy::large_enum_variant)]
+#[derive(Subcommand)]
+pub enum IndexAction {
+    /// Построить индекс из каталога .docx; ход сборки — в stderr, итог — в
+    /// stdout. Флаги перекрывают `config index` только для этого запуска
+    Build {
+        /// Каталог с .docx
+        #[arg(long)]
+        root: Option<String>,
+        /// Файл базы SQLite
+        #[arg(long)]
+        db: Option<String>,
+        /// fixed, structure или all
+        #[arg(long)]
+        strategy: Option<String>,
+        /// Модель эмбеддингов Ollama
+        #[arg(long)]
+        model: Option<String>,
+        /// chars или tokens
+        #[arg(long)]
+        unit: Option<String>,
+        #[arg(long = "chunk-size")]
+        chunk_size: Option<usize>,
+        #[arg(long)]
+        overlap: Option<usize>,
+        #[arg(long = "max-section")]
+        max_section: Option<usize>,
+        #[arg(long = "min-section")]
+        min_section: Option<usize>,
+        /// Минимальный объём корпуса в символах (умолчание сервера 50000)
+        #[arg(long = "min-chars")]
+        min_chars: Option<usize>,
+    },
+    /// Найти в индексе чанки, ближайшие к запросу по смыслу
+    Search {
+        /// Вопрос или фраза
+        query: String,
+        /// fixed или structure; по умолчанию — из config index
+        #[arg(long)]
+        strategy: Option<String>,
+        /// Сколько чанков показать (по умолчанию 5, не больше 20)
+        #[arg(long = "top-k")]
+        top_k: Option<usize>,
+    },
+    /// Что лежит в базе: стратегии, число чанков, модель, время сборки
+    Status,
+    /// Модели Ollama, умеющие эмбеддинги
+    Models,
 }
 
 #[derive(Subcommand)]
@@ -251,6 +308,13 @@ pub enum ConfigAction {
         #[command(subcommand)]
         action: PipelineConfigAction,
     },
+    /// Индекс документов index-mcp: каталог .docx, база, стратегия и
+    /// параметры chunking, модель эмбеддингов. Инструменты index_search и
+    /// index_status в чатах работают при заданной базе
+    Index {
+        #[command(subcommand)]
+        action: IndexConfigAction,
+    },
     /// Задать путь к файлу инвариантов (`invariants.toml`)
     SetInvariantsPath {
         /// Путь к файлу; пустая строка снимает умолчание
@@ -278,6 +342,45 @@ pub enum PipelineConfigAction {
     /// выключаются
     Clear,
     /// Показать каталоги пайплайна
+    Show,
+}
+
+// Разбирается один раз при старте: разница размеров вариантов ничего не стоит.
+#[allow(clippy::large_enum_variant)]
+#[derive(Subcommand)]
+pub enum IndexConfigAction {
+    /// Задать настройки индекса; пустая строка (у чисел — 0) снимает значение
+    Set {
+        /// Каталог с .docx
+        #[arg(long)]
+        root: Option<String>,
+        /// Файл базы SQLite; заданная база включает инструменты в чатах
+        #[arg(long)]
+        db: Option<String>,
+        /// fixed, structure или all
+        #[arg(long)]
+        strategy: Option<String>,
+        /// Модель эмбеддингов Ollama (по умолчанию nomic-embed-text)
+        #[arg(long)]
+        model: Option<String>,
+        /// chars или tokens
+        #[arg(long)]
+        unit: Option<String>,
+        #[arg(long = "chunk-size")]
+        chunk_size: Option<usize>,
+        #[arg(long)]
+        overlap: Option<usize>,
+        #[arg(long = "max-section")]
+        max_section: Option<usize>,
+        #[arg(long = "min-section")]
+        min_section: Option<usize>,
+        /// Адрес Ollama (по умолчанию http://localhost:11434)
+        #[arg(long = "ollama-url")]
+        ollama_url: Option<String>,
+    },
+    /// Снять все настройки индекса: инструменты в чатах выключаются
+    Clear,
+    /// Показать настройки индекса
     Show,
 }
 

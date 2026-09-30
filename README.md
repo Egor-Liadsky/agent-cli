@@ -166,7 +166,7 @@ AGENTCLI_LOG_DIR=/tmp/agentcli-logs cargo run -p agentcli -- ask "привет"
 | TUI                              | `ratatui`, `crossterm`, `futures` |
 | Рендер Markdown в терминале      | `termimad`, `ansi-to-tui`        |
 | Индикация прогресса/стиль текста | `indicatif`, `console`          |
-| Клиент MCP (git-инструменты, сводки, пайплайн) | `rmcp` (client, transport-child-process, transport-streamable-http-client-reqwest) |
+| Клиент MCP (git-инструменты, сводки, пайплайн, индекс) | `rmcp` (client, transport-child-process, transport-streamable-http-client-reqwest) |
 | Сверка записанного пайплайном файла | `sha2`, `hex` |
 
 Терминальные зависимости (`clap`, `ratatui`, `crossterm`, `termimad`,
@@ -174,7 +174,7 @@ AGENTCLI_LOG_DIR=/tmp/agentcli-logs cargo run -p agentcli -- ask "привет"
 `agentcore` от терминала не зависит. Там же живёт клиентская часть `rmcp`:
 процессы MCP-серверов запускает только клиент, ядро знает лишь типы вызовов
 (`ToolSpec`, `ToolCall`). Серверной части `rmcp` в этом workspace нет: она
-живёт в отдельных серверах `git-mcp`, `activity-mcp` и `pipeline-mcp`.
+живёт в отдельных серверах `git-mcp`, `activity-mcp`, `pipeline-mcp` и `index-mcp`.
 
 ## Запуск
 
@@ -326,11 +326,13 @@ cargo run -p agentcli -- chat
 - `Ctrl+O` — импорт контекста других чатов в текущий (`↑`/`↓` — выбор,
   `Space` — отметить, `Enter` — перенести, `Esc` — отмена);
 - `Ctrl+P` — параметры текущего чата (подключение, контекст, память,
-  профиль, инструменты, сводки активности, пайплайн, формат, стратегия
+  профиль, инструменты, сводки активности, пайплайн, индекс документов,
+  формат, стратегия
   рассуждения, сэмплирование), `Ctrl+S` — сохранить, `Esc` — отмена;
 - `Ctrl+X` в `Ctrl+P` на поле-каталоге («Репозиторий» раздела «Инструменты»,
   «Каталог проектов» раздела «Сводки активности», «Каталог поиска» и
-  «Каталог записи» раздела «Пайплайн») — выбрать каталог в
+  «Каталог записи» раздела «Пайплайн», «Каталог с .docx» раздела «Индекс
+  документов») — выбрать каталог в
   системном диалоге (на macOS — Finder). Диалог открывается в каталоге из
   поля, если такой есть, иначе в домашнем; выбранный путь попадает в поле и
   сохраняется по `Ctrl+S`, как набранный вручную, — ручной ввод остаётся.
@@ -393,9 +395,9 @@ cargo run -p agentcli -- chat
 
 ### Модель, сервис и токен
 
-Окно параметров чата (`Ctrl+P`) — слева список из десяти разделов
+Окно параметров чата (`Ctrl+P`) — слева список из одиннадцати разделов
 (Подключение, Контекст, Память, Профиль, Инструменты, Сводки активности,
-Пайплайн, Формат ответа, Рассуждение, Сэмплинг), справа поля
+Пайплайн, Индекс документов, Формат ответа, Рассуждение, Сэмплинг), справа поля
 активного раздела: под значением каждого поля всегда видна короткая
 подсказка о его смысле; под списком полей — панель «Пояснение» с более
 развёрнутым описанием выделенного поля (или раздела, пока курсор ещё в
@@ -1127,3 +1129,89 @@ cargo run -p agentcli -- config pipeline clear
 
 Живой тест против собранного сервера:
 `AGENTCLI_PIPELINE_MCP=$PWD/../mcp/pipeline/target/release/pipeline-mcp cargo test -p agentcli live_pipeline -- --ignored`.
+
+### Индекс документов (index-mcp)
+
+Сервер `index-mcp` из отдельного репозитория
+[`index-mcp-agent`](https://github.com/Egor-Liadsky/index-mcp-agent) строит
+локальный индекс конспектов `.docx` (чанки двух стратегий, эмбеддинги у
+Ollama, SQLite) и ищет по нему по смыслу. Как `git-mcp` и `pipeline-mcp`, он
+запускается клиентом процессом (`index-mcp serve`, stdio) на время команды
+или одного хода чата; cargo-зависимости между проектами нет. Бинарник ищется
+так: путь из `AGENTCLI_INDEX_MCP` → рядом с `agentcli` → `PATH`. Установка:
+
+```bash
+cargo install --git https://github.com/Egor-Liadsky/index-mcp-agent index-mcp
+# или из подмодуля зонтичного репозитория:
+cargo install --path ../mcp/index/crates/index
+```
+
+Имена инструментов и поля JSON (`structuredContent`) — общий контракт с
+сервером:
+
+| Инструмент | Пишет | Аргументы | Результат |
+|------------|-------|-----------|-----------|
+| `index_search` | нет | `query`, `strategy`, `top_k` | `{query, strategy, model, dim, hits:[{chunk_id, source, section, score, text}]}` |
+| `index_status` | нет | — | `{db, exists, search_model, strategies:[{strategy, chunks, files, chars, model, dim, embed_ms, built_at, params}]}` |
+| `index_models` | нет | — | `{models:[{name, dim, context_length, size}]}` — модели Ollama с эмбеддингами |
+| `index_build` | базу | `input`, `strategy`, `unit`, `chunk_size`, `overlap`, `max_section`, `min_section`, `min_chars`, `model`, `num_ctx`, `batch`, `dim` | `{db, model, dim, strategies:[{strategy, chunks, files, chars, embed_ms}]}` |
+| `index_compare` | отчёт | `questions`, `out` | `{out, report}` — клиент его не использует |
+
+Поиск не смешивает модели: если модель запроса (`index_model`) не совпадает с
+моделью, которой построены векторы стратегии, `index_search` отвечает
+ошибкой, а не результатом. Размерность вектора новой модели сервер берёт у
+Ollama (`/api/show`, иначе длина первого вектора), а не из умолчания 768.
+
+**Настройки** — поля `Config`, свойство клиента (не чата), как `pipeline_*`:
+
+```bash
+cargo run -p agentcli -- config index set --root ~/notes --db ~/.local/share/agentcli/index.db
+cargo run -p agentcli -- config index set --strategy structure --model nomic-embed-text
+cargo run -p agentcli -- config index set --unit tokens --chunk-size 400 --overlap 60 --max-section 600 --min-section 100
+cargo run -p agentcli -- config index set --model "" --chunk-size 0   # пустая строка (у чисел — 0) снимает значение
+cargo run -p agentcli -- config index show
+cargo run -p agentcli -- config index clear
+```
+
+| Поле конфига | Что задаёт | Умолчание |
+|--------------|-----------|-----------|
+| `index_root` | каталог с `.docx` для сборки | — |
+| `index_db` | файл базы SQLite; **заданная база включает инструменты в чатах** | — |
+| `index_strategy` | `fixed`, `structure` или `all` | `all` |
+| `index_model` | модель эмбеддингов Ollama | `nomic-embed-text` |
+| `index_unit` | единица размеров: `chars` или `tokens` | `chars` |
+| `index_chunk_size`, `index_overlap` | `fixed`: окно и перекрытие | 1200, 200 |
+| `index_max_section`, `index_min_section` | `structure`: потолок и минимум чанка | 1500, 200 |
+| `index_ollama_url` | адрес Ollama | `http://localhost:11434` |
+
+**Команды.** Каждая запускает `index-mcp` на время команды; флаги `build`
+перекрывают конфиг только для этого запуска. Ход сборки идёт в stderr, итог —
+в stdout:
+
+```bash
+cargo run -p agentcli -- index build --strategy structure           # каталог и база из конфига
+cargo run -p agentcli -- index build --root ~/notes --db /tmp/idx.db --min-chars 0
+cargo run -p agentcli -- index search "как TCP гарантирует доставку" --top-k 3
+cargo run -p agentcli -- index status
+cargo run -p agentcli -- index models
+```
+
+**Чат.** При заданном `index_db` модель во всех чатах и в `agentcli ask`
+получает `index_search` и `index_status` — можно спросить «что в моих
+конспектах про UDP». Пишущий `index_build` в TUI требует подтверждения (каталог
+и параметры подставляются из настроек, что модель не назвала сама), в `ask`
+отклоняется. `index_models` и `index_compare` в чат не отдаются.
+
+**Настройки в TUI.** Раздел «Индекс документов» в `Ctrl+P` (после
+«Пайплайна») правит те же поля: «Каталог с .docx» (`Ctrl+X` — системный
+диалог), «Файл базы», «Стратегия chunking» и «Единица размеров» (`◀`/`▶`,
+`Space`), «Модель эмбеддингов» (`◀`/`▶` перебирает модели Ollama с
+эмбеддингами, список грузится по первой стрелке, `Ctrl+L` обновляет), размеры
+`fixed` и `structure`, «Адрес Ollama». Строка «Сборка индекса»: `Enter`
+сохраняет поля в конфиг и строит индекс фоном — ход виден в самой строке,
+повторный `Enter` во время сборки ничего не делает. Размеры проверяются по
+`Ctrl+S` и при сборке: целое больше нуля или пусто. Значения не попадают в
+`ChatSettings` и на сервис.
+
+Живой тест против собранного сервера и Ollama с `nomic-embed-text`:
+`AGENTCLI_INDEX_MCP=$PWD/../mcp/index/target/release/index-mcp cargo test -p agentcli live_index -- --ignored`.
