@@ -993,8 +993,8 @@ index_build. Ctrl+X — выбрать каталог в системном ди
 со следующего хода; файл создаётся при первой сборке."
             }
             FormatField::IndexStrategy => {
-                "◀/▶ или Space — fixed (окна фиксированной длины), structure (по разделам документа) или all (обе). \
-Пусто — all. Поиск по базе с двумя стратегиями берёт выбранную здесь; при all модель называет её сама."
+                "◀/▶ или Space — fixed (окна фиксированной длины) или structure (по разделам документа). Ниже показаны \
+параметры только выбранной стратегии."
             }
             FormatField::IndexModel => {
                 "Модель эмбеддингов Ollama (index_model конфига). ◀/▶ — выбрать из моделей Ollama с эмбеддингами, Ctrl+L — обновить \
@@ -1456,6 +1456,13 @@ impl SettingsEditor {
                 | FormatField::ActivityChatTools
                 | FormatField::ActivityDaemon => self.activity_enabled,
                 FormatField::PipelineRoot | FormatField::PipelineOutput => self.pipeline_enabled,
+                // параметры стратегии видны, когда выбрана она сама или all (пусто)
+                FormatField::IndexChunkSize | FormatField::IndexOverlap => {
+                    self.index_strategy == "fixed"
+                }
+                FormatField::IndexMaxSection | FormatField::IndexMinSection => {
+                    self.index_strategy == "structure"
+                }
                 _ => true,
             })
             .collect()
@@ -1648,10 +1655,11 @@ impl SettingsEditor {
         self.model = choices[next as usize].clone();
     }
 
-    /// Стратегия индекса: не задано → fixed → structure → all → снова не задано.
+    /// Стратегия индекса: fixed ↔ structure; не заданная (или старое `all`) при
+    /// первом нажатии становится fixed.
     fn cycle_index_strategy(&mut self, delta: i32) {
-        const STATES: [&str; 4] = ["", "fixed", "structure", "all"];
-        let current = STATES.iter().position(|s| *s == self.index_strategy).unwrap_or(0) as i32;
+        const STATES: [&str; 2] = ["fixed", "structure"];
+        let current = STATES.iter().position(|s| *s == self.index_strategy).map_or(-1, |i| i as i32);
         self.index_strategy = STATES[(current + delta).rem_euclid(STATES.len() as i32) as usize].to_string();
     }
 
@@ -3297,8 +3305,16 @@ fn handle_settings_key(
             if !editor.index_busy {
                 match editor.index_values() {
                     Err(err) => editor.error = Some(err),
-                    Ok(values) => {
+                    Ok(mut values) => {
                         editor.error = None;
+                        // Пустая база — не ошибка: файл создаётся сборкой, путь берём в каталоге данных.
+                        if values.db.is_none() {
+                            let dir = dirs::data_dir().unwrap_or_default().join("agentcli");
+                            let _ = std::fs::create_dir_all(&dir);
+                            let db = dir.join("index.db").to_string_lossy().into_owned();
+                            editor.index_db = db.clone();
+                            values.db = Some(db);
+                        }
                         // Собирается то, что сейчас на экране: поля сохраняются до запуска.
                         save_index(state, values);
                         start_index_build(state, tx);
@@ -7631,6 +7647,18 @@ fn render_settings_popup(f: &mut Frame, editor: &SettingsEditor) {
     render_settings_fields(f, editor, columns[1]);
     render_settings_description(f, rows[1], description_text);
 
+    // Ошибка в списке полей оказывается под всеми полями, за границей окна, —
+    // поэтому при ошибке она занимает нижнюю строку вместо подсказки клавиш.
+    if let Some(err) = &editor.error {
+        f.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                format!(" Ошибка: {err}"),
+                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+            ))),
+            rows[2],
+        );
+        return;
+    }
     f.render_widget(
         Paragraph::new(Line::from(Span::styled(
             " Tab — панель/поле · ↑/↓ — выбор · Ctrl+D — сброс · Ctrl+L — модели Ollama · \
@@ -7786,6 +7814,8 @@ fn render_settings_fields(f: &mut Frame, editor: &SettingsEditor, area: Rect) {
     let active = editor.pane == SettingsPane::Fields;
     let current = editor.current_field();
     let mut lines: Vec<Line> = Vec::new();
+    // Строка, на которой заканчивается выбранное поле: по ней считается прокрутка.
+    let mut selected_end = 0usize;
 
     for field in editor.visible_fields() {
         let selected = active && Some(field) == current;
@@ -7863,7 +7893,7 @@ fn render_settings_fields(f: &mut Frame, editor: &SettingsEditor, area: Rect) {
             FormatField::IndexRoot => editor.index_root.clone(),
             FormatField::IndexDb => editor.index_db.clone(),
             FormatField::IndexStrategy => match editor.index_strategy.as_str() {
-                "" => "all (умолчание)".to_string(),
+                "" | "all" => "не выбрана".to_string(),
                 other => other.to_string(),
             },
             FormatField::IndexModel => editor.index_model.clone(),
@@ -7936,6 +7966,9 @@ fn render_settings_fields(f: &mut Frame, editor: &SettingsEditor, area: Rect) {
             "─".repeat(area.width as usize),
             Style::default().fg(Color::DarkGray),
         )));
+        if selected {
+            selected_end = lines.len();
+        }
     }
 
     if let Some(err) = &editor.error {
@@ -7946,8 +7979,10 @@ fn render_settings_fields(f: &mut Frame, editor: &SettingsEditor, area: Rect) {
         )));
     }
 
+    // ponytail: перенос длинных значений не учитывается, при нём выбранное поле может уйти на строку-две.
+    let scroll = clamp_u16(selected_end.saturating_sub(area.height as usize));
     f.render_widget(
-        Paragraph::new(Text::from(lines)).wrap(Wrap { trim: false }),
+        Paragraph::new(Text::from(lines)).wrap(Wrap { trim: false }).scroll((scroll, 0)),
         area,
     );
 }
@@ -10100,7 +10135,8 @@ mod tests {
     #[test]
     fn index_section_mirrors_config_and_cycles_choices() {
         let mut editor = editor_on_index(&index_config());
-        assert_eq!(editor.visible_fields().len(), 11);
+        // structure: окно и перекрытие fixed скрыты
+        assert_eq!(editor.visible_fields().len(), 9);
         assert_eq!(
             editor.index_values().unwrap(),
             IndexValues {
@@ -10118,9 +10154,8 @@ mod tests {
         );
         // Стратегия и единица — круг «не задано → … → не задано».
         editor.cycle_index_strategy(1);
-        assert_eq!(editor.index_strategy, "all");
-        editor.cycle_index_strategy(1);
-        assert_eq!(editor.index_strategy, "");
+        assert_eq!(editor.index_strategy, "fixed");
+        assert_eq!(editor.visible_fields().len(), 9);
         editor.cycle_index_unit(-1);
         assert_eq!(editor.index_unit, "tokens");
         // Модели: пока список не загружен, стрелка ничего не меняет и просит загрузку.
