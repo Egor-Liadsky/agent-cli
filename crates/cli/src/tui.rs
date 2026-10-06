@@ -5389,13 +5389,16 @@ fn spawn_tool_turn(request: ToolTurnRequest) {
             tx: tx.clone(),
         };
         let max_iterations = settings.effective_tool_max_iterations();
+        let retrieval_query = tool_loop::retrieval_query(&history).unwrap_or_else(|| line.clone());
         let result = match settings.provider {
             Provider::Cloud => {
                 let mut backend = tool_loop::CloudTurn {
                     server: agent.server(),
                     chat_id: &chat_id,
                     prompt: &line,
+                    retrieval_query: &retrieval_query,
                     settings: &settings,
+                    retrieval_context: None,
                 };
                 tool_loop::run_tool_loop(&mut backend, &tools, &approver, max_iterations, &observer)
                     .await
@@ -5406,6 +5409,7 @@ fn spawn_tool_turn(request: ToolTurnRequest) {
                     history: &history,
                     settings: &settings,
                     instruction: None,
+                    retrieval_context: None,
                 };
                 tool_loop::run_tool_loop(&mut backend, &tools, &approver, max_iterations, &observer)
                     .await
@@ -5839,7 +5843,7 @@ fn request_create_chat(state: &mut AppState, tx: &mpsc::UnboundedSender<ChatEven
     }
     state.creating_chat = true;
     let client = state.chats_client.clone();
-    let settings = state.config.default_chat_settings();
+    let settings = new_chat_settings(&state.config);
     let tx = tx.clone();
     tokio::spawn(async move {
         let result = client
@@ -5848,6 +5852,16 @@ fn request_create_chat(state: &mut AppState, tx: &mpsc::UnboundedSender<ChatEven
             .map_err(|err| failure_text(&err));
         let _ = tx.send(ChatEvent::ChatCreated(result));
     });
+}
+
+fn new_chat_settings(config: &Config) -> ChatSettings {
+    let mut settings = config.default_chat_settings();
+    if config.index_active() {
+        settings.context_strategy = Some(ContextStrategy::Facts);
+        settings.task_state_enabled = Some(true);
+        settings.task_state_auto_enabled = Some(true);
+    }
+    settings
 }
 
 /// Переименование или изменение параметров чата. Локально изменение не
@@ -11519,6 +11533,20 @@ mod tests {
         assert!(
             Config::default().index_db.is_none() && !SettingsSection::Index.fields().is_empty()
         );
+    }
+
+    #[test]
+    fn rag_chats_enable_persistent_task_memory_by_default() {
+        let settings = new_chat_settings(&Config {
+            index_db: Some("/tmp/index.db".into()),
+            ..Config::default()
+        });
+        assert_eq!(settings.context_strategy, Some(ContextStrategy::Facts));
+        assert_eq!(settings.task_state_enabled, Some(true));
+        assert_eq!(settings.task_state_auto_enabled, Some(true));
+
+        let plain = new_chat_settings(&Config::default());
+        assert_eq!(plain.task_state_enabled, None);
     }
 
     #[test]

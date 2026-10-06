@@ -44,6 +44,11 @@ pub trait ToolExecutor: Send + Sync {
     fn validate_grounded_answer(&self, _answer: &str) -> std::result::Result<(), String> {
         Ok(())
     }
+    /// Контекст, который обязателен до первого ответа модели (например,
+    /// поиск по индексу). Ошибка прерывает ход: отвечать без поиска нельзя.
+    async fn prepare_context(&self, _query: &str) -> Result<Option<String>> {
+        Ok(None)
+    }
     /// Текст результата для модели. `Err` с [`AgentError::ToolServerUnavailable`]
     /// прерывает ход; прочие ошибки становятся результатом-ошибкой.
     async fn call(&self, call: &ToolCall) -> Result<String>;
@@ -64,6 +69,13 @@ pub trait ToolApprover: Send + Sync {
 /// сервисе и шлёт только новое; локальный — собирает историю сам.
 #[async_trait]
 pub trait TurnBackend: Send {
+    /// Поисковый запрос, собранный из текущего вопроса и истории.
+    fn retrieval_query(&self) -> Option<String> {
+        None
+    }
+    /// Добавляет найденный контекст только к запросу модели, не меняя
+    /// локальную историю, которую показывает интерфейс.
+    fn set_retrieval_context(&mut self, _context: String) {}
     /// Первый запрос хода.
     async fn first(
         &mut self,
@@ -145,6 +157,15 @@ pub async fn run_tool_loop(
     let fail = |error: anyhow::Error, executed: usize| TurnError { error, executed };
 
     let instruction = executor.grounding_instruction();
+    if instruction.is_some()
+        && let Some(query) = backend.retrieval_query()
+    {
+        match executor.prepare_context(&query).await {
+            Ok(Some(context)) => backend.set_retrieval_context(context),
+            Ok(None) => {}
+            Err(error) => return Err(fail(error, executed)),
+        }
+    }
     let mut reply = match backend.first(&specs, instruction).await {
         Ok(reply) => reply,
         Err(error) => return Err(fail(error, executed)),
@@ -263,20 +284,28 @@ pub struct CloudTurn<'a> {
     pub server: &'a ServerAgent,
     pub chat_id: &'a str,
     pub prompt: &'a str,
+    pub retrieval_query: &'a str,
     pub settings: &'a ChatSettings,
+    pub retrieval_context: Option<String>,
 }
 
 #[async_trait]
 impl TurnBackend for CloudTurn<'_> {
+    fn retrieval_query(&self) -> Option<String> {
+        Some(self.retrieval_query.to_string())
+    }
+
+    fn set_retrieval_context(&mut self, context: String) {
+        self.retrieval_context = Some(context);
+    }
+
     async fn first(
         &mut self,
         tools: &[ToolSpec],
         instruction: Option<&'static str>,
     ) -> Result<AgentReply> {
-        let prompt = instruction.map_or_else(
-            || self.prompt.to_string(),
-            |instruction| format!("{}\n\n{instruction}", self.prompt),
-        );
+        let prompt =
+            prompt_with_context(self.prompt, self.retrieval_context.as_deref(), instruction);
         self.server
             .ask_in_chat(self.chat_id, &prompt, self.settings, tools)
             .await
@@ -302,18 +331,91 @@ pub struct HistoryTurn<'a> {
     pub history: &'a [Message],
     pub settings: &'a ChatSettings,
     pub instruction: Option<&'static str>,
+    pub retrieval_context: Option<String>,
 }
 
-fn history_with_instruction(history: &[Message], instruction: Option<&str>) -> Vec<Message> {
-    let mut history = history.to_vec();
-    if let Some(instruction) = instruction {
-        if let Some(user) = history
-            .last_mut()
-            .filter(|message| matches!(message.role, Role::User))
-        {
+fn append_to_latest_user(
+    history: &mut [Message],
+    context: Option<&str>,
+    instruction: Option<&str>,
+) {
+    if let Some(user) = history
+        .last_mut()
+        .filter(|message| matches!(message.role, Role::User))
+    {
+        if let Some(context) = context {
+            user.content.push_str("\n\n");
+            user.content.push_str(context);
+        }
+        if let Some(instruction) = instruction {
             user.content.push_str("\n\n");
             user.content.push_str(instruction);
-        } else {
+        }
+    }
+}
+
+fn prompt_with_context(prompt: &str, context: Option<&str>, instruction: Option<&str>) -> String {
+    let mut prompt = prompt.to_string();
+    if let Some(context) = context {
+        prompt.push_str("\n\n");
+        prompt.push_str(context);
+    }
+    if let Some(instruction) = instruction {
+        prompt.push_str("\n\n");
+        prompt.push_str(instruction);
+    }
+    prompt
+}
+
+pub fn retrieval_query(history: &[Message]) -> Option<String> {
+    let user_messages: Vec<&str> = history
+        .iter()
+        .filter(|message| matches!(message.role, Role::User))
+        .map(|message| {
+            message
+                .content
+                .split_once("[[RAG_CONTEXT_BEGIN]]")
+                .map_or(message.content.as_str(), |(user_text, _)| user_text)
+        })
+        .collect();
+    let last = user_messages.len().checked_sub(1)?;
+    let recent_start = user_messages.len().saturating_sub(4);
+    // ponytail: запрос ограничен исходной целью и четырьмя последними репликами; перейти на task memory, если старые уточнения должны участвовать в поиске.
+    let mut indices = Vec::with_capacity(5);
+    if last >= 4 {
+        indices.push(0);
+    }
+    indices.extend(recent_start..=last);
+
+    let mut query = String::from("Цель и последние уточнения пользователя:\n");
+    for index in indices {
+        let limit = if index == last { 800 } else { 350 };
+        query.push_str("- ");
+        query.extend(user_messages[index].chars().take(limit));
+        query.push('\n');
+    }
+    Some(query)
+}
+
+fn history_with_context(
+    history: &[Message],
+    context: Option<&str>,
+    instruction: Option<&str>,
+) -> Vec<Message> {
+    let mut history = history.to_vec();
+    if context.is_some() || instruction.is_some() {
+        if history
+            .last()
+            .is_some_and(|message| matches!(message.role, Role::User))
+        {
+            append_to_latest_user(&mut history, context, instruction);
+        } else if let Some(context) = context {
+            history.push(Message::user(prompt_with_context(
+                "",
+                Some(context),
+                instruction,
+            )));
+        } else if let Some(instruction) = instruction {
             history.push(Message::user(instruction));
         }
     }
@@ -322,18 +424,36 @@ fn history_with_instruction(history: &[Message], instruction: Option<&str>) -> V
 
 #[async_trait]
 impl TurnBackend for HistoryTurn<'_> {
+    fn retrieval_query(&self) -> Option<String> {
+        retrieval_query(self.history)
+    }
+
+    fn set_retrieval_context(&mut self, context: String) {
+        self.retrieval_context = Some(context);
+    }
+
     async fn first(
         &mut self,
         tools: &[ToolSpec],
         instruction: Option<&'static str>,
     ) -> Result<AgentReply> {
         self.instruction = instruction;
-        let history = history_with_instruction(self.history, self.instruction);
-        self.agent.ask_with_tools(&history, self.settings, tools).await
+        let history = history_with_context(
+            self.history,
+            self.retrieval_context.as_deref(),
+            self.instruction,
+        );
+        self.agent
+            .ask_with_tools(&history, self.settings, tools)
+            .await
     }
 
     async fn next(&mut self, turn: &[Message], tools: &[ToolSpec]) -> Result<AgentReply> {
-        let mut history = history_with_instruction(self.history, self.instruction);
+        let mut history = history_with_context(
+            self.history,
+            self.retrieval_context.as_deref(),
+            self.instruction,
+        );
         history.extend(turn.iter().cloned());
         self.agent
             .ask_with_tools(&history, self.settings, tools)
@@ -341,10 +461,16 @@ impl TurnBackend for HistoryTurn<'_> {
     }
 
     async fn repair(&mut self, turn: &[Message], correction: &str) -> Result<AgentReply> {
-        let mut history = self.history.to_vec();
+        let mut history = history_with_context(
+            self.history,
+            self.retrieval_context.as_deref(),
+            self.instruction,
+        );
         history.extend(turn.iter().cloned());
         history.push(Message::user(correction));
-        self.agent.ask_with_tools(&history, self.settings, &[]).await
+        self.agent
+            .ask_with_tools(&history, self.settings, &[])
+            .await
     }
 }
 
@@ -406,6 +532,13 @@ impl ToolExecutor for ToolSet<'_> {
     fn validate_grounded_answer(&self, answer: &str) -> std::result::Result<(), String> {
         self.grounding_executor()
             .map_or(Ok(()), |executor| executor.validate_grounded_answer(answer))
+    }
+
+    async fn prepare_context(&self, query: &str) -> Result<Option<String>> {
+        match self.grounding_executor() {
+            Some(executor) => executor.prepare_context(query).await,
+            None => Ok(None),
+        }
     }
 
     async fn call(&self, call: &ToolCall) -> Result<String> {
@@ -793,6 +926,30 @@ mod tests {
         let results = trailing_results(&turn);
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].content, "b");
+    }
+
+    #[test]
+    fn rag_query_keeps_the_goal_and_four_latest_user_messages() {
+        let history = [
+            Message::user("цель: подготовить план запуска"),
+            Message::assistant("понял"),
+            Message::user("старое уточнение"),
+            Message::user("срок — месяц"),
+            Message::user(
+                "бюджет — 200 тысяч\n\n[[RAG_CONTEXT_BEGIN]] старый документ: неверный бюджет — 9 млн [[RAG_CONTEXT_END]]",
+            ),
+            Message::user("термин MVP означает веб-версию"),
+            Message::user("учти российский рынок"),
+        ];
+        let query = retrieval_query(&history).expect("есть вопрос пользователя");
+        assert!(query.contains("цель: подготовить план запуска"));
+        assert!(query.contains("срок — месяц"));
+        assert!(query.contains("бюджет — 200 тысяч"));
+        assert!(query.contains("MVP означает веб-версию"));
+        assert!(query.contains("учти российский рынок"));
+        assert!(!query.contains("старый документ"));
+        assert!(!query.contains("9 млн"));
+        assert!(!query.contains("старое уточнение"));
     }
 
     /// Второй исполнитель с одним читающим инструментом.

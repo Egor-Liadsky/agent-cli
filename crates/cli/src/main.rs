@@ -2095,6 +2095,7 @@ async fn ask_with_tools(
             history,
             settings,
             instruction: None,
+            retrieval_context: None,
         };
         let observer = SpinnerObserver(spinner.clone());
         tool_loop::run_tool_loop(
