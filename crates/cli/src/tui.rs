@@ -1,35 +1,35 @@
-use crate::agent::CliAgent;
 use crate::activity::ActivityTools;
+use crate::agent::CliAgent;
+use crate::chats::{self, ChatSession};
+use crate::markdown::agent_skin;
 use crate::mcp::{GitToolServer, GitTools};
 use crate::tool_loop::{self, ToolApprover, TurnObserver};
-use agentcore::agent::{AgentReply, Message, MessageMeta, Role, ToolCall};
-use crate::chats::{self, ChatSession};
 use agentclient::{
-    Branch, ChatHistory, ChatSummary, ChatsClient, Fact, LongTermMemoryEntry, ProfileChoice, StoredMessage,
-    WorkingMemoryEntry,
+    Branch, ChatHistory, ChatSummary, ChatsClient, Fact, LongTermMemoryEntry, ProfileChoice,
+    StoredMessage, WorkingMemoryEntry,
 };
+use agentcore::agent::{AgentReply, Message, MessageMeta, Role, ToolCall};
 use agentcore::config::{
     ChatSettings, Config, ContextStrategy, Provider, ReasoningMode, ResponseFormat, SamplingParams,
     ThinkingMode,
 };
-use crate::markdown::agent_skin;
 use ansi_to_tui::IntoText;
 use crossterm::{
     event::{
-        DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture, Event,
-        EventStream, KeyCode, KeyEventKind, KeyModifiers, MouseEventKind,
+        DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+        Event, EventStream, KeyCode, KeyEventKind, KeyModifiers, MouseEventKind,
     },
     execute,
-    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
+    terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
 use futures::{FutureExt, StreamExt};
 use ratatui::{
+    Frame, Terminal,
     backend::CrosstermBackend,
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span, Text},
     widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap},
-    Frame, Terminal,
 };
 use std::collections::{HashMap, VecDeque};
 use std::io;
@@ -336,7 +336,11 @@ enum MemorySection {
 }
 
 impl MemorySection {
-    const ALL: [MemorySection; 3] = [MemorySection::ShortTerm, MemorySection::Working, MemorySection::LongTerm];
+    const ALL: [MemorySection; 3] = [
+        MemorySection::ShortTerm,
+        MemorySection::Working,
+        MemorySection::LongTerm,
+    ];
 
     fn label(self) -> &'static str {
         match self {
@@ -411,24 +415,30 @@ impl MemoryPicker {
             MemorySection::Working => {
                 let len = self.working.len() as i32;
                 if len > 0 {
-                    self.working_cursor = (self.working_cursor as i32 + delta).rem_euclid(len) as usize;
+                    self.working_cursor =
+                        (self.working_cursor as i32 + delta).rem_euclid(len) as usize;
                 }
             }
             MemorySection::LongTerm => {
                 let len = self.long_term.len() as i32;
                 if len > 0 {
-                    self.long_term_cursor = (self.long_term_cursor as i32 + delta).rem_euclid(len) as usize;
+                    self.long_term_cursor =
+                        (self.long_term_cursor as i32 + delta).rem_euclid(len) as usize;
                 }
             }
         }
     }
 
     fn selected_working_key(&self) -> Option<&str> {
-        self.working.get(self.working_cursor).map(|e| e.key.as_str())
+        self.working
+            .get(self.working_cursor)
+            .map(|e| e.key.as_str())
     }
 
     fn selected_long_term_id(&self) -> Option<&str> {
-        self.long_term.get(self.long_term_cursor).map(|e| e.id.as_str())
+        self.long_term
+            .get(self.long_term_cursor)
+            .map(|e| e.id.as_str())
     }
 }
 
@@ -536,6 +546,12 @@ enum FormatField {
     IndexMaxSection,
     IndexMinSection,
     IndexOllamaUrl,
+    IndexSearchEnabled,
+    IndexTopK,
+    IndexCandidateTopK,
+    IndexSimilarityThreshold,
+    IndexRewrite,
+    IndexRewriteModel,
     IndexBuild,
     Mode,
     Reasoning,
@@ -563,13 +579,14 @@ enum SettingsSection {
     Activity,
     Pipeline,
     Index,
+    IndexSearch,
     Format,
     Reasoning,
     Sampling,
 }
 
 impl SettingsSection {
-    const ALL: [SettingsSection; 11] = [
+    const ALL: [SettingsSection; 12] = [
         SettingsSection::Connection,
         SettingsSection::Context,
         SettingsSection::Memory,
@@ -578,6 +595,7 @@ impl SettingsSection {
         SettingsSection::Activity,
         SettingsSection::Pipeline,
         SettingsSection::Index,
+        SettingsSection::IndexSearch,
         SettingsSection::Format,
         SettingsSection::Reasoning,
         SettingsSection::Sampling,
@@ -593,6 +611,7 @@ impl SettingsSection {
             SettingsSection::Activity => "Сводки активности",
             SettingsSection::Pipeline => "Пайплайн",
             SettingsSection::Index => "Индекс документов",
+            SettingsSection::IndexSearch => "Поиск индекса",
             SettingsSection::Format => "Формат ответа",
             SettingsSection::Reasoning => "Рассуждение",
             SettingsSection::Sampling => "Сэмплинг",
@@ -625,7 +644,10 @@ impl SettingsSection {
                 "Сервер pipeline-mcp: инструменты search → summarize → save_to_file во всех чатах. Настройки общие для всех чатов; инструменты работают при включённом переключателе и заданном каталоге поиска."
             }
             SettingsSection::Index => {
-                "Сервер index-mcp: индекс конспектов .docx для поиска по смыслу. Настройки общие для всех чатов; при заданной базе модель получает index_search и index_status, а index_build — только после подтверждения. Строить индекс можно отсюда."
+                "Сервер index-mcp: индекс конспектов .docx для поиска по смыслу. Настройки сборки общие для всех чатов; поиск включается отдельно во вкладке «Поиск индекса». Строить индекс можно отсюда."
+            }
+            SettingsSection::IndexSearch => {
+                "Параметры RAG-поиска index-mcp: число кандидатов, итоговый top-k, cosine threshold и query rewrite. Настройки общие для всех чатов."
             }
             SettingsSection::Format => "Формат ответа: кастомный режим, длина, стоп-условия.",
             SettingsSection::Reasoning => {
@@ -693,6 +715,14 @@ impl SettingsSection {
                 FormatField::IndexMinSection,
                 FormatField::IndexOllamaUrl,
                 FormatField::IndexBuild,
+            ],
+            SettingsSection::IndexSearch => &[
+                FormatField::IndexSearchEnabled,
+                FormatField::IndexTopK,
+                FormatField::IndexCandidateTopK,
+                FormatField::IndexSimilarityThreshold,
+                FormatField::IndexRewrite,
+                FormatField::IndexRewriteModel,
             ],
             SettingsSection::Format => &[
                 FormatField::Mode,
@@ -828,6 +858,12 @@ impl FormatField {
             FormatField::IndexMaxSection => "structure: потолок чанка",
             FormatField::IndexMinSection => "structure: минимум чанка",
             FormatField::IndexOllamaUrl => "Адрес Ollama",
+            FormatField::IndexSearchEnabled => "Поиск по индексу",
+            FormatField::IndexTopK => "Результатов top-k",
+            FormatField::IndexCandidateTopK => "Кандидатов до фильтра",
+            FormatField::IndexSimilarityThreshold => "Similarity threshold",
+            FormatField::IndexRewrite => "Query rewrite",
+            FormatField::IndexRewriteModel => "Модель query rewrite",
             FormatField::IndexBuild => "Сборка индекса",
             FormatField::Mode => "Режим",
             FormatField::Reasoning => "Стратегия рассуждения",
@@ -989,8 +1025,7 @@ git_reset, git_create_branch, git_checkout. Пусто — только чита
 index_build. Ctrl+X — выбрать каталог в системном диалоге, Ctrl+D — очистить."
             }
             FormatField::IndexDb => {
-                "Файл базы SQLite (index_db конфига). Заданная база включает модели во всех чатах index_search и index_status \
-со следующего хода; файл создаётся при первой сборке."
+                "Файл базы SQLite (index_db конфига). Заданная база нужна индексным инструментам, если включён поиск во вкладке «Поиск индекса»; файл создаётся при первой сборке."
             }
             FormatField::IndexStrategy => {
                 "◀/▶ или Space — fixed (окна фиксированной длины) или structure (по разделам документа). Ниже показаны \
@@ -1004,13 +1039,35 @@ index_build. Ctrl+X — выбрать каталог в системном ди
                 "◀/▶ или Space — в чём меряются размеры ниже: chars (символы) или tokens (токены модели). Пусто — chars."
             }
             FormatField::IndexChunkSize => "fixed: размер окна в выбранных единицах. Пусто — 1200.",
-            FormatField::IndexOverlap => "fixed: перекрытие соседних окон, меньше половины окна. Пусто — 200.",
+            FormatField::IndexOverlap => {
+                "fixed: перекрытие соседних окон, меньше половины окна. Пусто — 200."
+            }
             FormatField::IndexMaxSection => {
                 "structure: потолок чанка; раздел длиннее режется по абзацам. Пусто — 1500 (под контекст 2048 токенов nomic-embed-text)."
             }
-            FormatField::IndexMinSection => "structure: кусок короче склеивается с соседним. Пусто — 200.",
+            FormatField::IndexMinSection => {
+                "structure: кусок короче склеивается с соседним. Пусто — 200."
+            }
             FormatField::IndexOllamaUrl => {
                 "Адрес Ollama для index-mcp (index_ollama_url конфига). Пусто — http://localhost:11434."
+            }
+            FormatField::IndexTopK => {
+                "Сколько результатов вернуть после фильтрации (index_top_k). Пусто — 5; допустимо от 1 до 20."
+            }
+            FormatField::IndexCandidateTopK => {
+                "Сколько кандидатов взять до фильтрации (index_candidate_top_k). Пусто — 20; допустимо от 1 до 100."
+            }
+            FormatField::IndexSimilarityThreshold => {
+                "Минимальный cosine score (index_similarity_threshold). Пусто — 0.5 для RAG; ручной поиск без фильтра. Допустимо от -1 до 1."
+            }
+            FormatField::IndexRewrite => {
+                "◀/▶ или Space — включить query rewrite через Ollama. Умолчание выключает rewrite; при ошибке используется исходный запрос."
+            }
+            FormatField::IndexRewriteModel => {
+                "Модель Ollama для query rewrite (index_rewrite_model). Пусто — модель эмбеддингов."
+            }
+            FormatField::IndexSearchEnabled => {
+                "◀/▶ или Space — подключать ли индексные инструменты к чатам и agentcli ask. Выключение сохраняет базу и параметры поиска."
             }
             FormatField::IndexBuild => {
                 "Enter — построить индекс из каталога с текущими настройками (поля сохраняются в конфиг до запуска). Долго: \
@@ -1034,11 +1091,15 @@ index_build. Ctrl+X — выбрать каталог в системном ди
                 "Стоп-последовательности, при которых генерация останавливается, через запятую."
             }
             FormatField::StopInstruction => "Инструкция модели о том, как завершать ответ.",
-            FormatField::Temperature => "Температура сэмплирования: выше — разнообразнее и менее предсказуемо.",
+            FormatField::Temperature => {
+                "Температура сэмплирования: выше — разнообразнее и менее предсказуемо."
+            }
             FormatField::TopP => "Nucleus sampling: доля вероятностной массы токенов-кандидатов.",
             FormatField::TopK => "Ограничивает выбор модели K самыми вероятными токенами.",
             FormatField::FrequencyPenalty => "Штраф за повтор уже встречавшихся токенов.",
-            FormatField::PresencePenalty => "Штраф за повтор уже упомянутых тем/токенов независимо от частоты.",
+            FormatField::PresencePenalty => {
+                "Штраф за повтор уже упомянутых тем/токенов независимо от частоты."
+            }
         }
     }
 
@@ -1068,6 +1129,8 @@ index_build. Ctrl+X — выбрать каталог в системном ди
                 | FormatField::PipelineEnabled
                 | FormatField::IndexStrategy
                 | FormatField::IndexUnit
+                | FormatField::IndexSearchEnabled
+                | FormatField::IndexRewrite
                 | FormatField::IndexBuild
         )
     }
@@ -1116,6 +1179,12 @@ index_build. Ctrl+X — выбрать каталог в системном ди
                 | FormatField::IndexMaxSection
                 | FormatField::IndexMinSection
                 | FormatField::IndexOllamaUrl
+                | FormatField::IndexSearchEnabled
+                | FormatField::IndexTopK
+                | FormatField::IndexCandidateTopK
+                | FormatField::IndexSimilarityThreshold
+                | FormatField::IndexRewrite
+                | FormatField::IndexRewriteModel
                 | FormatField::IndexBuild
         )
     }
@@ -1174,6 +1243,12 @@ struct SettingsEditor {
     index_max_section: String,
     index_min_section: String,
     index_ollama_url: String,
+    index_search_enabled: bool,
+    index_top_k: String,
+    index_candidate_top_k: String,
+    index_similarity_threshold: String,
+    index_rewrite: String,
+    index_rewrite_model: String,
     /// Модели Ollama с эмбеддингами для стрелок в поле модели; грузятся
     /// по первой стрелке или Ctrl+L.
     index_models: Vec<String>,
@@ -1298,7 +1373,11 @@ impl SettingsEditor {
             activity_root: config.activity_root.clone().unwrap_or_default(),
             activity_schedule: config.activity_schedule.clone().unwrap_or_default(),
             activity_chat_tools: config.activity_chat_tools == Some(true),
-            activity_daemon: if config.activity_active() { "проверяю…".to_string() } else { String::new() },
+            activity_daemon: if config.activity_active() {
+                "проверяю…".to_string()
+            } else {
+                String::new()
+            },
             activity_daemon_busy: false,
             pipeline_enabled: config.pipeline_switch_on(),
             pipeline_root: config.pipeline_root.clone().unwrap_or_default(),
@@ -1308,11 +1387,42 @@ impl SettingsEditor {
             index_strategy: config.index_strategy.clone().unwrap_or_default(),
             index_model: config.index_model.clone().unwrap_or_default(),
             index_unit: config.index_unit.clone().unwrap_or_default(),
-            index_chunk_size: config.index_chunk_size.map(|n| n.to_string()).unwrap_or_default(),
-            index_overlap: config.index_overlap.map(|n| n.to_string()).unwrap_or_default(),
-            index_max_section: config.index_max_section.map(|n| n.to_string()).unwrap_or_default(),
-            index_min_section: config.index_min_section.map(|n| n.to_string()).unwrap_or_default(),
+            index_chunk_size: config
+                .index_chunk_size
+                .map(|n| n.to_string())
+                .unwrap_or_default(),
+            index_overlap: config
+                .index_overlap
+                .map(|n| n.to_string())
+                .unwrap_or_default(),
+            index_max_section: config
+                .index_max_section
+                .map(|n| n.to_string())
+                .unwrap_or_default(),
+            index_min_section: config
+                .index_min_section
+                .map(|n| n.to_string())
+                .unwrap_or_default(),
             index_ollama_url: config.index_ollama_url.clone().unwrap_or_default(),
+            index_search_enabled: config.index_search_switch_on(),
+            index_top_k: config
+                .index_top_k
+                .map(|n| n.to_string())
+                .unwrap_or_default(),
+            index_candidate_top_k: config
+                .index_candidate_top_k
+                .map(|n| n.to_string())
+                .unwrap_or_default(),
+            index_similarity_threshold: config
+                .index_similarity_threshold
+                .map(|n| n.to_string())
+                .unwrap_or_default(),
+            index_rewrite: match config.index_rewrite {
+                Some(true) => "on".to_string(),
+                Some(false) => "off".to_string(),
+                None => String::new(),
+            },
+            index_rewrite_model: config.index_rewrite_model.clone().unwrap_or_default(),
             index_models: Vec::new(),
             index_status: String::new(),
             index_busy: false,
@@ -1380,7 +1490,11 @@ impl SettingsEditor {
             },
             git_tools_enabled: settings.git_tools_active(),
             git_repository: settings.git_repository.clone().unwrap_or_default(),
-            git_allowed_tools: settings.git_allowed_tools.clone().unwrap_or_default().join(", "),
+            git_allowed_tools: settings
+                .git_allowed_tools
+                .clone()
+                .unwrap_or_default()
+                .join(", "),
             tool_max_iterations: settings
                 .tool_max_iterations
                 .map(|v| v.to_string())
@@ -1400,7 +1514,10 @@ impl SettingsEditor {
             max_length: format.max_length.map(|v| v.to_string()).unwrap_or_default(),
             stop: format.stop.map(|v| v.join(", ")).unwrap_or_default(),
             stop_instruction: format.stop_instruction.unwrap_or_default(),
-            temperature: sampling.temperature.map(|v| v.to_string()).unwrap_or_default(),
+            temperature: sampling
+                .temperature
+                .map(|v| v.to_string())
+                .unwrap_or_default(),
             top_p: sampling.top_p.map(|v| v.to_string()).unwrap_or_default(),
             top_k: sampling.top_k.map(|v| v.to_string()).unwrap_or_default(),
             frequency_penalty: sampling
@@ -1448,9 +1565,9 @@ impl SettingsEditor {
                 // автотрекер имеет смысл только при включённом состоянии задачи
                 FormatField::TaskStateAutoEnabled => self.task_state_enabled == "on",
                 // параметры инструментов видны при включённом переключателе
-                FormatField::GitRepository | FormatField::GitAllowedTools | FormatField::ToolMaxIterations => {
-                    self.git_tools_enabled
-                }
+                FormatField::GitRepository
+                | FormatField::GitAllowedTools
+                | FormatField::ToolMaxIterations => self.git_tools_enabled,
                 FormatField::ActivityRoot
                 | FormatField::ActivitySchedule
                 | FormatField::ActivityChatTools
@@ -1463,6 +1580,11 @@ impl SettingsEditor {
                 FormatField::IndexMaxSection | FormatField::IndexMinSection => {
                     self.index_strategy == "structure"
                 }
+                FormatField::IndexTopK
+                | FormatField::IndexCandidateTopK
+                | FormatField::IndexSimilarityThreshold
+                | FormatField::IndexRewrite
+                | FormatField::IndexRewriteModel => self.index_search_enabled,
                 _ => true,
             })
             .collect()
@@ -1470,7 +1592,9 @@ impl SettingsEditor {
 
     fn current_field(&self) -> Option<FormatField> {
         let fields = self.visible_fields();
-        fields.get(self.field.min(fields.len().saturating_sub(1))).copied()
+        fields
+            .get(self.field.min(fields.len().saturating_sub(1)))
+            .copied()
     }
 
     /// Переместить выделение внутри активной панели.
@@ -1518,10 +1642,7 @@ impl SettingsEditor {
     fn cycle_reasoning(&mut self, delta: i32) {
         let modes = ReasoningMode::ALL;
         let len = modes.len() as i32;
-        let current = modes
-            .iter()
-            .position(|m| *m == self.reasoning)
-            .unwrap_or(0) as i32;
+        let current = modes.iter().position(|m| *m == self.reasoning).unwrap_or(0) as i32;
         self.reasoning = modes[(current + delta).rem_euclid(len) as usize];
         // «Эксперты» появляются и исчезают вместе со стратегией — не даём
         // курсору уехать за пределы списка полей
@@ -1534,7 +1655,10 @@ impl SettingsEditor {
     fn cycle_provider(&mut self, delta: i32) {
         let providers = Provider::ALL;
         let len = providers.len() as i32;
-        let current = providers.iter().position(|p| *p == self.provider).unwrap_or(0) as i32;
+        let current = providers
+            .iter()
+            .position(|p| *p == self.provider)
+            .unwrap_or(0) as i32;
         let next = providers[(current + delta).rem_euclid(len) as usize];
         if next != self.provider {
             // имя облачной модели локальной не подходит и наоборот
@@ -1636,7 +1760,8 @@ impl SettingsEditor {
             .position(|s| *s == self.task_state_auto_enabled)
             .unwrap_or(0) as i32;
         let len = STATES.len() as i32;
-        self.task_state_auto_enabled = STATES[(current + delta).rem_euclid(len) as usize].to_string();
+        self.task_state_auto_enabled =
+            STATES[(current + delta).rem_euclid(len) as usize].to_string();
     }
 
     /// Перебор известных моделей стрелками. Если в поле введено что-то своё,
@@ -1659,14 +1784,22 @@ impl SettingsEditor {
     /// первом нажатии становится fixed.
     fn cycle_index_strategy(&mut self, delta: i32) {
         const STATES: [&str; 2] = ["fixed", "structure"];
-        let current = STATES.iter().position(|s| *s == self.index_strategy).map_or(-1, |i| i as i32);
-        self.index_strategy = STATES[(current + delta).rem_euclid(STATES.len() as i32) as usize].to_string();
+        let current = STATES
+            .iter()
+            .position(|s| *s == self.index_strategy)
+            .map_or(-1, |i| i as i32);
+        self.index_strategy =
+            STATES[(current + delta).rem_euclid(STATES.len() as i32) as usize].to_string();
     }
 
     fn cycle_index_unit(&mut self, delta: i32) {
         const STATES: [&str; 3] = ["", "chars", "tokens"];
-        let current = STATES.iter().position(|s| *s == self.index_unit).unwrap_or(0) as i32;
-        self.index_unit = STATES[(current + delta).rem_euclid(STATES.len() as i32) as usize].to_string();
+        let current = STATES
+            .iter()
+            .position(|s| *s == self.index_unit)
+            .unwrap_or(0) as i32;
+        self.index_unit =
+            STATES[(current + delta).rem_euclid(STATES.len() as i32) as usize].to_string();
     }
 
     /// Перебор моделей эмбеддингов стрелками, как у поля «Модель»; `false`,
@@ -1676,13 +1809,28 @@ impl SettingsEditor {
             return false;
         }
         let len = self.index_models.len() as i32;
-        let next = match self.index_models.iter().position(|m| *m == self.index_model) {
+        let next = match self
+            .index_models
+            .iter()
+            .position(|m| *m == self.index_model)
+        {
             Some(current) => (current as i32 + delta).rem_euclid(len),
             None if delta >= 0 => 0,
             None => len - 1,
         };
         self.index_model = self.index_models[next as usize].clone();
         true
+    }
+
+    /// Перебор трёх состояний query rewrite: умолчание → включён → выключен.
+    fn cycle_index_rewrite(&mut self, delta: i32) {
+        const STATES: [&str; 3] = ["", "on", "off"];
+        let current = STATES
+            .iter()
+            .position(|s| *s == self.index_rewrite)
+            .unwrap_or(0) as i32;
+        self.index_rewrite =
+            STATES[(current + delta).rem_euclid(STATES.len() as i32) as usize].to_string();
     }
 
     /// Перебор профилей, доступных владельцу, стрелками: пусто → первый →
@@ -1694,7 +1842,11 @@ impl SettingsEditor {
         }
         // Состояния — "" (нет профиля) плюс id каждого профиля списка.
         let len = self.profile_choices.len() as i32 + 1;
-        let current = match self.profile_choices.iter().position(|p| p.id == self.profile_id) {
+        let current = match self
+            .profile_choices
+            .iter()
+            .position(|p| p.id == self.profile_id)
+        {
             Some(index) if !self.profile_id.is_empty() => index as i32 + 1,
             _ if self.profile_id.is_empty() => 0,
             _ => 0,
@@ -1726,6 +1878,8 @@ impl SettingsEditor {
             Some(FormatField::PipelineEnabled) => self.toggle_pipeline(false),
             Some(FormatField::IndexStrategy) => self.index_strategy.clear(),
             Some(FormatField::IndexUnit) => self.index_unit.clear(),
+            Some(FormatField::IndexSearchEnabled) => self.toggle_index_search(false),
+            Some(FormatField::IndexRewrite) => self.index_rewrite.clear(),
             Some(FormatField::IndexBuild) => {}
             // Ctrl+D на строке демона — остановка, её обрабатывает
             // handle_settings_key: редактору не хватает канала событий.
@@ -1757,6 +1911,8 @@ impl SettingsEditor {
             | FormatField::PipelineEnabled
             | FormatField::IndexStrategy
             | FormatField::IndexUnit
+            | FormatField::IndexSearchEnabled
+            | FormatField::IndexRewrite
             | FormatField::IndexBuild => None,
             FormatField::IndexRoot => Some(&mut self.index_root),
             FormatField::IndexDb => Some(&mut self.index_db),
@@ -1766,6 +1922,10 @@ impl SettingsEditor {
             FormatField::IndexMaxSection => Some(&mut self.index_max_section),
             FormatField::IndexMinSection => Some(&mut self.index_min_section),
             FormatField::IndexOllamaUrl => Some(&mut self.index_ollama_url),
+            FormatField::IndexTopK => Some(&mut self.index_top_k),
+            FormatField::IndexCandidateTopK => Some(&mut self.index_candidate_top_k),
+            FormatField::IndexSimilarityThreshold => Some(&mut self.index_similarity_threshold),
+            FormatField::IndexRewriteModel => Some(&mut self.index_rewrite_model),
             FormatField::ActivityRoot => Some(&mut self.activity_root),
             FormatField::ActivitySchedule => Some(&mut self.activity_schedule),
             FormatField::PipelineRoot => Some(&mut self.pipeline_root),
@@ -1825,7 +1985,10 @@ impl SettingsEditor {
                 }
                 // Поле строковое, а конфиг — TOML: путь не в UTF-8 в нём не
                 // сохранить без искажения.
-                (None, _) => format!("Путь {} не в UTF-8 — введите другой вручную", path.display()),
+                (None, _) => format!(
+                    "Путь {} не в UTF-8 — введите другой вручную",
+                    path.display()
+                ),
                 (Some(_), None) => "Это поле не принимает каталог".to_string(),
             },
             Ok(None) => "Каталог не выбран — поле не изменилось".to_string(),
@@ -1901,7 +2064,8 @@ impl SettingsEditor {
             }
             Some(parsed)
         };
-        let frequency_penalty = parse_range(&self.frequency_penalty, "Frequency penalty", -2.0, 2.0)?;
+        let frequency_penalty =
+            parse_range(&self.frequency_penalty, "Frequency penalty", -2.0, 2.0)?;
         let presence_penalty = parse_range(&self.presence_penalty, "Presence penalty", -2.0, 2.0)?;
 
         Ok(SamplingParams {
@@ -2032,6 +2196,13 @@ impl SettingsEditor {
         self.field = self.field.min(len.saturating_sub(1));
     }
 
+    /// Поля RAG-поиска видны только при включённом поиске.
+    fn toggle_index_search(&mut self, enabled: bool) {
+        self.index_search_enabled = enabled;
+        let len = self.visible_fields().len();
+        self.field = self.field.min(len.saturating_sub(1));
+    }
+
     fn build_git_tools_enabled(&self) -> Option<bool> {
         self.git_tools_enabled.then_some(true)
     }
@@ -2052,7 +2223,9 @@ impl SettingsEditor {
         let max = agentcore::config::MAX_TOOL_ITERATIONS;
         match value.parse::<u32>() {
             Ok(parsed) if (1..=max).contains(&parsed) => Ok(Some(parsed)),
-            _ => Err(format!("Лимит итераций должен быть целым числом от 1 до {max}")),
+            _ => Err(format!(
+                "Лимит итераций должен быть целым числом от 1 до {max}"
+            )),
         }
     }
 
@@ -2148,7 +2321,8 @@ fn pick_folder_for_field(
         None => {
             let start = crate::folder_picker::start_dir(&current, dirs::home_dir().as_deref());
             let suspended = suspend_terminal(terminal);
-            let picked = suspended.and_then(|()| crate::folder_picker::pick_folder(start.as_deref()));
+            let picked =
+                suspended.and_then(|()| crate::folder_picker::pick_folder(start.as_deref()));
             // Восстанавливаем и после сбоя: частично освобождённый терминал
             // хуже любой ошибки диалога.
             resume_terminal(terminal)?;
@@ -2167,7 +2341,11 @@ fn pick_folder_for_field(
     };
     if let Some(editor) = state.settings.as_mut() {
         let message = editor.apply_picked_folder(field, picked);
-        if failed { state.notify_error(message) } else { state.notify(message) }
+        if failed {
+            state.notify_error(message)
+        } else {
+            state.notify(message)
+        }
     }
     Ok(())
 }
@@ -2310,7 +2488,8 @@ impl ActivityState {
             .count();
         let current = self.current().map(|digest| digest.id);
         self.digests = digests;
-        let position = current.and_then(|id| self.digests.iter().position(|digest| digest.id == id));
+        let position =
+            current.and_then(|id| self.digests.iter().position(|digest| digest.id == id));
         if position != Some(self.cursor) {
             self.scroll = 0;
         }
@@ -2488,11 +2667,18 @@ impl AppState {
         // спрятало бы её раньше, чем её прочитают; в журнал оно всё равно
         // попало.
         if kind == NoticeKind::Info
-            && self.notice.as_ref().is_some_and(|notice| notice.kind == NoticeKind::Error && !notice.dismissable())
+            && self
+                .notice
+                .as_ref()
+                .is_some_and(|notice| notice.kind == NoticeKind::Error && !notice.dismissable())
         {
             return;
         }
-        self.notice = Some(Notice { text, kind, at: Instant::now() });
+        self.notice = Some(Notice {
+            text,
+            kind,
+            at: Instant::now(),
+        });
     }
 
     fn active_notice_entry(&self) -> Option<&Notice> {
@@ -2504,19 +2690,27 @@ impl AppState {
 
     /// Текст видимого уведомления; без него снова показываем подсказки.
     fn active_notice(&self) -> Option<&str> {
-        self.active_notice_entry().map(|notice| notice.text.as_str())
+        self.active_notice_entry()
+            .map(|notice| notice.text.as_str())
     }
 
     /// Любая клавиша снимает ошибку, провисевшую хотя бы NOTICE_ERROR_GRACE.
     fn dismiss_error_notice(&mut self) {
-        if self.notice.as_ref().is_some_and(|notice| notice.kind == NoticeKind::Error && notice.dismissable()) {
+        if self
+            .notice
+            .as_ref()
+            .is_some_and(|notice| notice.kind == NoticeKind::Error && notice.dismissable())
+        {
             self.notice = None;
         }
     }
 
     /// Текст, введённый пользователем в активной панели.
     fn active_input(&self) -> &str {
-        self.chat_ui.get(&self.panes[self.active_pane]).map(|u| u.input.as_str()).unwrap_or("")
+        self.chat_ui
+            .get(&self.panes[self.active_pane])
+            .map(|u| u.input.as_str())
+            .unwrap_or("")
     }
 
     /// Вставка из буфера обмена: в настройках она идёт в активное поле
@@ -2534,7 +2728,15 @@ impl AppState {
             }
             return;
         }
-        if matches!(self.focus, Focus::Import | Focus::Confirm | Focus::Facts | Focus::Branches | Focus::Memory | Focus::Activity) {
+        if matches!(
+            self.focus,
+            Focus::Import
+                | Focus::Confirm
+                | Focus::Facts
+                | Focus::Branches
+                | Focus::Memory
+                | Focus::Activity
+        ) {
             return;
         }
         let Some(chat_id) = self.active_chat_id() else {
@@ -2545,7 +2747,11 @@ impl AppState {
         }
         // многострочная вставка схлопывается в пробелы: поле ввода однострочное
         let flat = text.replace(['\n', '\r'], " ");
-        self.chat_ui.entry(chat_id).or_default().input.push_str(&flat);
+        self.chat_ui
+            .entry(chat_id)
+            .or_default()
+            .input
+            .push_str(&flat);
     }
 }
 
@@ -2685,8 +2891,14 @@ async fn run_app(
 async fn stop_tool_servers(servers: &ToolServers, should_stop: impl Fn(&PathBuf) -> bool) {
     let stopped: Vec<Arc<GitToolServer>> = {
         let mut servers = servers.lock().await;
-        let keys: Vec<PathBuf> = servers.keys().filter(|key| should_stop(key)).cloned().collect();
-        keys.into_iter().filter_map(|key| servers.remove(&key)).collect()
+        let keys: Vec<PathBuf> = servers
+            .keys()
+            .filter(|key| should_stop(key))
+            .cloned()
+            .collect();
+        keys.into_iter()
+            .filter_map(|key| servers.remove(&key))
+            .collect()
     };
     for server in stopped {
         server.shutdown().await;
@@ -2698,7 +2910,11 @@ async fn stop_tool_servers(servers: &ToolServers, should_stop: impl Fn(&PathBuf)
 fn release_unused_tool_servers(state: &AppState) {
     // Серверов нет — и останавливать нечего: обычный случай, когда
     // инструментами не пользуются.
-    if state.tool_servers.try_lock().is_ok_and(|servers| servers.is_empty()) {
+    if state
+        .tool_servers
+        .try_lock()
+        .is_ok_and(|servers| servers.is_empty())
+    {
         return;
     }
     let used: Vec<PathBuf> = state
@@ -2735,9 +2951,8 @@ fn handle_terminal_event(
                     .map(|agent| agent.with_unauthorized_hint(crate::logging::UNAUTHORIZED_HINT))
                 {
                     Ok(updated) => *agent = Arc::new(updated),
-                    Err(err) => state.notify_error(format!(
-                        "Не удалось применить настройки подключения: {err}"
-                    )),
+                    Err(err) => state
+                        .notify_error(format!("Не удалось применить настройки подключения: {err}")),
                 }
                 // Клиент чатов ходит по тому же адресу с тем же токеном,
                 // поэтому пересобирается вместе с агентом.
@@ -2772,8 +2987,16 @@ fn handle_global_key(
         return Some(LoopControl::Break);
     }
     if key.code == KeyCode::Char('n') && key.modifiers.contains(KeyModifiers::CONTROL) {
-        if matches!(state.focus, Focus::Settings | Focus::Import | Focus::Confirm | Focus::Facts | Focus::Branches | Focus::Memory | Focus::Activity)
-            || state.active_pending()
+        if matches!(
+            state.focus,
+            Focus::Settings
+                | Focus::Import
+                | Focus::Confirm
+                | Focus::Facts
+                | Focus::Branches
+                | Focus::Memory
+                | Focus::Activity
+        ) || state.active_pending()
         {
             return Some(LoopControl::Continue);
         }
@@ -2862,7 +3085,16 @@ fn handle_global_key(
         });
         return Some(LoopControl::Continue);
     }
-    if matches!(state.focus, Focus::Settings | Focus::Import | Focus::Confirm | Focus::Facts | Focus::Branches | Focus::Memory | Focus::Activity) {
+    if matches!(
+        state.focus,
+        Focus::Settings
+            | Focus::Import
+            | Focus::Confirm
+            | Focus::Facts
+            | Focus::Branches
+            | Focus::Memory
+            | Focus::Activity
+    ) {
         return None;
     }
     if key.code == KeyCode::Char('w') && key.modifiers.contains(KeyModifiers::CONTROL) {
@@ -2884,7 +3116,8 @@ fn handle_global_key(
             }
             KeyCode::Left => {
                 if state.panes.len() > 1 {
-                    state.active_pane = (state.active_pane + state.panes.len() - 1) % state.panes.len();
+                    state.active_pane =
+                        (state.active_pane + state.panes.len() - 1) % state.panes.len();
                 }
                 return Some(LoopControl::Continue);
             }
@@ -2911,11 +3144,16 @@ fn handle_key(
     // Журнал уведомлений открывается поверх любого окна, в том числе
     // настроек: ошибка сохранения видна там же, где случилась. `й` — та же
     // клавиша на русской раскладке.
-    if matches!(key.code, KeyCode::Char('q' | 'й')) && key.modifiers.contains(KeyModifiers::CONTROL) {
+    if matches!(key.code, KeyCode::Char('q' | 'й')) && key.modifiers.contains(KeyModifiers::CONTROL)
+    {
         if state.notice_log_view.take().is_none() {
             state.notice_log_view = Some(NoticeLogView::default());
             // Ошибку открыли, чтобы прочитать, — внизу она больше не нужна.
-            if state.notice.as_ref().is_some_and(|notice| notice.kind == NoticeKind::Error) {
+            if state
+                .notice
+                .as_ref()
+                .is_some_and(|notice| notice.kind == NoticeKind::Error)
+            {
                 state.notice = None;
             }
         }
@@ -2934,15 +3172,31 @@ fn handle_key(
         if state.focus == Focus::Import {
             state.import = None;
             state.focus = Focus::Input;
-        } else if !matches!(state.focus, Focus::Settings | Focus::Confirm | Focus::Facts | Focus::Branches | Focus::Memory | Focus::Activity)
-            && let Some(chat_index) = state.active_chat_index() {
-                state.import = Some(ImportPicker::new(&state.chats[chat_index], &state.chats));
-                state.focus = Focus::Import;
-            }
+        } else if !matches!(
+            state.focus,
+            Focus::Settings
+                | Focus::Confirm
+                | Focus::Facts
+                | Focus::Branches
+                | Focus::Memory
+                | Focus::Activity
+        ) && let Some(chat_index) = state.active_chat_index()
+        {
+            state.import = Some(ImportPicker::new(&state.chats[chat_index], &state.chats));
+            state.focus = Focus::Import;
+        }
         return LoopControl::Continue;
     }
     if key.code == KeyCode::Char('p') && key.modifiers.contains(KeyModifiers::CONTROL) {
-        if matches!(state.focus, Focus::Import | Focus::Confirm | Focus::Facts | Focus::Branches | Focus::Memory | Focus::Activity) {
+        if matches!(
+            state.focus,
+            Focus::Import
+                | Focus::Confirm
+                | Focus::Facts
+                | Focus::Branches
+                | Focus::Memory
+                | Focus::Activity
+        ) {
             return LoopControl::Continue;
         }
         if state.focus == Focus::Settings {
@@ -3045,7 +3299,15 @@ fn handle_key(
     if key.code == KeyCode::Tab
         && !matches!(
             state.focus,
-            Focus::Settings | Focus::Import | Focus::Confirm | Focus::Facts | Focus::Branches | Focus::Memory | Focus::Task | Focus::Activity | Focus::MessageSelect
+            Focus::Settings
+                | Focus::Import
+                | Focus::Confirm
+                | Focus::Facts
+                | Focus::Branches
+                | Focus::Memory
+                | Focus::Task
+                | Focus::Activity
+                | Focus::MessageSelect
         )
     {
         state.focus = match state.focus {
@@ -3090,7 +3352,10 @@ fn handle_settings_key(
     state: &mut AppState,
     tx: &mpsc::UnboundedSender<ChatEvent>,
 ) -> LoopControl {
-    let editor = state.settings.as_mut().expect("settings focus implies editor");
+    let editor = state
+        .settings
+        .as_mut()
+        .expect("settings focus implies editor");
     match key.code {
         KeyCode::Esc => {
             state.settings = None;
@@ -3127,28 +3392,38 @@ fn handle_settings_key(
                         })
                 })
                 .and_then(|(format, sampling, context_limit, summary_keep_messages)| {
-                    editor.build_summary_step_messages().map(|summary_step_messages| {
-                        (
-                            format,
-                            sampling,
-                            context_limit,
-                            summary_keep_messages,
-                            summary_step_messages,
-                        )
-                    })
-                })
-                .and_then(
-                    |(format, sampling, context_limit, summary_keep_messages, summary_step_messages)| {
-                        editor.build_context_window_messages().map(|context_window_messages| {
+                    editor
+                        .build_summary_step_messages()
+                        .map(|summary_step_messages| {
                             (
                                 format,
                                 sampling,
                                 context_limit,
                                 summary_keep_messages,
                                 summary_step_messages,
-                                context_window_messages,
                             )
                         })
+                })
+                .and_then(
+                    |(
+                        format,
+                        sampling,
+                        context_limit,
+                        summary_keep_messages,
+                        summary_step_messages,
+                    )| {
+                        editor
+                            .build_context_window_messages()
+                            .map(|context_window_messages| {
+                                (
+                                    format,
+                                    sampling,
+                                    context_limit,
+                                    summary_keep_messages,
+                                    summary_step_messages,
+                                    context_window_messages,
+                                )
+                            })
                     },
                 )
                 .and_then(
@@ -3160,17 +3435,19 @@ fn handle_settings_key(
                         summary_step_messages,
                         context_window_messages,
                     )| {
-                        editor.build_memory_working_max_entries().map(|memory_working_max_entries| {
-                            (
-                                format,
-                                sampling,
-                                context_limit,
-                                summary_keep_messages,
-                                summary_step_messages,
-                                context_window_messages,
-                                memory_working_max_entries,
-                            )
-                        })
+                        editor.build_memory_working_max_entries().map(
+                            |memory_working_max_entries| {
+                                (
+                                    format,
+                                    sampling,
+                                    context_limit,
+                                    summary_keep_messages,
+                                    summary_step_messages,
+                                    context_window_messages,
+                                    memory_working_max_entries,
+                                )
+                            },
+                        )
                     },
                 )
                 .and_then(
@@ -3198,8 +3475,7 @@ fn handle_settings_key(
                             },
                         )
                     },
-                )
-            {
+                ) {
                 Ok((
                     format,
                     sampling,
@@ -3287,7 +3563,8 @@ fn handle_settings_key(
             }
         }
         KeyCode::Enter
-            if editor.pane == SettingsPane::Fields && editor.current_field() == Some(FormatField::ActivityDaemon) =>
+            if editor.pane == SettingsPane::Fields
+                && editor.current_field() == Some(FormatField::ActivityDaemon) =>
         {
             if !editor.activity_daemon_busy {
                 editor.activity_daemon_busy = true;
@@ -3300,7 +3577,8 @@ fn handle_settings_key(
             }
         }
         KeyCode::Enter
-            if editor.pane == SettingsPane::Fields && editor.current_field() == Some(FormatField::IndexBuild) =>
+            if editor.pane == SettingsPane::Fields
+                && editor.current_field() == Some(FormatField::IndexBuild) =>
         {
             if !editor.index_busy {
                 match editor.index_values() {
@@ -3358,36 +3636,42 @@ fn handle_settings_key(
             request_index_models(state, tx);
         }
         KeyCode::Left
-            if editor.pane == SettingsPane::Fields && editor.current_field() == Some(FormatField::IndexModel) =>
+            if editor.pane == SettingsPane::Fields
+                && editor.current_field() == Some(FormatField::IndexModel) =>
         {
             if !editor.cycle_index_model(-1) {
                 request_index_models(state, tx);
             }
         }
         KeyCode::Right
-            if editor.pane == SettingsPane::Fields && editor.current_field() == Some(FormatField::IndexModel) =>
+            if editor.pane == SettingsPane::Fields
+                && editor.current_field() == Some(FormatField::IndexModel) =>
         {
             if !editor.cycle_index_model(1) {
                 request_index_models(state, tx);
             }
         }
         KeyCode::Left
-            if editor.pane == SettingsPane::Fields && editor.current_field() == Some(FormatField::IndexStrategy) =>
+            if editor.pane == SettingsPane::Fields
+                && editor.current_field() == Some(FormatField::IndexStrategy) =>
         {
             editor.cycle_index_strategy(-1);
         }
         KeyCode::Right | KeyCode::Char(' ')
-            if editor.pane == SettingsPane::Fields && editor.current_field() == Some(FormatField::IndexStrategy) =>
+            if editor.pane == SettingsPane::Fields
+                && editor.current_field() == Some(FormatField::IndexStrategy) =>
         {
             editor.cycle_index_strategy(1);
         }
         KeyCode::Left
-            if editor.pane == SettingsPane::Fields && editor.current_field() == Some(FormatField::IndexUnit) =>
+            if editor.pane == SettingsPane::Fields
+                && editor.current_field() == Some(FormatField::IndexUnit) =>
         {
             editor.cycle_index_unit(-1);
         }
         KeyCode::Right | KeyCode::Char(' ')
-            if editor.pane == SettingsPane::Fields && editor.current_field() == Some(FormatField::IndexUnit) =>
+            if editor.pane == SettingsPane::Fields
+                && editor.current_field() == Some(FormatField::IndexUnit) =>
         {
             editor.cycle_index_unit(1);
         }
@@ -3560,6 +3844,24 @@ fn handle_settings_key(
             let enabled = !editor.pipeline_enabled;
             editor.toggle_pipeline(enabled);
         }
+        KeyCode::Left | KeyCode::Right | KeyCode::Char(' ')
+            if editor.pane == SettingsPane::Fields
+                && editor.current_field() == Some(FormatField::IndexSearchEnabled) =>
+        {
+            editor.toggle_index_search(!editor.index_search_enabled);
+        }
+        KeyCode::Left
+            if editor.pane == SettingsPane::Fields
+                && editor.current_field() == Some(FormatField::IndexRewrite) =>
+        {
+            editor.cycle_index_rewrite(-1);
+        }
+        KeyCode::Right | KeyCode::Char(' ')
+            if editor.pane == SettingsPane::Fields
+                && editor.current_field() == Some(FormatField::IndexRewrite) =>
+        {
+            editor.cycle_index_rewrite(1);
+        }
         KeyCode::Left => {
             // из полей — обратно к списку разделов
             editor.pane = SettingsPane::Sections;
@@ -3638,7 +3940,11 @@ impl SettingsEditor {
 /// Сохранить настройки сводок в конфиг. Они общие для всех чатов, как
 /// адрес сервиса; фоновый опрос демона перезапускается под новые значения,
 /// а выключение убирает уже полученные сводки с экрана.
-fn save_activity(state: &mut AppState, values: ActivityValues, tx: &mpsc::UnboundedSender<ChatEvent>) {
+fn save_activity(
+    state: &mut AppState,
+    values: ActivityValues,
+    tx: &mpsc::UnboundedSender<ChatEvent>,
+) {
     let config = &mut state.config;
     if config.activity_active() == values.enabled
         && config.activity_root == values.root
@@ -3695,7 +4001,11 @@ fn save_pipeline(state: &mut AppState, values: PipelineValues) {
 
 /// Запись файла передаётся параметром: Config::save пишет в настоящий
 /// каталог конфигов ОС, и тест без этого переписал бы конфиг пользователя.
-fn save_pipeline_with(state: &mut AppState, values: PipelineValues, save: impl FnOnce(&Config) -> anyhow::Result<()>) {
+fn save_pipeline_with(
+    state: &mut AppState,
+    values: PipelineValues,
+    save: impl FnOnce(&Config) -> anyhow::Result<()>,
+) {
     let config = &mut state.config;
     if config.pipeline_switch_on() == values.enabled
         && config.pipeline_root == values.root
@@ -3726,6 +4036,12 @@ struct IndexValues {
     max_section: Option<usize>,
     min_section: Option<usize>,
     ollama_url: Option<String>,
+    search_enabled: bool,
+    top_k: Option<usize>,
+    candidate_top_k: Option<usize>,
+    similarity_threshold: Option<f32>,
+    rewrite: Option<bool>,
+    rewrite_model: Option<String>,
 }
 
 /// Размер chunking: пусто — умолчание сервера, иначе целое больше нуля.
@@ -3738,6 +4054,30 @@ fn parse_index_size(text: &str, label: &str) -> Result<Option<usize>, String> {
         Ok(value) if value > 0 => Ok(Some(value)),
         _ => Err(format!("{label} должен быть целым числом больше нуля")),
     }
+}
+
+/// Ограничение поискового top-k теми же пределами, что и index-mcp.
+fn parse_index_top_k(text: &str, label: &str, max: usize) -> Result<Option<usize>, String> {
+    let value = parse_index_size(text, label)?;
+    if value.is_some_and(|value| value > max) {
+        return Err(format!("{label} должен быть не больше {max}"));
+    }
+    Ok(value)
+}
+
+/// Threshold пустым значением выключает фильтр, иначе принимает cosine score.
+fn parse_index_threshold(text: &str) -> Result<Option<f32>, String> {
+    let text = text.trim();
+    if text.is_empty() {
+        return Ok(None);
+    }
+    let value = text
+        .parse::<f32>()
+        .map_err(|_| "Similarity threshold должен быть числом".to_string())?;
+    if !(-1.0..=1.0).contains(&value) {
+        return Err("Similarity threshold должен быть от -1 до 1".to_string());
+    }
+    Ok(Some(value))
 }
 
 impl SettingsEditor {
@@ -3753,6 +4093,20 @@ impl SettingsEditor {
             max_section: parse_index_size(&self.index_max_section, "Потолок чанка")?,
             min_section: parse_index_size(&self.index_min_section, "Минимум чанка")?,
             ollama_url: non_empty(&self.index_ollama_url),
+            search_enabled: self.index_search_enabled,
+            top_k: parse_index_top_k(&self.index_top_k, "Top-k", 20)?,
+            candidate_top_k: parse_index_top_k(
+                &self.index_candidate_top_k,
+                "Candidate top-k",
+                100,
+            )?,
+            similarity_threshold: parse_index_threshold(&self.index_similarity_threshold)?,
+            rewrite: match self.index_rewrite.as_str() {
+                "on" => Some(true),
+                "off" => Some(false),
+                _ => None,
+            },
+            rewrite_model: non_empty(&self.index_rewrite_model),
         })
     }
 }
@@ -3765,9 +4119,14 @@ fn save_index(state: &mut AppState, values: IndexValues) {
 
 /// Запись файла передаётся параметром: `Config::save` пишет в настоящий
 /// каталог конфигов ОС, и тест без этого переписал бы конфиг пользователя.
-fn save_index_with(state: &mut AppState, values: IndexValues, save: impl FnOnce(&Config) -> anyhow::Result<()>) {
+fn save_index_with(
+    state: &mut AppState,
+    values: IndexValues,
+    save: impl FnOnce(&Config) -> anyhow::Result<()>,
+) {
     let config = &mut state.config;
-    let unchanged = config.index_root == values.root
+    let unchanged = config.index_search_switch_on() == values.search_enabled
+        && config.index_root == values.root
         && config.index_db == values.db
         && config.index_strategy == values.strategy
         && config.index_model == values.model
@@ -3776,12 +4135,18 @@ fn save_index_with(state: &mut AppState, values: IndexValues, save: impl FnOnce(
         && config.index_overlap == values.overlap
         && config.index_max_section == values.max_section
         && config.index_min_section == values.min_section
-        && config.index_ollama_url == values.ollama_url;
+        && config.index_ollama_url == values.ollama_url
+        && config.index_top_k == values.top_k
+        && config.index_candidate_top_k == values.candidate_top_k
+        && config.index_similarity_threshold == values.similarity_threshold
+        && config.index_rewrite == values.rewrite
+        && config.index_rewrite_model == values.rewrite_model;
     if unchanged {
         return;
     }
     config.index_root = values.root;
     config.index_db = values.db;
+    config.index_search_enabled = Some(values.search_enabled);
     config.index_strategy = values.strategy;
     config.index_model = values.model;
     config.index_unit = values.unit;
@@ -3790,9 +4155,18 @@ fn save_index_with(state: &mut AppState, values: IndexValues, save: impl FnOnce(
     config.index_max_section = values.max_section;
     config.index_min_section = values.min_section;
     config.index_ollama_url = values.ollama_url;
+    config.index_top_k = values.top_k;
+    config.index_candidate_top_k = values.candidate_top_k;
+    config.index_similarity_threshold = values.similarity_threshold;
+    config.index_rewrite = values.rewrite;
+    config.index_rewrite_model = values.rewrite_model;
     match save(&state.config) {
         Ok(()) if state.config.index_active() => state.notify("Настройки индекса сохранены"),
-        Ok(()) => state.notify("Настройки индекса сохранены — инструменты индекса выключены: не задана база"),
+        Ok(()) if !state.config.index_search_switch_on() => {
+            state.notify("Поиск по индексу выключен — параметры сохранены")
+        }
+        Ok(()) => state
+            .notify("Настройки индекса сохранены — инструменты индекса выключены: не задана база"),
         Err(err) => state.notify_error(format!("Не удалось сохранить конфиг: {err}")),
     }
 }
@@ -3800,7 +4174,9 @@ fn save_index_with(state: &mut AppState, values: IndexValues, save: impl FnOnce(
 /// Список моделей с эмбеддингами: отдельный короткоживущий процесс сервера.
 /// Адрес Ollama берётся с экрана — им можно проверить ещё не сохранённое.
 fn request_index_models(state: &mut AppState, tx: &mpsc::UnboundedSender<ChatEvent>) {
-    let Some(editor) = state.settings.as_ref() else { return };
+    let Some(editor) = state.settings.as_ref() else {
+        return;
+    };
     let settings = crate::index::IndexSettings {
         db: non_empty(&editor.index_db).unwrap_or_else(|| "index.db".to_string()),
         ollama_url: non_empty(&editor.index_ollama_url),
@@ -3818,7 +4194,9 @@ fn request_index_models(state: &mut AppState, tx: &mpsc::UnboundedSender<ChatEve
             )
             .await
             .map_err(|err| format!("{err:#}"))?;
-            let result = server.call_json(crate::index::INDEX_MODELS, serde_json::json!({})).await;
+            let result = server
+                .call_json(crate::index::INDEX_MODELS, serde_json::json!({}))
+                .await;
             server.shutdown().await;
             let value = result.map_err(|err| format!("{err:#}"))??;
             Ok(value["models"]
@@ -3835,9 +4213,9 @@ fn request_index_models(state: &mut AppState, tx: &mpsc::UnboundedSender<ChatEve
 
 fn handle_index_models(result: Result<Vec<String>, String>, state: &mut AppState) {
     match result {
-        Ok(models) if models.is_empty() => {
-            state.notify_error("Ollama не сообщил моделей с эмбеддингами (ollama pull nomic-embed-text)")
-        }
+        Ok(models) if models.is_empty() => state.notify_error(
+            "Ollama не сообщил моделей с эмбеддингами (ollama pull nomic-embed-text)",
+        ),
         Ok(models) => {
             state.notify(format!("Моделей с эмбеддингами: {}", models.len()));
             if let Some(editor) = state.settings.as_mut() {
@@ -3856,7 +4234,9 @@ fn start_index_build(state: &mut AppState, tx: &mpsc::UnboundedSender<ChatEvent>
             .ok_or_else(|| anyhow::anyhow!("не задан каталог с .docx"))?;
         Ok((settings, arguments))
     });
-    let Some(editor) = state.settings.as_mut() else { return };
+    let Some(editor) = state.settings.as_mut() else {
+        return;
+    };
     let (settings, arguments) = match prepared {
         Ok(prepared) => prepared,
         Err(err) => {
@@ -3902,14 +4282,19 @@ fn handle_index_built(result: Result<String, String>, state: &mut AppState) {
         editor.index_status = text.clone();
     }
     let text = format!("Индекс: {text}");
-    if ok { state.notify(text) } else { state.notify_error(text) }
+    if ok {
+        state.notify(text)
+    } else {
+        state.notify_error(text)
+    }
 }
 
 /// Запуск демона фоном: регистрация у супервизора и ожидание ответа —
 /// до 30 с, TUI при этом не замирает. Параметры собираются сразу: конфиг
 /// в задачу не передаётся.
 fn spawn_daemon_start(config: &Config, tx: &mpsc::UnboundedSender<ChatEvent>) {
-    let spec = crate::activity_daemon::DaemonSpec::from_config(config).map_err(|err| format!("{err:#}"));
+    let spec =
+        crate::activity_daemon::DaemonSpec::from_config(config).map_err(|err| format!("{err:#}"));
     let endpoint = crate::activity::Endpoint::from_config(config);
     let tx = tx.clone();
     tokio::spawn(async move {
@@ -3917,12 +4302,17 @@ fn spawn_daemon_start(config: &Config, tx: &mpsc::UnboundedSender<ChatEvent>) {
             Err(err) => Err(err),
             Ok(spec) => match crate::activity_daemon::start(&spec).await {
                 Err(err) => Err(format!("{err:#}")),
-                Ok(place) => crate::activity_daemon::wait_ready(&endpoint, crate::logging::exchange_log())
-                    .await
-                    .map(|status| format!("{status} ({place})")),
+                Ok(place) => {
+                    crate::activity_daemon::wait_ready(&endpoint, crate::logging::exchange_log())
+                        .await
+                        .map(|status| format!("{status} ({place})"))
+                }
             },
         };
-        let _ = tx.send(ChatEvent::ActivityDaemon { result, announce: true });
+        let _ = tx.send(ChatEvent::ActivityDaemon {
+            result,
+            announce: true,
+        });
     });
 }
 
@@ -3933,7 +4323,10 @@ fn spawn_daemon_stop(tx: &mpsc::UnboundedSender<ChatEvent>) {
             .await
             .map(|()| "остановлен и снят с автозапуска".to_string())
             .map_err(|err| format!("{err:#}"));
-        let _ = tx.send(ChatEvent::ActivityDaemon { result, announce: true });
+        let _ = tx.send(ChatEvent::ActivityDaemon {
+            result,
+            announce: true,
+        });
     });
 }
 
@@ -3945,7 +4338,10 @@ fn spawn_daemon_status(config: &Config, tx: &mpsc::UnboundedSender<ChatEvent>) {
         let result = crate::activity_daemon::status(&endpoint, crate::logging::exchange_log())
             .await
             .map_err(|_| "не запущен или не отвечает".to_string());
-        let _ = tx.send(ChatEvent::ActivityDaemon { result, announce: false });
+        let _ = tx.send(ChatEvent::ActivityDaemon {
+            result,
+            announce: false,
+        });
     });
 }
 
@@ -3965,7 +4361,11 @@ fn handle_daemon_state(
     }
     if announce {
         let text = format!("Демон activity-mcp: {text}");
-        if started { state.notify(text) } else { state.notify_error(text) }
+        if started {
+            state.notify(text)
+        } else {
+            state.notify_error(text)
+        }
         // Только что поднятый демон мог уже собрать пропущенную сводку.
         if started && state.config.activity_active() {
             refresh_activity(state, tx);
@@ -4044,7 +4444,9 @@ fn import_context(
     // Перенос контекста — реплика пользователя в целевом чате: она уйдёт в
     // сервис вместе с обменом, когда пользователь отправит сообщение, и
     // заголовок чата от переноса не меняется.
-    state.chats[chat_index].messages.push(Message::user(content));
+    state.chats[chat_index]
+        .messages
+        .push(Message::user(content));
     state.chats[chat_index].touch_quietly();
     let ui = state.chat_ui.entry(target_id.to_string()).or_default();
     ui.auto_scroll = true;
@@ -4200,7 +4602,10 @@ fn handle_branches_key(
     state: &mut AppState,
     tx: &mpsc::UnboundedSender<ChatEvent>,
 ) -> LoopControl {
-    let picker = state.branches.as_mut().expect("branches focus implies picker");
+    let picker = state
+        .branches
+        .as_mut()
+        .expect("branches focus implies picker");
 
     if let Some(creation) = picker.creating.as_mut() {
         if let Some(name) = creation.name.as_mut() {
@@ -4296,14 +4701,24 @@ fn handle_memory_key(
                 let chat_id = picker.chat_id.clone();
                 if editor.for_long_term {
                     let entry_type = editor.entry_type.clone();
-                    request_set_long_term_memory(state, &chat_id, &entry_type, &key_text, &value_text, tx);
+                    request_set_long_term_memory(
+                        state,
+                        &chat_id,
+                        &entry_type,
+                        &key_text,
+                        &value_text,
+                        tx,
+                    );
                 } else {
                     request_set_working_memory(state, &chat_id, &key_text, &value_text, tx);
                 }
             }
             KeyCode::Left | KeyCode::Right if editor.for_long_term && editor.field == 2 => {
                 const TYPES: [&str; 3] = ["profile", "decision", "knowledge"];
-                let current = TYPES.iter().position(|t| *t == editor.entry_type).unwrap_or(0) as i32;
+                let current = TYPES
+                    .iter()
+                    .position(|t| *t == editor.entry_type)
+                    .unwrap_or(0) as i32;
                 let delta = if key.code == KeyCode::Right { 1 } else { -1 };
                 let len = TYPES.len() as i32;
                 editor.entry_type = TYPES[(current + delta).rem_euclid(len) as usize].to_string();
@@ -4483,12 +4898,16 @@ fn handle_task_key(
 /// конца хода» нет намеренно: каждый пишущий вызов виден отдельно.
 fn tool_approval_decision(code: KeyCode) -> Option<bool> {
     match code {
-        KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Char('д') | KeyCode::Char('Д') | KeyCode::Enter => {
-            Some(true)
-        }
-        KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Char('н') | KeyCode::Char('Н') | KeyCode::Esc => {
-            Some(false)
-        }
+        KeyCode::Char('y')
+        | KeyCode::Char('Y')
+        | KeyCode::Char('д')
+        | KeyCode::Char('Д')
+        | KeyCode::Enter => Some(true),
+        KeyCode::Char('n')
+        | KeyCode::Char('N')
+        | KeyCode::Char('н')
+        | KeyCode::Char('Н')
+        | KeyCode::Esc => Some(false),
         _ => None,
     }
 }
@@ -4540,7 +4959,10 @@ fn handle_confirm_key(
 ) -> LoopControl {
     match key.code {
         KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Char('д') | KeyCode::Enter => {
-            let confirm = state.delete_confirm.take().expect("confirm focus implies request");
+            let confirm = state
+                .delete_confirm
+                .take()
+                .expect("confirm focus implies request");
             // Чат удаляет сервис: из списка клиента он исчезает по
             // подтверждению, а не до него.
             request_delete_chat(state, &confirm.chat_id, tx);
@@ -4657,7 +5079,11 @@ fn submit_line(
     // Путь проверяется до отправки: с неверным путём ход не
     // начинается, а реплика остаётся в поле ввода.
     let tool_repository = if state.chats[chat_index].settings.git_tools_active() {
-        let path = state.chats[chat_index].settings.git_repository.clone().unwrap_or_default();
+        let path = state.chats[chat_index]
+            .settings
+            .git_repository
+            .clone()
+            .unwrap_or_default();
         match crate::mcp::validate_repository(&path) {
             Ok(repository) => Some(repository),
             Err(err) => {
@@ -4669,7 +5095,9 @@ fn submit_line(
     } else {
         None
     };
-    state.chats[chat_index].messages.push(Message::user(line.clone()));
+    state.chats[chat_index]
+        .messages
+        .push(Message::user(line.clone()));
     state.chats[chat_index].touch_quietly();
     // Заголовок нового чата придумывает сервис после первого обмена
     // (AGENTD_AUTO_TITLE): клиент больше не подставляет свой,
@@ -4790,15 +5218,17 @@ struct TuiObserver {
 
 impl TurnObserver for TuiObserver {
     fn messages(&self, messages: &[Message]) {
-        let _ = self
-            .tx
-            .send(ChatEvent::ToolTurnMessages(self.chat_id.clone(), messages.to_vec()));
+        let _ = self.tx.send(ChatEvent::ToolTurnMessages(
+            self.chat_id.clone(),
+            messages.to_vec(),
+        ));
     }
 
     fn running(&self, call: &ToolCall) {
-        let _ = self
-            .tx
-            .send(ChatEvent::ToolRunning(self.chat_id.clone(), call.name.clone()));
+        let _ = self.tx.send(ChatEvent::ToolRunning(
+            self.chat_id.clone(),
+            call.name.clone(),
+        ));
     }
 }
 
@@ -4828,9 +5258,11 @@ fn spawn_tool_turn(request: ToolTurnRequest) {
                     match servers.get(&repository) {
                         Some(server) => Ok(server.clone()),
                         None => {
-                            let started =
-                                GitToolServer::start(&repository.to_string_lossy(), crate::logging::exchange_log())
-                                    .await;
+                            let started = GitToolServer::start(
+                                &repository.to_string_lossy(),
+                                crate::logging::exchange_log(),
+                            )
+                            .await;
                             if let Ok(server) = &started {
                                 servers.insert(repository.clone(), server.clone());
                             }
@@ -4858,25 +5290,29 @@ fn spawn_tool_turn(request: ToolTurnRequest) {
         // Демон сводок необязателен, в отличие от git-сервера, который чат
         // включил явно: без демона ход идёт без его инструментов.
         let activity_tools = match activity {
-            Some(endpoint) => match ActivityTools::connect(&endpoint, crate::logging::exchange_log()).await {
-                Ok(tools) => Some(tools),
-                Err(err) => {
-                    let _ = tx.send(ChatEvent::ActivityNotice(NoticeKind::Error, format!(
-                        "Инструменты activity_* недоступны в этом ходе: {err}"
-                    )));
-                    None
+            Some(endpoint) => {
+                match ActivityTools::connect(&endpoint, crate::logging::exchange_log()).await {
+                    Ok(tools) => Some(tools),
+                    Err(err) => {
+                        let _ = tx.send(ChatEvent::ActivityNotice(
+                            NoticeKind::Error,
+                            format!("Инструменты activity_* недоступны в этом ходе: {err}"),
+                        ));
+                        None
+                    }
                 }
-            },
+            }
             None => None,
         };
         // Процесс pipeline-mcp живёт один ход; `summarize` просит сводку у
         // модели этого же чата через sampling.
         let pipeline_tools = match pipeline {
             Some(dirs) => {
-                let sampler: Arc<dyn crate::pipeline::Sampler> = Arc::new(crate::pipeline::AgentSampler {
-                    agent: agent.clone(),
-                    settings: settings.clone(),
-                });
+                let sampler: Arc<dyn crate::pipeline::Sampler> =
+                    Arc::new(crate::pipeline::AgentSampler {
+                        agent: agent.clone(),
+                        settings: settings.clone(),
+                    });
                 let started = crate::pipeline::PipelineServer::start(
                     &crate::pipeline::server_program(),
                     &dirs.root,
@@ -4888,9 +5324,10 @@ fn spawn_tool_turn(request: ToolTurnRequest) {
                 match started {
                     Ok(server) => Some(crate::pipeline::PipelineTools { server }),
                     Err(err) => {
-                        let _ = tx.send(ChatEvent::ActivityNotice(NoticeKind::Error, format!(
-                            "Инструменты пайплайна недоступны в этом ходе: {err}"
-                        )));
+                        let _ = tx.send(ChatEvent::ActivityNotice(
+                            NoticeKind::Error,
+                            format!("Инструменты пайплайна недоступны в этом ходе: {err}"),
+                        ));
                         None
                     }
                 }
@@ -4902,23 +5339,47 @@ fn spawn_tool_turn(request: ToolTurnRequest) {
         // рисовал бы поверх экрана.
         let index_tools = match index {
             Some(settings) => {
-                match crate::index::IndexTools::start(&settings, crate::index::Progress::Discard, crate::logging::exchange_log()).await {
+                match crate::index::IndexTools::start(
+                    &settings,
+                    crate::index::Progress::Discard,
+                    crate::logging::exchange_log(),
+                )
+                .await
+                {
                     Ok(tools) => Some(tools),
                     Err(err) => {
-                        let _ = tx.send(ChatEvent::ActivityNotice(NoticeKind::Error, format!(
-                            "Инструменты индекса недоступны в этом ходе: {err}"
-                        )));
-                        None
+                        let _ = tx.send(ChatEvent::ToolServerFailed {
+                            chat_id,
+                            line,
+                            error: format!("Индекс включён, но сервер недоступен: {err}"),
+                        });
+                        return;
                     }
                 }
             }
             None => None,
         };
         let tools = tool_loop::ToolSet::default()
-            .with(git_tools.as_ref().map(|tools| tools as &dyn tool_loop::ToolExecutor))
-            .with(activity_tools.as_ref().map(|tools| tools as &dyn tool_loop::ToolExecutor))
-            .with(pipeline_tools.as_ref().map(|tools| tools as &dyn tool_loop::ToolExecutor))
-            .with(index_tools.as_ref().map(|tools| tools as &dyn tool_loop::ToolExecutor));
+            .with(
+                git_tools
+                    .as_ref()
+                    .map(|tools| tools as &dyn tool_loop::ToolExecutor),
+            )
+            .with(
+                activity_tools
+                    .as_ref()
+                    .map(|tools| tools as &dyn tool_loop::ToolExecutor),
+            )
+            .with(
+                pipeline_tools
+                    .as_ref()
+                    .map(|tools| tools as &dyn tool_loop::ToolExecutor),
+            )
+            .with(
+                index_tools
+                    .as_ref()
+                    .map(|tools| tools as &dyn tool_loop::ToolExecutor),
+            );
         let approver = TuiApprover {
             chat_title,
             tx: tx.clone(),
@@ -4936,15 +5397,18 @@ fn spawn_tool_turn(request: ToolTurnRequest) {
                     prompt: &line,
                     settings: &settings,
                 };
-                tool_loop::run_tool_loop(&mut backend, &tools, &approver, max_iterations, &observer).await
+                tool_loop::run_tool_loop(&mut backend, &tools, &approver, max_iterations, &observer)
+                    .await
             }
             Provider::Ollama => {
                 let mut backend = tool_loop::HistoryTurn {
                     agent: agent.as_ref(),
                     history: &history,
                     settings: &settings,
+                    instruction: None,
                 };
-                tool_loop::run_tool_loop(&mut backend, &tools, &approver, max_iterations, &observer).await
+                tool_loop::run_tool_loop(&mut backend, &tools, &approver, max_iterations, &observer)
+                    .await
             }
         };
         drop(tools);
@@ -5005,7 +5469,10 @@ fn refresh_activity(state: &AppState, tx: &mpsc::UnboundedSender<ChatEvent>) {
     });
 }
 
-fn handle_activity_digests(result: Result<Vec<crate::activity::Digest>, String>, state: &mut AppState) {
+fn handle_activity_digests(
+    result: Result<Vec<crate::activity::Digest>, String>,
+    state: &mut AppState,
+) {
     let first = !state.activity.loaded;
     state.activity.loaded = true;
     match result {
@@ -5028,11 +5495,15 @@ fn spawn_activity_ack(state: &AppState, id: i64, tx: &mpsc::UnboundedSender<Chat
     let endpoint = crate::activity::Endpoint::from_config(&state.config);
     let tx = tx.clone();
     tokio::spawn(async move {
-        if let Err(err) = crate::activity::ack(&endpoint, crate::logging::exchange_log(), id).await {
-            let _ = tx.send(ChatEvent::ActivityNotice(NoticeKind::Error, format!(
-                "Сводка #{id} не отмечена прочитанной: {}",
-                failure_text(&err)
-            )));
+        if let Err(err) = crate::activity::ack(&endpoint, crate::logging::exchange_log(), id).await
+        {
+            let _ = tx.send(ChatEvent::ActivityNotice(
+                NoticeKind::Error,
+                format!(
+                    "Сводка #{id} не отмечена прочитанной: {}",
+                    failure_text(&err)
+                ),
+            ));
         }
     });
 }
@@ -5052,8 +5523,14 @@ fn spawn_activity_build(state: &AppState, tx: &mpsc::UnboundedSender<ChatEvent>)
         .await;
         let notice = match &built {
             Ok(Some(digest)) => (NoticeKind::Info, format!("Собрана сводка #{}", digest.id)),
-            Ok(None) => (NoticeKind::Info, "С прошлой сводки изменений нет".to_string()),
-            Err(err) => (NoticeKind::Error, format!("Сводка не собрана: {}", failure_text(err))),
+            Ok(None) => (
+                NoticeKind::Info,
+                "С прошлой сводки изменений нет".to_string(),
+            ),
+            Err(err) => (
+                NoticeKind::Error,
+                format!("Сводка не собрана: {}", failure_text(err)),
+            ),
         };
         let _ = tx.send(ChatEvent::ActivityNotice(notice.0, notice.1));
         let result = crate::activity::fetch_unread(&endpoint, log)
@@ -5078,9 +5555,13 @@ fn handle_activity_key(
         KeyCode::Left => activity.select(-1),
         KeyCode::Right => activity.select(1),
         KeyCode::Up => activity.scroll = activity.scroll.saturating_sub(1),
-        KeyCode::Down => activity.scroll = activity.scroll.saturating_add(1).min(activity.max_scroll),
+        KeyCode::Down => {
+            activity.scroll = activity.scroll.saturating_add(1).min(activity.max_scroll)
+        }
         KeyCode::PageUp => activity.scroll = activity.scroll.saturating_sub(10),
-        KeyCode::PageDown => activity.scroll = activity.scroll.saturating_add(10).min(activity.max_scroll),
+        KeyCode::PageDown => {
+            activity.scroll = activity.scroll.saturating_add(10).min(activity.max_scroll)
+        }
         KeyCode::Char('a') | KeyCode::Char('ф') => {
             if let Some(digest) = activity.take_current() {
                 spawn_activity_ack(state, digest.id, tx);
@@ -5110,8 +5591,19 @@ fn handle_activity_key(
             state.focus = Focus::Input;
             // Сводка прочитана, когда её пересказ ушёл в чат; отказ
             // отправки (сервис недоступен) оставляет её непрочитанной.
-            if submit_line(state, agent, tx, chat_id, crate::activity::retell_prompt(&digest)) {
-                if let Some(position) = state.activity.digests.iter().position(|d| d.id == digest.id) {
+            if submit_line(
+                state,
+                agent,
+                tx,
+                chat_id,
+                crate::activity::retell_prompt(&digest),
+            ) {
+                if let Some(position) = state
+                    .activity
+                    .digests
+                    .iter()
+                    .position(|d| d.id == digest.id)
+                {
                     state.activity.cursor = position;
                     state.activity.take_current();
                 }
@@ -5224,7 +5716,10 @@ fn handle_message_select_key(key: crossterm::event::KeyEvent, state: &mut AppSta
         .map(|index| state.chats[index].messages.len())
         .unwrap_or(0);
     let selected = normalize_selection(
-        state.chat_ui.get(&chat_id).and_then(|ui| ui.selected_message),
+        state
+            .chat_ui
+            .get(&chat_id)
+            .and_then(|ui| ui.selected_message),
         len,
     );
     // История опустела, пока режим был открыт: выбирать нечего.
@@ -5419,19 +5914,33 @@ fn request_facts(state: &AppState, chat_id: &str, tx: &mpsc::UnboundedSender<Cha
     });
 }
 
-fn request_set_fact(state: &AppState, chat_id: &str, key: &str, value: &str, tx: &mpsc::UnboundedSender<ChatEvent>) {
+fn request_set_fact(
+    state: &AppState,
+    chat_id: &str,
+    key: &str,
+    value: &str,
+    tx: &mpsc::UnboundedSender<ChatEvent>,
+) {
     let client = state.chats_client.clone();
     let tx = tx.clone();
     let id = chat_id.to_string();
     let key = key.to_string();
     let value = value.to_string();
     tokio::spawn(async move {
-        let result = client.set_fact(&id, &key, &value).await.map_err(|err| failure_text(&err));
+        let result = client
+            .set_fact(&id, &key, &value)
+            .await
+            .map_err(|err| failure_text(&err));
         let _ = tx.send(ChatEvent::FactSet(id, result));
     });
 }
 
-fn request_delete_fact(state: &AppState, chat_id: &str, key: &str, tx: &mpsc::UnboundedSender<ChatEvent>) {
+fn request_delete_fact(
+    state: &AppState,
+    chat_id: &str,
+    key: &str,
+    tx: &mpsc::UnboundedSender<ChatEvent>,
+) {
     let client = state.chats_client.clone();
     let tx = tx.clone();
     let id = chat_id.to_string();
@@ -5461,7 +5970,11 @@ fn request_branches(state: &AppState, chat_id: &str, tx: &mpsc::UnboundedSender<
 /// из уже загрученной `ChatSession`: там нет `seq`, нужного для выбора
 /// точки ветвления (specs/chat-branching, «Ветка создаётся от выбранного
 /// сообщения»).
-fn request_branch_source_messages(state: &AppState, chat_id: &str, tx: &mpsc::UnboundedSender<ChatEvent>) {
+fn request_branch_source_messages(
+    state: &AppState,
+    chat_id: &str,
+    tx: &mpsc::UnboundedSender<ChatEvent>,
+) {
     let client = state.chats_client.clone();
     let tx = tx.clone();
     let id = chat_id.to_string();
@@ -5475,18 +5988,32 @@ fn request_branch_source_messages(state: &AppState, chat_id: &str, tx: &mpsc::Un
     });
 }
 
-fn request_create_branch(state: &AppState, chat_id: &str, from_seq: i64, name: &str, tx: &mpsc::UnboundedSender<ChatEvent>) {
+fn request_create_branch(
+    state: &AppState,
+    chat_id: &str,
+    from_seq: i64,
+    name: &str,
+    tx: &mpsc::UnboundedSender<ChatEvent>,
+) {
     let client = state.chats_client.clone();
     let tx = tx.clone();
     let id = chat_id.to_string();
     let name = name.to_string();
     tokio::spawn(async move {
-        let result = client.create_branch(&id, from_seq, &name).await.map_err(|err| failure_text(&err));
+        let result = client
+            .create_branch(&id, from_seq, &name)
+            .await
+            .map_err(|err| failure_text(&err));
         let _ = tx.send(ChatEvent::BranchCreated(id, result));
     });
 }
 
-fn request_activate_branch(state: &AppState, chat_id: &str, branch_id: &str, tx: &mpsc::UnboundedSender<ChatEvent>) {
+fn request_activate_branch(
+    state: &AppState,
+    chat_id: &str,
+    branch_id: &str,
+    tx: &mpsc::UnboundedSender<ChatEvent>,
+) {
     let client = state.chats_client.clone();
     let tx = tx.clone();
     let id = chat_id.to_string();
@@ -5508,7 +6035,10 @@ fn request_working_memory(state: &AppState, chat_id: &str, tx: &mpsc::UnboundedS
     let tx = tx.clone();
     let id = chat_id.to_string();
     tokio::spawn(async move {
-        let result = client.working_memory(&id).await.map_err(|err| failure_text(&err));
+        let result = client
+            .working_memory(&id)
+            .await
+            .map_err(|err| failure_text(&err));
         let _ = tx.send(ChatEvent::WorkingMemoryLoaded(id, result));
     });
 }
@@ -5526,12 +6056,20 @@ fn request_set_working_memory(
     let key = key.to_string();
     let value = value.to_string();
     tokio::spawn(async move {
-        let result = client.set_working_memory(&id, &key, &value).await.map_err(|err| failure_text(&err));
+        let result = client
+            .set_working_memory(&id, &key, &value)
+            .await
+            .map_err(|err| failure_text(&err));
         let _ = tx.send(ChatEvent::WorkingMemorySet(id, result));
     });
 }
 
-fn request_delete_working_memory(state: &AppState, chat_id: &str, key: &str, tx: &mpsc::UnboundedSender<ChatEvent>) {
+fn request_delete_working_memory(
+    state: &AppState,
+    chat_id: &str,
+    key: &str,
+    tx: &mpsc::UnboundedSender<ChatEvent>,
+) {
     let client = state.chats_client.clone();
     let tx = tx.clone();
     let id = chat_id.to_string();
@@ -5554,17 +6092,27 @@ fn request_finish_task(state: &AppState, chat_id: &str, tx: &mpsc::UnboundedSend
         // Ручное завершение задачи из TUI переносит все записи текущей
         // рабочей памяти без выборочного отбора: точечный выбор ключей для
         // переноса остаётся полем маршрутизатора и HTTP-клиентов сервиса.
-        let result = client.finish_task(&id, &[]).await.map_err(|err| failure_text(&err));
+        let result = client
+            .finish_task(&id, &[])
+            .await
+            .map_err(|err| failure_text(&err));
         let _ = tx.send(ChatEvent::TaskFinished(id, result));
     });
 }
 
-fn request_long_term_memory(state: &AppState, chat_id: &str, tx: &mpsc::UnboundedSender<ChatEvent>) {
+fn request_long_term_memory(
+    state: &AppState,
+    chat_id: &str,
+    tx: &mpsc::UnboundedSender<ChatEvent>,
+) {
     let client = state.chats_client.clone();
     let tx = tx.clone();
     let id = chat_id.to_string();
     tokio::spawn(async move {
-        let result = client.long_term_memory().await.map_err(|err| failure_text(&err));
+        let result = client
+            .long_term_memory()
+            .await
+            .map_err(|err| failure_text(&err));
         let _ = tx.send(ChatEvent::LongTermMemoryLoaded(id, result));
     });
 }
@@ -5584,8 +6132,15 @@ fn request_set_long_term_memory(
     let key = key.to_string();
     let value = value.to_string();
     tokio::spawn(async move {
-        let key_arg = if key.is_empty() { None } else { Some(key.as_str()) };
-        let result = client.set_long_term_memory(&entry_type, key_arg, &value).await.map_err(|err| failure_text(&err));
+        let key_arg = if key.is_empty() {
+            None
+        } else {
+            Some(key.as_str())
+        };
+        let result = client
+            .set_long_term_memory(&entry_type, key_arg, &value)
+            .await
+            .map_err(|err| failure_text(&err));
         let _ = tx.send(ChatEvent::LongTermMemorySet(id, result));
     });
 }
@@ -5638,7 +6193,13 @@ fn request_task_transition(
     let expected_action = expected_action.map(str::to_string);
     tokio::spawn(async move {
         let result = client
-            .task_transition(&id, stage.as_deref(), step.as_deref(), expected_action.as_deref(), &[])
+            .task_transition(
+                &id,
+                stage.as_deref(),
+                step.as_deref(),
+                expected_action.as_deref(),
+                &[],
+            )
             .await
             .map_err(|err| failure_text(&err));
         let _ = tx.send(ChatEvent::TaskTransitioned(id, result));
@@ -5650,7 +6211,10 @@ fn request_task_pause(state: &AppState, chat_id: &str, tx: &mpsc::UnboundedSende
     let tx = tx.clone();
     let id = chat_id.to_string();
     tokio::spawn(async move {
-        let result = client.task_pause(&id).await.map_err(|err| failure_text(&err));
+        let result = client
+            .task_pause(&id)
+            .await
+            .map_err(|err| failure_text(&err));
         let _ = tx.send(ChatEvent::TaskPaused(id, result));
     });
 }
@@ -5660,7 +6224,10 @@ fn request_task_resume(state: &AppState, chat_id: &str, tx: &mpsc::UnboundedSend
     let tx = tx.clone();
     let id = chat_id.to_string();
     tokio::spawn(async move {
-        let result = client.task_resume(&id).await.map_err(|err| failure_text(&err));
+        let result = client
+            .task_resume(&id)
+            .await
+            .map_err(|err| failure_text(&err));
         let _ = tx.send(ChatEvent::TaskResumed(id, result));
     });
 }
@@ -5855,11 +6422,23 @@ fn handle_chat_event(
             state.chat_ui.entry(chat_id).or_default().tool_running = Some(name);
             return;
         }
-        ChatEvent::ToolApproval { chat_title, call, reply } => {
-            state.tool_approvals.push_back(ToolApprovalRequest { chat_title, call, reply });
+        ChatEvent::ToolApproval {
+            chat_title,
+            call,
+            reply,
+        } => {
+            state.tool_approvals.push_back(ToolApprovalRequest {
+                chat_title,
+                call,
+                reply,
+            });
             return;
         }
-        ChatEvent::ToolServerFailed { chat_id, line, error } => {
+        ChatEvent::ToolServerFailed {
+            chat_id,
+            line,
+            error,
+        } => {
             handle_tool_server_failed(chat_id, line, error, state);
             return;
         }
@@ -5891,7 +6470,10 @@ fn handle_tool_turn_messages(chat_id: String, messages: Vec<Message>, state: &mu
 fn handle_tool_server_failed(chat_id: String, line: String, error: String, state: &mut AppState) {
     if let Some(chat_index) = state.chat_index(&chat_id) {
         let messages = &mut state.chats[chat_index].messages;
-        if messages.last().is_some_and(|m| matches!(m.role, Role::User) && m.content == line) {
+        if messages
+            .last()
+            .is_some_and(|m| matches!(m.role, Role::User) && m.content == line)
+        {
             messages.pop();
         }
     }
@@ -5939,7 +6521,11 @@ fn handle_response(
         return;
     };
     if let Some(context) = reply_context {
-        state.chat_ui.entry(chat_id.clone()).or_default().last_context = Some(context);
+        state
+            .chat_ui
+            .entry(chat_id.clone())
+            .or_default()
+            .last_context = Some(context);
     }
     // у ошибки телеметрии нет — оставляем хотя бы время получения
     if message.meta.is_none() {
@@ -6010,10 +6596,11 @@ fn handle_chats_loaded(
                 // Уже загруженную историю не выбрасываем: список её не
                 // содержит, а повторный запрос ни к чему.
                 if let Some(existing) = state.chats.iter().find(|c| c.id == id)
-                    && existing.history_loaded {
-                        chat.messages = existing.messages.clone();
-                        chat.history_loaded = true;
-                    }
+                    && existing.history_loaded
+                {
+                    chat.messages = existing.messages.clone();
+                    chat.history_loaded = true;
+                }
                 chats.push(chat);
             }
             let known: Vec<String> = chats.iter().map(|chat| chat.id.clone()).collect();
@@ -6025,9 +6612,10 @@ fn handle_chats_loaded(
             }
             state.panes.retain(|id| known.contains(id));
             if state.panes.is_empty()
-                && let Some(first) = known.first() {
-                    state.panes.push(first.clone());
-                }
+                && let Some(first) = known.first()
+            {
+                state.panes.push(first.clone());
+            }
             if state.active_pane >= state.panes.len() {
                 state.active_pane = state.panes.len().saturating_sub(1);
             }
@@ -6050,7 +6638,11 @@ fn handle_chats_loaded(
     }
 }
 
-fn handle_history_loaded(chat_id: String, result: Result<ChatHistory, String>, state: &mut AppState) {
+fn handle_history_loaded(
+    chat_id: String,
+    result: Result<ChatHistory, String>,
+    state: &mut AppState,
+) {
     match result {
         Ok(history) => {
             if let Some(index) = state.chat_index(&chat_id) {
@@ -6127,15 +6719,18 @@ fn handle_exchange_saved(chat_id: String, result: Result<(), String>, state: &mu
                 "Обмен не сохранён в сервисе: {reason}. Ctrl+U — повторить"
             ));
             if let Some(ui) = state.chat_ui.get_mut(&chat_id)
-                && let Some(unsaved) = ui.unsaved.as_mut() {
-                    unsaved.reason = reason;
-                }
+                && let Some(unsaved) = ui.unsaved.as_mut()
+            {
+                unsaved.reason = reason;
+            }
         }
     }
 }
 
 fn handle_facts_loaded(chat_id: String, result: Result<Vec<Fact>, String>, state: &mut AppState) {
-    let Some(picker) = state.facts.as_mut() else { return };
+    let Some(picker) = state.facts.as_mut() else {
+        return;
+    };
     if picker.chat_id != chat_id {
         return;
     }
@@ -6151,7 +6746,9 @@ fn handle_facts_loaded(chat_id: String, result: Result<Vec<Fact>, String>, state
 }
 
 fn handle_fact_set(chat_id: String, result: Result<Fact, String>, state: &mut AppState) {
-    let Some(picker) = state.facts.as_mut() else { return };
+    let Some(picker) = state.facts.as_mut() else {
+        return;
+    };
     if picker.chat_id != chat_id {
         return;
     }
@@ -6170,7 +6767,9 @@ fn handle_fact_set(chat_id: String, result: Result<Fact, String>, state: &mut Ap
 }
 
 fn handle_fact_deleted(chat_id: String, result: Result<String, String>, state: &mut AppState) {
-    let Some(picker) = state.facts.as_mut() else { return };
+    let Some(picker) = state.facts.as_mut() else {
+        return;
+    };
     if picker.chat_id != chat_id {
         return;
     }
@@ -6183,8 +6782,14 @@ fn handle_fact_deleted(chat_id: String, result: Result<String, String>, state: &
     }
 }
 
-fn handle_branches_loaded(chat_id: String, result: Result<Vec<Branch>, String>, state: &mut AppState) {
-    let Some(picker) = state.branches.as_mut() else { return };
+fn handle_branches_loaded(
+    chat_id: String,
+    result: Result<Vec<Branch>, String>,
+    state: &mut AppState,
+) {
+    let Some(picker) = state.branches.as_mut() else {
+        return;
+    };
     if picker.chat_id != chat_id {
         return;
     }
@@ -6204,11 +6809,15 @@ fn handle_branch_source_messages_loaded(
     result: Result<Vec<StoredMessage>, String>,
     state: &mut AppState,
 ) {
-    let Some(picker) = state.branches.as_mut() else { return };
+    let Some(picker) = state.branches.as_mut() else {
+        return;
+    };
     if picker.chat_id != chat_id {
         return;
     }
-    let Some(creation) = picker.creating.as_mut() else { return };
+    let Some(creation) = picker.creating.as_mut() else {
+        return;
+    };
     creation.loading = false;
     match result {
         Ok(messages) => {
@@ -6228,7 +6837,9 @@ fn handle_branch_created(
     state: &mut AppState,
     tx: &mpsc::UnboundedSender<ChatEvent>,
 ) {
-    let Some(picker) = state.branches.as_mut() else { return };
+    let Some(picker) = state.branches.as_mut() else {
+        return;
+    };
     if picker.chat_id != chat_id {
         return;
     }
@@ -6267,8 +6878,14 @@ fn handle_branch_activated(
 
 // --- Память (specs/memory-layers) ---
 
-fn handle_working_memory_loaded(chat_id: String, result: Result<Vec<WorkingMemoryEntry>, String>, state: &mut AppState) {
-    let Some(picker) = state.memory.as_mut() else { return };
+fn handle_working_memory_loaded(
+    chat_id: String,
+    result: Result<Vec<WorkingMemoryEntry>, String>,
+    state: &mut AppState,
+) {
+    let Some(picker) = state.memory.as_mut() else {
+        return;
+    };
     if picker.chat_id != chat_id {
         return;
     }
@@ -6283,8 +6900,14 @@ fn handle_working_memory_loaded(chat_id: String, result: Result<Vec<WorkingMemor
     }
 }
 
-fn handle_working_memory_set(chat_id: String, result: Result<WorkingMemoryEntry, String>, state: &mut AppState) {
-    let Some(picker) = state.memory.as_mut() else { return };
+fn handle_working_memory_set(
+    chat_id: String,
+    result: Result<WorkingMemoryEntry, String>,
+    state: &mut AppState,
+) {
+    let Some(picker) = state.memory.as_mut() else {
+        return;
+    };
     if picker.chat_id != chat_id {
         return;
     }
@@ -6298,21 +6921,33 @@ fn handle_working_memory_set(chat_id: String, result: Result<WorkingMemoryEntry,
                 picker.working.sort_by(|a, b| a.key.cmp(&b.key));
             }
         }
-        Err(reason) => state.notify_error(format!("Не удалось сохранить запись рабочей памяти: {reason}")),
+        Err(reason) => state.notify_error(format!(
+            "Не удалось сохранить запись рабочей памяти: {reason}"
+        )),
     }
 }
 
-fn handle_working_memory_deleted(chat_id: String, result: Result<String, String>, state: &mut AppState) {
-    let Some(picker) = state.memory.as_mut() else { return };
+fn handle_working_memory_deleted(
+    chat_id: String,
+    result: Result<String, String>,
+    state: &mut AppState,
+) {
+    let Some(picker) = state.memory.as_mut() else {
+        return;
+    };
     if picker.chat_id != chat_id {
         return;
     }
     match result {
         Ok(key) => {
             picker.working.retain(|e| e.key != key);
-            picker.working_cursor = picker.working_cursor.min(picker.working.len().saturating_sub(1));
+            picker.working_cursor = picker
+                .working_cursor
+                .min(picker.working.len().saturating_sub(1));
         }
-        Err(reason) => state.notify_error(format!("Не удалось удалить запись рабочей памяти: {reason}")),
+        Err(reason) => state.notify_error(format!(
+            "Не удалось удалить запись рабочей памяти: {reason}"
+        )),
     }
 }
 
@@ -6324,7 +6959,10 @@ fn handle_task_finished(
 ) {
     match result {
         Ok(transferred) => {
-            state.notify(format!("Задача завершена, перенесено записей: {}", transferred.len()));
+            state.notify(format!(
+                "Задача завершена, перенесено записей: {}",
+                transferred.len()
+            ));
             if let Some(picker) = state.memory.as_ref()
                 && picker.chat_id == chat_id
             {
@@ -6336,8 +6974,14 @@ fn handle_task_finished(
     }
 }
 
-fn handle_long_term_memory_loaded(chat_id: String, result: Result<Vec<LongTermMemoryEntry>, String>, state: &mut AppState) {
-    let Some(picker) = state.memory.as_mut() else { return };
+fn handle_long_term_memory_loaded(
+    chat_id: String,
+    result: Result<Vec<LongTermMemoryEntry>, String>,
+    state: &mut AppState,
+) {
+    let Some(picker) = state.memory.as_mut() else {
+        return;
+    };
     if picker.chat_id != chat_id {
         return;
     }
@@ -6352,8 +6996,14 @@ fn handle_long_term_memory_loaded(chat_id: String, result: Result<Vec<LongTermMe
     }
 }
 
-fn handle_long_term_memory_set(chat_id: String, result: Result<LongTermMemoryEntry, String>, state: &mut AppState) {
-    let Some(picker) = state.memory.as_mut() else { return };
+fn handle_long_term_memory_set(
+    chat_id: String,
+    result: Result<LongTermMemoryEntry, String>,
+    state: &mut AppState,
+) {
+    let Some(picker) = state.memory.as_mut() else {
+        return;
+    };
     if picker.chat_id != chat_id {
         return;
     }
@@ -6366,21 +7016,33 @@ fn handle_long_term_memory_set(chat_id: String, result: Result<LongTermMemoryEnt
                 picker.long_term.push(entry);
             }
         }
-        Err(reason) => state.notify_error(format!("Не удалось сохранить запись долговременной памяти: {reason}")),
+        Err(reason) => state.notify_error(format!(
+            "Не удалось сохранить запись долговременной памяти: {reason}"
+        )),
     }
 }
 
-fn handle_long_term_memory_deleted(chat_id: String, result: Result<String, String>, state: &mut AppState) {
-    let Some(picker) = state.memory.as_mut() else { return };
+fn handle_long_term_memory_deleted(
+    chat_id: String,
+    result: Result<String, String>,
+    state: &mut AppState,
+) {
+    let Some(picker) = state.memory.as_mut() else {
+        return;
+    };
     if picker.chat_id != chat_id {
         return;
     }
     match result {
         Ok(id) => {
             picker.long_term.retain(|e| e.id != id);
-            picker.long_term_cursor = picker.long_term_cursor.min(picker.long_term.len().saturating_sub(1));
+            picker.long_term_cursor = picker
+                .long_term_cursor
+                .min(picker.long_term.len().saturating_sub(1));
         }
-        Err(reason) => state.notify_error(format!("Не удалось удалить запись долговременной памяти: {reason}")),
+        Err(reason) => state.notify_error(format!(
+            "Не удалось удалить запись долговременной памяти: {reason}"
+        )),
     }
 }
 
@@ -6389,7 +7051,9 @@ fn handle_task_loaded(
     result: Result<agentclient::TaskState, String>,
     state: &mut AppState,
 ) {
-    let Some(picker) = state.task.as_mut() else { return };
+    let Some(picker) = state.task.as_mut() else {
+        return;
+    };
     if picker.chat_id != chat_id {
         return;
     }
@@ -6412,7 +7076,9 @@ fn handle_task_transitioned(
     result: Result<agentclient::TaskState, String>,
     state: &mut AppState,
 ) {
-    let Some(picker) = state.task.as_mut() else { return };
+    let Some(picker) = state.task.as_mut() else {
+        return;
+    };
     if picker.chat_id != chat_id {
         return;
     }
@@ -6423,7 +7089,9 @@ fn handle_task_transitioned(
             picker.editor = None;
             picker.error = None;
         }
-        Err(reason) => state.notify_error(format!("Не удалось изменить состояние задачи: {reason}")),
+        Err(reason) => {
+            state.notify_error(format!("Не удалось изменить состояние задачи: {reason}"))
+        }
     }
 }
 
@@ -6530,8 +7198,9 @@ fn render_ui(f: &mut Frame, state: &mut AppState) {
         render_no_chat(f, state, main[0]);
     } else {
         let pane_count = state.panes.len() as u32;
-        let pane_constraints: Vec<Constraint> =
-            (0..pane_count).map(|_| Constraint::Ratio(1, pane_count)).collect();
+        let pane_constraints: Vec<Constraint> = (0..pane_count)
+            .map(|_| Constraint::Ratio(1, pane_count))
+            .collect();
         let pane_areas = Layout::default()
             .direction(Direction::Horizontal)
             .constraints(pane_constraints)
@@ -6631,7 +7300,10 @@ fn render_notice_log_popup(f: &mut Frame, log: &VecDeque<LoggedNotice>, view: &N
         .split(inner);
 
     let lines: Vec<Line> = if log.is_empty() {
-        vec![Line::from(Span::styled(" Уведомлений пока не было", Style::default().fg(Color::DarkGray)))]
+        vec![Line::from(Span::styled(
+            " Уведомлений пока не было",
+            Style::default().fg(Color::DarkGray),
+        ))]
     } else {
         // Прокрутки внутри абзаца нет: список начинается чуть выше курсора,
         // чтобы выбранная запись была видна и при длинных соседях.
@@ -6649,11 +7321,21 @@ fn render_notice_log_popup(f: &mut Frame, log: &VecDeque<LoggedNotice>, view: &N
                 if index == view.cursor {
                     style = style.add_modifier(Modifier::REVERSED);
                 }
-                let label = if entry.kind == NoticeKind::Error { "ошибка" } else { "" };
+                let label = if entry.kind == NoticeKind::Error {
+                    "ошибка"
+                } else {
+                    ""
+                };
                 [
                     Line::from(vec![
-                        Span::styled(format!(" {} ", entry.time), Style::default().fg(Color::DarkGray)),
-                        Span::styled(format!("{label} "), Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)),
+                        Span::styled(
+                            format!(" {} ", entry.time),
+                            Style::default().fg(Color::DarkGray),
+                        ),
+                        Span::styled(
+                            format!("{label} "),
+                            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+                        ),
                         Span::styled(entry.text.clone(), style),
                     ]),
                     Line::raw(""),
@@ -6661,10 +7343,15 @@ fn render_notice_log_popup(f: &mut Frame, log: &VecDeque<LoggedNotice>, view: &N
             })
             .collect()
     };
-    f.render_widget(Paragraph::new(Text::from(lines)).wrap(Wrap { trim: false }), rows[0]);
     f.render_widget(
-        Paragraph::new(" ↑/↓, PageUp/PageDown — запись · Ctrl+Y — копировать · Esc/Ctrl+Q — закрыть")
-            .style(Style::default().fg(Color::DarkGray)),
+        Paragraph::new(Text::from(lines)).wrap(Wrap { trim: false }),
+        rows[0],
+    );
+    f.render_widget(
+        Paragraph::new(
+            " ↑/↓, PageUp/PageDown — запись · Ctrl+Y — копировать · Esc/Ctrl+Q — закрыть",
+        )
+        .style(Style::default().fg(Color::DarkGray)),
         rows[1],
     );
 }
@@ -6672,12 +7359,17 @@ fn render_notice_log_popup(f: &mut Frame, log: &VecDeque<LoggedNotice>, view: &N
 /// Подтверждение пишущего вызова инструмента: имя, аргументы целиком.
 fn render_tool_approval_popup(f: &mut Frame, request: &ToolApprovalRequest, queued: usize) {
     let argument_lines = tool_arguments_lines(&request.call.arguments);
-    let height = (argument_lines.len() as u16 + 8).min(f.area().height.saturating_sub(2)).max(8);
+    let height = (argument_lines.len() as u16 + 8)
+        .min(f.area().height.saturating_sub(2))
+        .max(8);
     let area = centered_rect(70, height, f.area());
     f.render_widget(Clear, area);
 
     let title = if queued > 1 {
-        format!(" Подтвердите вызов инструмента (в очереди ещё {}) ", queued - 1)
+        format!(
+            " Подтвердите вызов инструмента (в очереди ещё {}) ",
+            queued - 1
+        )
     } else {
         " Подтвердите вызов инструмента ".to_string()
     };
@@ -6690,8 +7382,13 @@ fn render_tool_approval_popup(f: &mut Frame, request: &ToolApprovalRequest, queu
 
     let mut lines = vec![
         Line::from(Span::styled(
-            format!(" Чат «{}» просит выполнить {}", request.chat_title, request.call.name),
-            Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+            format!(
+                " Чат «{}» просит выполнить {}",
+                request.chat_title, request.call.name
+            ),
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
         )),
         Line::from(Span::styled(
             " Инструмент изменяет репозиторий.",
@@ -6699,17 +7396,21 @@ fn render_tool_approval_popup(f: &mut Frame, request: &ToolApprovalRequest, queu
         )),
         Line::raw(""),
     ];
-    lines.extend(
-        argument_lines
-            .into_iter()
-            .map(|line| Line::from(Span::styled(format!(" {line}"), Style::default().fg(Color::Cyan)))),
-    );
+    lines.extend(argument_lines.into_iter().map(|line| {
+        Line::from(Span::styled(
+            format!(" {line}"),
+            Style::default().fg(Color::Cyan),
+        ))
+    }));
     lines.push(Line::raw(""));
     lines.push(Line::from(Span::styled(
         " y / д / Enter — выполнить · n / н / Esc — отклонить",
         Style::default().fg(Color::DarkGray),
     )));
-    f.render_widget(Paragraph::new(Text::from(lines)).wrap(Wrap { trim: false }), inner);
+    f.render_widget(
+        Paragraph::new(Text::from(lines)).wrap(Wrap { trim: false }),
+        inner,
+    );
 }
 
 /// Подтверждение удаления чата: удаление необратимо, поэтому спрашиваем явно.
@@ -6727,7 +7428,9 @@ fn render_delete_popup(f: &mut Frame, confirm: &DeleteConfirm) {
     let lines = vec![
         Line::from(Span::styled(
             format!(" Удалить чат «{}»?", confirm.chat_title),
-            Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
         )),
         Line::from(Span::styled(
             " Чат и его история будут удалены в сервисе без возможности восстановления.",
@@ -6739,7 +7442,10 @@ fn render_delete_popup(f: &mut Frame, confirm: &DeleteConfirm) {
             Style::default().fg(Color::DarkGray),
         )),
     ];
-    f.render_widget(Paragraph::new(Text::from(lines)).wrap(Wrap { trim: false }), inner);
+    f.render_widget(
+        Paragraph::new(Text::from(lines)).wrap(Wrap { trim: false }),
+        inner,
+    );
 }
 
 fn render_pane(f: &mut Frame, state: &mut AppState, pane_idx: usize, area: Rect) {
@@ -6756,7 +7462,11 @@ fn render_pane(f: &mut Frame, state: &mut AppState, pane_idx: usize, area: Rect)
     // Строку телеметрии токенов резервируем только когда есть что показать:
     // иначе высота панели ввода будет дёргаться между кадрами без ответа.
     let mut footer = token_footer_line(&state.chats[chat_index].messages);
-    if let Some(context) = state.chat_ui.get(&chat_id).and_then(|ui| ui.last_context.as_ref()) {
+    if let Some(context) = state
+        .chat_ui
+        .get(&chat_id)
+        .and_then(|ui| ui.last_context.as_ref())
+    {
         let strategy_line = context_status_line(context);
         footer = Some(match footer {
             Some(existing) => format!("{existing} · {strategy_line}"),
@@ -6843,7 +7553,11 @@ fn context_status_line(context: &agentcore::config::ContextObservability) -> Str
     // Состояние задачи в шапке чата видно без открытия экрана Ctrl+T
     // (specs/task-state, design.md решение 9).
     if let Some(stage) = &context.task_stage {
-        let paused = if context.task_paused == Some(true) { " (на паузе)" } else { "" };
+        let paused = if context.task_paused == Some(true) {
+            " (на паузе)"
+        } else {
+            ""
+        };
         parts.push(format!("задача: {stage}{paused}"));
     }
     parts.join(" · ")
@@ -6916,7 +7630,9 @@ fn render_no_chat(f: &mut Frame, state: &AppState, area: Rect) {
         ChatsLoad::Loaded => {
             lines.push(Line::from(Span::styled(
                 " Чатов пока нет",
-                Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD),
             )));
             lines.push(Line::raw(""));
             lines.push(Line::from(Span::styled(
@@ -6925,7 +7641,10 @@ fn render_no_chat(f: &mut Frame, state: &AppState, area: Rect) {
             )));
         }
     }
-    f.render_widget(Paragraph::new(Text::from(lines)).wrap(Wrap { trim: false }), inner);
+    f.render_widget(
+        Paragraph::new(Text::from(lines)).wrap(Wrap { trim: false }),
+        inner,
+    );
 }
 
 fn render_sidebar(f: &mut Frame, state: &AppState, area: Rect) {
@@ -7052,10 +7771,7 @@ fn render_pane_title(
     let title = Paragraph::new(Line::from(vec![
         Span::styled(" agentcli ", badge_style),
         Span::raw(format!("  {}", state.chats[chat_index].title)),
-        Span::styled(
-            format!("  [{model}]"),
-            Style::default().fg(Color::DarkGray),
-        ),
+        Span::styled(format!("  [{model}]"), Style::default().fg(Color::DarkGray)),
     ]));
     f.render_widget(title, area);
 }
@@ -7107,10 +7823,12 @@ impl TokenTotals {
             reasoning: meta.reasoning_tokens,
             // Не каждый провайдер отдаёт total_tokens, поэтому при его
             // отсутствии складываем запрос и ответ сами.
-            total: meta.total_tokens.or(match (meta.prompt_tokens, meta.completion_tokens) {
-                (Some(prompt), Some(completion)) => Some(prompt + completion),
-                _ => None,
-            }),
+            total: meta
+                .total_tokens
+                .or(match (meta.prompt_tokens, meta.completion_tokens) {
+                    (Some(prompt), Some(completion)) => Some(prompt + completion),
+                    _ => None,
+                }),
         }
     }
 
@@ -7239,7 +7957,9 @@ fn render_history(
         head.push(Line::raw(""));
         head.push(Line::from(Span::styled(
             "        agent-cli — консольный AI-агент",
-            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
         )));
         head.push(Line::raw(""));
     }
@@ -7258,12 +7978,19 @@ fn render_history(
         let elapsed = pending_since
             .map(|since| format!(" {:.1} с", since.elapsed().as_secs_f64()))
             .unwrap_or_default();
-        let activity = match state.chat_ui.get(chat_id).and_then(|u| u.tool_running.as_deref()) {
+        let activity = match state
+            .chat_ui
+            .get(chat_id)
+            .and_then(|u| u.tool_running.as_deref())
+        {
             Some(tool) => format!("Выполняется инструмент {tool}..."),
             None => "Агент думает...".to_string(),
         };
         tail.push(Line::from(Span::styled(
-            format!("{} {activity}{elapsed}", SPINNER_FRAMES[state.spinner_frame]),
+            format!(
+                "{} {activity}{elapsed}",
+                SPINNER_FRAMES[state.spinner_frame]
+            ),
             Style::default().fg(Color::Magenta),
         )));
     }
@@ -7440,7 +8167,12 @@ fn render_message_lines(
         header_style = header_style.add_modifier(Modifier::REVERSED);
     }
     let mut header = vec![Span::styled(format!("● {label}"), header_style)];
-    if let Some(stats) = entry.meta.as_ref().map(meta_summary).filter(|s| !s.is_empty()) {
+    if let Some(stats) = entry
+        .meta
+        .as_ref()
+        .map(meta_summary)
+        .filter(|s| !s.is_empty())
+    {
         header.push(Span::styled(
             format!("  {stats}"),
             Style::default().fg(Color::DarkGray),
@@ -7451,7 +8183,9 @@ fn render_message_lines(
         if show_reasoning {
             lines.push(Line::from(Span::styled(
                 "  ┌ Рассуждение",
-                Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(Color::Magenta)
+                    .add_modifier(Modifier::BOLD),
             )));
             for reasoning_line in reasoning.lines() {
                 lines.push(Line::from(Span::styled(
@@ -7469,7 +8203,9 @@ fn render_message_lines(
             let count = reasoning.lines().count();
             lines.push(Line::from(Span::styled(
                 format!("  ▸ Рассуждение скрыто ({count} стр.) — Ctrl+R"),
-                Style::default().fg(Color::Magenta).add_modifier(Modifier::DIM),
+                Style::default()
+                    .fg(Color::Magenta)
+                    .add_modifier(Modifier::DIM),
             )));
         }
     }
@@ -7491,7 +8227,9 @@ fn render_message_lines(
                 "  ▸ {} — {count} стр. результата (Ctrl+G — показать)",
                 entry.tool_name.as_deref().unwrap_or("результат")
             ),
-            Style::default().fg(Color::Magenta).add_modifier(Modifier::DIM),
+            Style::default()
+                .fg(Color::Magenta)
+                .add_modifier(Modifier::DIM),
         )));
         lines.push(Line::raw(""));
         return lines;
@@ -7548,7 +8286,11 @@ fn render_input(f: &mut Frame, state: &AppState, chat_id: &str, is_active_pane: 
     let ui = state.chat_ui.get(chat_id);
     let input_text = ui.map(|u| u.input.as_str()).unwrap_or("");
     let pending = ui.map(|u| u.pending).unwrap_or(false);
-    let title = if pending { " Сообщение (ожидание ответа...) " } else { " Сообщение " };
+    let title = if pending {
+        " Сообщение (ожидание ответа...) "
+    } else {
+        " Сообщение "
+    };
     let input_widget = Paragraph::new(input_text)
         .style(Style::default().fg(Color::White))
         .block(
@@ -7566,8 +8308,16 @@ fn render_input(f: &mut Frame, state: &AppState, chat_id: &str, is_active_pane: 
 fn render_help(f: &mut Frame, state: &AppState, area: Rect) {
     let notice = state.active_notice_entry();
     let (text, color) = match notice {
-        Some(Notice { text, kind: NoticeKind::Info, .. }) => (text.as_str(), Color::Green),
-        Some(Notice { text, kind: NoticeKind::Error, .. }) => (text.as_str(), Color::Red),
+        Some(Notice {
+            text,
+            kind: NoticeKind::Info,
+            ..
+        }) => (text.as_str(), Color::Green),
+        Some(Notice {
+            text,
+            kind: NoticeKind::Error,
+            ..
+        }) => (text.as_str(), Color::Red),
         // В режиме выбора клавиши другие, и у Ctrl+Y другой смысл: подсказка
         // показывает именно их, пока режим открыт.
         None if state.focus == Focus::MessageSelect => (
@@ -7586,7 +8336,9 @@ fn render_help(f: &mut Frame, state: &AppState, area: Rect) {
     if unread > 0 && state.active_notice().is_none() && state.focus != Focus::Activity {
         spans.push(Span::styled(
             format!("Сводок активности: {unread} — Ctrl+A · "),
-            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
         ));
     }
     if notice.is_some_and(|notice| notice.kind == NoticeKind::Error) {
@@ -7716,7 +8468,9 @@ fn render_settings_sections(f: &mut Frame, editor: &SettingsEditor, area: Rect) 
                     .fg(Color::Black)
                     .bg(Color::Cyan)
                     .add_modifier(Modifier::BOLD),
-                (true, false) => Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                (true, false) => Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
                 _ => Style::default().fg(Color::White),
             };
             let marker = if selected { "▸" } else { " " };
@@ -7735,10 +8489,9 @@ fn empty_field_hint(field: FormatField, editor: &SettingsEditor) -> String {
     match field {
         FormatField::Model => match editor.provider {
             Provider::Cloud => format!("не задана — {} из конфига", editor.default_model),
-            Provider::Ollama if !editor.default_ollama_model.is_empty() => format!(
-                "не задана — {} из конфига",
-                editor.default_ollama_model
-            ),
+            Provider::Ollama if !editor.default_ollama_model.is_empty() => {
+                format!("не задана — {} из конфига", editor.default_ollama_model)
+            }
             Provider::Ollama if editor.ollama_models.is_empty() => {
                 "локальных моделей не видно — Ctrl+L обновить список".to_string()
             }
@@ -7756,30 +8509,41 @@ fn empty_field_hint(field: FormatField, editor: &SettingsEditor) -> String {
         FormatField::OllamaUrl => {
             format!("не задан — {}", agentcore::config::DEFAULT_OLLAMA_URL)
         }
-        FormatField::ContextLimit => {
-            "не задан — действует операторский лимит сервиса".to_string()
-        }
+        FormatField::ContextLimit => "не задан — действует операторский лимит сервиса".to_string(),
         FormatField::GitRepository => "не задан — укажите путь к git-репозиторию".to_string(),
-        FormatField::ActivityRoot => "не задан — укажите каталог с проектами, например ~/projects".to_string(),
+        FormatField::ActivityRoot => {
+            "не задан — укажите каталог с проектами, например ~/projects".to_string()
+        }
         FormatField::ActivitySchedule => "не задано — умолчание демона: 0 9,18 * * *".to_string(),
-        FormatField::PipelineRoot => "не задан — без него инструменты пайплайна не работают".to_string(),
+        FormatField::PipelineRoot => {
+            "не задан — без него инструменты пайплайна не работают".to_string()
+        }
         // Путь считает ядро по введённому, но ещё не сохранённому каталогу
         // поиска: подсказка совпадает с тем, куда запишет следующий ход.
         FormatField::PipelineOutput => {
-            let preview = Config { pipeline_root: non_empty(&editor.pipeline_root), ..Config::default() };
+            let preview = Config {
+                pipeline_root: non_empty(&editor.pipeline_root),
+                ..Config::default()
+            };
             match preview.effective_pipeline_output() {
                 Some(dir) => format!("не задан — {dir}"),
                 None => "не задан — сначала укажите каталог поиска".to_string(),
             }
         }
         FormatField::IndexRoot => "не задан — без него нечего собирать".to_string(),
-        FormatField::IndexDb => "не задан — без базы инструменты индекса в чатах выключены".to_string(),
+        FormatField::IndexDb => {
+            "не задан — без базы инструменты индекса в чатах выключены".to_string()
+        }
         FormatField::IndexModel => "не задана — nomic-embed-text".to_string(),
         FormatField::IndexChunkSize => "не задан — 1200".to_string(),
         FormatField::IndexOverlap => "не задано — 200".to_string(),
         FormatField::IndexMaxSection => "не задан — 1500".to_string(),
         FormatField::IndexMinSection => "не задан — 200".to_string(),
         FormatField::IndexOllamaUrl => "не задан — http://localhost:11434".to_string(),
+        FormatField::IndexTopK => "не задан — 5".to_string(),
+        FormatField::IndexCandidateTopK => "не задан — 20".to_string(),
+        FormatField::IndexSimilarityThreshold => "не задан — 0.5 для RAG".to_string(),
+        FormatField::IndexRewriteModel => "не задана — модель эмбеддингов".to_string(),
         FormatField::GitAllowedTools => "не заданы — только читающие инструменты".to_string(),
         FormatField::ToolMaxIterations => format!(
             "не задан — {}",
@@ -7825,7 +8589,9 @@ fn render_settings_fields(f: &mut Frame, editor: &SettingsEditor, area: Rect) {
                 .bg(Color::Cyan)
                 .add_modifier(Modifier::BOLD)
         } else {
-            Style::default().fg(Color::White).add_modifier(Modifier::BOLD)
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD)
         };
 
         let raw = match field {
@@ -7842,12 +8608,18 @@ fn render_settings_fields(f: &mut Frame, editor: &SettingsEditor, area: Rect) {
             },
             FormatField::SummaryKeepMessages => editor.summary_keep_messages.clone(),
             FormatField::SummaryStepMessages => editor.summary_step_messages.clone(),
-            FormatField::ContextStrategy => match ContextStrategy::parse(&editor.context_strategy) {
-                Some(strategy) => strategy.label().to_string(),
-                None => "Умолчание сервиса".to_string(),
-            },
+            FormatField::ContextStrategy => {
+                match ContextStrategy::parse(&editor.context_strategy) {
+                    Some(strategy) => strategy.label().to_string(),
+                    None => "Умолчание сервиса".to_string(),
+                }
+            }
             FormatField::ContextWindowMessages => editor.context_window_messages.clone(),
-            FormatField::Profile => match editor.profile_choices.iter().find(|p| p.id == editor.profile_id) {
+            FormatField::Profile => match editor
+                .profile_choices
+                .iter()
+                .find(|p| p.id == editor.profile_id)
+            {
                 Some(profile) => format!("{} ({})", profile.name, profile.id),
                 None if editor.profile_id.is_empty() => "Умолчание сервиса".to_string(),
                 None => editor.profile_id.clone(),
@@ -7874,20 +8646,29 @@ fn render_settings_fields(f: &mut Frame, editor: &SettingsEditor, area: Rect) {
                 "off" => "Выключен".to_string(),
                 _ => "Умолчание сервиса".to_string(),
             },
-            FormatField::GitToolsEnabled => {
-                if editor.git_tools_enabled { "Включены" } else { "Выключены" }.to_string()
+            FormatField::GitToolsEnabled => if editor.git_tools_enabled {
+                "Включены"
+            } else {
+                "Выключены"
             }
+            .to_string(),
             FormatField::GitRepository => editor.git_repository.clone(),
             FormatField::GitAllowedTools => editor.git_allowed_tools.clone(),
             FormatField::ToolMaxIterations => editor.tool_max_iterations.clone(),
-            FormatField::ActivityEnabled => {
-                if editor.activity_enabled { "Включены" } else { "Выключены" }.to_string()
+            FormatField::ActivityEnabled => if editor.activity_enabled {
+                "Включены"
+            } else {
+                "Выключены"
             }
+            .to_string(),
             FormatField::ActivityRoot => editor.activity_root.clone(),
             FormatField::ActivitySchedule => editor.activity_schedule.clone(),
-            FormatField::PipelineEnabled => {
-                if editor.pipeline_enabled { "Включены" } else { "Выключены" }.to_string()
+            FormatField::PipelineEnabled => if editor.pipeline_enabled {
+                "Включены"
+            } else {
+                "Выключены"
             }
+            .to_string(),
             FormatField::PipelineRoot => editor.pipeline_root.clone(),
             FormatField::PipelineOutput => editor.pipeline_output.clone(),
             FormatField::IndexRoot => editor.index_root.clone(),
@@ -7906,17 +8687,52 @@ fn render_settings_fields(f: &mut Frame, editor: &SettingsEditor, area: Rect) {
             FormatField::IndexMaxSection => editor.index_max_section.clone(),
             FormatField::IndexMinSection => editor.index_min_section.clone(),
             FormatField::IndexOllamaUrl => editor.index_ollama_url.clone(),
+            FormatField::IndexSearchEnabled => {
+                if editor.index_search_enabled {
+                    "Включён".to_string()
+                } else {
+                    "Выключен".to_string()
+                }
+            }
+            FormatField::IndexTopK => editor.index_top_k.clone(),
+            FormatField::IndexCandidateTopK => editor.index_candidate_top_k.clone(),
+            FormatField::IndexSimilarityThreshold => editor.index_similarity_threshold.clone(),
+            FormatField::IndexRewrite => match editor.index_rewrite.as_str() {
+                "on" => "Включён".to_string(),
+                "off" => "Выключен".to_string(),
+                _ => "Умолчание (выключен)".to_string(),
+            },
+            FormatField::IndexRewriteModel => editor.index_rewrite_model.clone(),
             FormatField::IndexBuild => {
-                let hint = if editor.index_busy { "" } else { " · Enter — построить" };
-                let status = if editor.index_status.is_empty() { "не запускалась" } else { &editor.index_status };
+                let hint = if editor.index_busy {
+                    ""
+                } else {
+                    " · Enter — построить"
+                };
+                let status = if editor.index_status.is_empty() {
+                    "не запускалась"
+                } else {
+                    &editor.index_status
+                };
                 format!("{status}{hint}")
             }
-            FormatField::ActivityChatTools => {
-                if editor.activity_chat_tools { "Включены" } else { "Выключены" }.to_string()
+            FormatField::ActivityChatTools => if editor.activity_chat_tools {
+                "Включены"
+            } else {
+                "Выключены"
             }
+            .to_string(),
             FormatField::ActivityDaemon => {
-                let hint = if editor.activity_daemon_busy { "" } else { " · Enter — запустить, Ctrl+D — остановить" };
-                let status = if editor.activity_daemon.is_empty() { "не проверен" } else { &editor.activity_daemon };
+                let hint = if editor.activity_daemon_busy {
+                    ""
+                } else {
+                    " · Enter — запустить, Ctrl+D — остановить"
+                };
+                let status = if editor.activity_daemon.is_empty() {
+                    "не проверен"
+                } else {
+                    &editor.activity_daemon
+                };
                 format!("{status}{hint}")
             }
             FormatField::Mode => {
@@ -7939,7 +8755,11 @@ fn render_settings_fields(f: &mut Frame, editor: &SettingsEditor, area: Rect) {
             FormatField::FrequencyPenalty => editor.frequency_penalty.clone(),
             FormatField::PresencePenalty => editor.presence_penalty.clone(),
         };
-        let cursor = if selected && !field.is_toggle() { "▏" } else { "" };
+        let cursor = if selected && !field.is_toggle() {
+            "▏"
+        } else {
+            ""
+        };
         let enabled = field.is_connection()
             || field.is_sampling()
             || field.is_toggle()
@@ -7957,7 +8777,10 @@ fn render_settings_fields(f: &mut Frame, editor: &SettingsEditor, area: Rect) {
             Color::White
         };
 
-        lines.push(Line::from(Span::styled(format!(" {} ", field.label()), label_style)));
+        lines.push(Line::from(Span::styled(
+            format!(" {} ", field.label()),
+            label_style,
+        )));
         lines.push(Line::from(Span::styled(
             format!("   {value}{cursor}"),
             Style::default().fg(value_color),
@@ -7982,7 +8805,9 @@ fn render_settings_fields(f: &mut Frame, editor: &SettingsEditor, area: Rect) {
     // ponytail: перенос длинных значений не учитывается, при нём выбранное поле может уйти на строку-две.
     let scroll = clamp_u16(selected_end.saturating_sub(area.height as usize));
     f.render_widget(
-        Paragraph::new(Text::from(lines)).wrap(Wrap { trim: false }).scroll((scroll, 0)),
+        Paragraph::new(Text::from(lines))
+            .wrap(Wrap { trim: false })
+            .scroll((scroll, 0)),
         area,
     );
 }
@@ -8030,7 +8855,10 @@ fn render_import_popup(f: &mut Frame, picker: &ImportPicker) {
                 };
                 let mark = if candidate.selected { "[x]" } else { "[ ]" };
                 Line::from(Span::styled(
-                    format!(" {mark} {} ({} сообщ.)", candidate.title, candidate.messages),
+                    format!(
+                        " {mark} {} ({} сообщ.)",
+                        candidate.title, candidate.messages
+                    ),
                     style,
                 ))
             })
@@ -8068,7 +8896,12 @@ fn render_facts_popup(f: &mut Frame, picker: &FactsPicker) {
     if let Some(editor) = &picker.editor {
         let rows = Layout::default()
             .direction(Direction::Vertical)
-            .constraints([Constraint::Length(1), Constraint::Length(1), Constraint::Min(0), Constraint::Length(1)])
+            .constraints([
+                Constraint::Length(1),
+                Constraint::Length(1),
+                Constraint::Min(0),
+                Constraint::Length(1),
+            ])
             .split(inner);
         let key_style = if editor.editing_key {
             Style::default().fg(Color::Black).bg(Color::Cyan)
@@ -8080,14 +8913,20 @@ fn render_facts_popup(f: &mut Frame, picker: &FactsPicker) {
         } else {
             Style::default().fg(Color::Black).bg(Color::Cyan)
         };
-        f.render_widget(Paragraph::new(Line::from(vec![
-            Span::raw(" Ключ: "),
-            Span::styled(editor.key.clone(), key_style),
-        ])), rows[0]);
-        f.render_widget(Paragraph::new(Line::from(vec![
-            Span::raw(" Значение: "),
-            Span::styled(editor.value.clone(), value_style),
-        ])), rows[1]);
+        f.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::raw(" Ключ: "),
+                Span::styled(editor.key.clone(), key_style),
+            ])),
+            rows[0],
+        );
+        f.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::raw(" Значение: "),
+                Span::styled(editor.value.clone(), value_style),
+            ])),
+            rows[1],
+        );
         f.render_widget(
             Paragraph::new(Line::from(Span::styled(
                 " Tab — переключить поле · Enter — сохранить · Esc — отмена",
@@ -8104,9 +8943,15 @@ fn render_facts_popup(f: &mut Frame, picker: &FactsPicker) {
         .split(inner);
 
     let lines: Vec<Line> = if picker.loading {
-        vec![Line::from(Span::styled(" Загрузка...", Style::default().fg(Color::DarkGray)))]
+        vec![Line::from(Span::styled(
+            " Загрузка...",
+            Style::default().fg(Color::DarkGray),
+        ))]
     } else if let Some(error) = &picker.error {
-        vec![Line::from(Span::styled(format!(" Ошибка: {error}"), Style::default().fg(Color::Red)))]
+        vec![Line::from(Span::styled(
+            format!(" Ошибка: {error}"),
+            Style::default().fg(Color::Red),
+        ))]
     } else if picker.facts.is_empty() {
         vec![Line::from(Span::styled(
             " Фактов пока нет — n добавит первый",
@@ -8119,15 +8964,24 @@ fn render_facts_popup(f: &mut Frame, picker: &FactsPicker) {
             .enumerate()
             .map(|(index, fact)| {
                 let style = if index == picker.cursor {
-                    Style::default().fg(Color::Black).bg(Color::Cyan).add_modifier(Modifier::BOLD)
+                    Style::default()
+                        .fg(Color::Black)
+                        .bg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD)
                 } else {
                     Style::default().fg(Color::White)
                 };
-                Line::from(Span::styled(format!(" {}: {}", fact.key, fact.value), style))
+                Line::from(Span::styled(
+                    format!(" {}: {}", fact.key, fact.value),
+                    style,
+                ))
             })
             .collect()
     };
-    f.render_widget(Paragraph::new(Text::from(lines)).wrap(Wrap { trim: false }), rows[0]);
+    f.render_widget(
+        Paragraph::new(Text::from(lines)).wrap(Wrap { trim: false }),
+        rows[0],
+    );
     f.render_widget(
         Paragraph::new(Line::from(Span::styled(
             " ↑/↓ — выбор · Enter — править · n — новый факт · d — удалить · Esc — закрыть",
@@ -8162,7 +9016,10 @@ fn render_branches_popup(f: &mut Frame, picker: &BranchesPicker) {
             f.render_widget(
                 Paragraph::new(Line::from(vec![
                     Span::raw(" Имя новой ветки: "),
-                    Span::styled(name.clone(), Style::default().fg(Color::Black).bg(Color::Cyan)),
+                    Span::styled(
+                        name.clone(),
+                        Style::default().fg(Color::Black).bg(Color::Cyan),
+                    ),
                 ])),
                 rows[0],
             );
@@ -8177,9 +9034,15 @@ fn render_branches_popup(f: &mut Frame, picker: &BranchesPicker) {
         }
 
         let lines: Vec<Line> = if creation.loading {
-            vec![Line::from(Span::styled(" Загрузка сообщений...", Style::default().fg(Color::DarkGray)))]
+            vec![Line::from(Span::styled(
+                " Загрузка сообщений...",
+                Style::default().fg(Color::DarkGray),
+            ))]
         } else if creation.messages.is_empty() {
-            vec![Line::from(Span::styled(" В чате нет сообщений для точки ветвления", Style::default().fg(Color::DarkGray)))]
+            vec![Line::from(Span::styled(
+                " В чате нет сообщений для точки ветвления",
+                Style::default().fg(Color::DarkGray),
+            ))]
         } else {
             creation
                 .messages
@@ -8187,16 +9050,25 @@ fn render_branches_popup(f: &mut Frame, picker: &BranchesPicker) {
                 .enumerate()
                 .map(|(index, message)| {
                     let style = if index == creation.message_cursor {
-                        Style::default().fg(Color::Black).bg(Color::Cyan).add_modifier(Modifier::BOLD)
+                        Style::default()
+                            .fg(Color::Black)
+                            .bg(Color::Cyan)
+                            .add_modifier(Modifier::BOLD)
                     } else {
                         Style::default().fg(Color::White)
                     };
                     let preview: String = message.message.content.chars().take(60).collect();
-                    Line::from(Span::styled(format!(" #{} {}", message.seq, preview), style))
+                    Line::from(Span::styled(
+                        format!(" #{} {}", message.seq, preview),
+                        style,
+                    ))
                 })
                 .collect()
         };
-        f.render_widget(Paragraph::new(Text::from(lines)).wrap(Wrap { trim: false }), rows[0]);
+        f.render_widget(
+            Paragraph::new(Text::from(lines)).wrap(Wrap { trim: false }),
+            rows[0],
+        );
         f.render_widget(
             Paragraph::new(Line::from(Span::styled(
                 " ↑/↓ — выбор сообщения · Enter — ветвить отсюда · Esc — отмена",
@@ -8213,9 +9085,15 @@ fn render_branches_popup(f: &mut Frame, picker: &BranchesPicker) {
         .split(inner);
 
     let lines: Vec<Line> = if picker.loading {
-        vec![Line::from(Span::styled(" Загрузка...", Style::default().fg(Color::DarkGray)))]
+        vec![Line::from(Span::styled(
+            " Загрузка...",
+            Style::default().fg(Color::DarkGray),
+        ))]
     } else if let Some(error) = &picker.error {
-        vec![Line::from(Span::styled(format!(" Ошибка: {error}"), Style::default().fg(Color::Red)))]
+        vec![Line::from(Span::styled(
+            format!(" Ошибка: {error}"),
+            Style::default().fg(Color::Red),
+        ))]
     } else {
         picker
             .branches
@@ -8223,7 +9101,10 @@ fn render_branches_popup(f: &mut Frame, picker: &BranchesPicker) {
             .enumerate()
             .map(|(index, branch)| {
                 let style = if index == picker.branch_cursor {
-                    Style::default().fg(Color::Black).bg(Color::Cyan).add_modifier(Modifier::BOLD)
+                    Style::default()
+                        .fg(Color::Black)
+                        .bg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD)
                 } else {
                     Style::default().fg(Color::White)
                 };
@@ -8235,7 +9116,10 @@ fn render_branches_popup(f: &mut Frame, picker: &BranchesPicker) {
             })
             .collect()
     };
-    f.render_widget(Paragraph::new(Text::from(lines)).wrap(Wrap { trim: false }), rows[0]);
+    f.render_widget(
+        Paragraph::new(Text::from(lines)).wrap(Wrap { trim: false }),
+        rows[0],
+    );
     f.render_widget(
         Paragraph::new(Line::from(Span::styled(
             " ↑/↓ — выбор · Enter — переключить · n — новая ветка · Esc — закрыть",
@@ -8263,7 +9147,12 @@ fn render_memory_popup(f: &mut Frame, picker: &MemoryPicker, short_term_tail: &[
 
     let rows = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(1), Constraint::Length(1), Constraint::Min(0), Constraint::Length(1)])
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Min(0),
+            Constraint::Length(1),
+        ])
         .split(inner);
 
     let tabs: Vec<Span> = MemorySection::ALL
@@ -8271,11 +9160,17 @@ fn render_memory_popup(f: &mut Frame, picker: &MemoryPicker, short_term_tail: &[
         .enumerate()
         .flat_map(|(index, section)| {
             let style = if index == picker.section {
-                Style::default().fg(Color::Black).bg(Color::Cyan).add_modifier(Modifier::BOLD)
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD)
             } else {
                 Style::default().fg(Color::White)
             };
-            vec![Span::styled(format!(" {} ", section.label()), style), Span::raw(" ")]
+            vec![
+                Span::styled(format!(" {} ", section.label()), style),
+                Span::raw(" "),
+            ]
         })
         .collect();
     f.render_widget(Paragraph::new(Line::from(tabs)), rows[0]);
@@ -8295,7 +9190,10 @@ fn render_memory_popup(f: &mut Frame, picker: &MemoryPicker, short_term_tail: &[
     let lines: Vec<Line> = match picker.current_section() {
         MemorySection::ShortTerm => {
             if short_term_tail.is_empty() {
-                vec![Line::from(Span::styled(" Сообщений пока нет", Style::default().fg(Color::DarkGray)))]
+                vec![Line::from(Span::styled(
+                    " Сообщений пока нет",
+                    Style::default().fg(Color::DarkGray),
+                ))]
             } else {
                 short_term_tail
                     .iter()
@@ -8313,9 +9211,15 @@ fn render_memory_popup(f: &mut Frame, picker: &MemoryPicker, short_term_tail: &[
         }
         MemorySection::Working => {
             if picker.working_loading {
-                vec![Line::from(Span::styled(" Загрузка...", Style::default().fg(Color::DarkGray)))]
+                vec![Line::from(Span::styled(
+                    " Загрузка...",
+                    Style::default().fg(Color::DarkGray),
+                ))]
             } else if let Some(error) = &picker.working_error {
-                vec![Line::from(Span::styled(format!(" Ошибка: {error}"), Style::default().fg(Color::Red)))]
+                vec![Line::from(Span::styled(
+                    format!(" Ошибка: {error}"),
+                    Style::default().fg(Color::Red),
+                ))]
             } else if picker.working.is_empty() {
                 vec![Line::from(Span::styled(
                     " Рабочей памяти пока нет — n добавит первую запись",
@@ -8328,7 +9232,10 @@ fn render_memory_popup(f: &mut Frame, picker: &MemoryPicker, short_term_tail: &[
                     .enumerate()
                     .map(|(index, entry)| {
                         let style = if index == picker.working_cursor {
-                            Style::default().fg(Color::Black).bg(Color::Cyan).add_modifier(Modifier::BOLD)
+                            Style::default()
+                                .fg(Color::Black)
+                                .bg(Color::Cyan)
+                                .add_modifier(Modifier::BOLD)
                         } else {
                             Style::default().fg(Color::White)
                         };
@@ -8342,9 +9249,15 @@ fn render_memory_popup(f: &mut Frame, picker: &MemoryPicker, short_term_tail: &[
         }
         MemorySection::LongTerm => {
             if picker.long_term_loading {
-                vec![Line::from(Span::styled(" Загрузка...", Style::default().fg(Color::DarkGray)))]
+                vec![Line::from(Span::styled(
+                    " Загрузка...",
+                    Style::default().fg(Color::DarkGray),
+                ))]
             } else if let Some(error) = &picker.long_term_error {
-                vec![Line::from(Span::styled(format!(" Ошибка: {error}"), Style::default().fg(Color::Red)))]
+                vec![Line::from(Span::styled(
+                    format!(" Ошибка: {error}"),
+                    Style::default().fg(Color::Red),
+                ))]
             } else if picker.long_term.is_empty() {
                 vec![Line::from(Span::styled(
                     " Долговременной памяти пока нет — n добавит первую запись",
@@ -8357,7 +9270,10 @@ fn render_memory_popup(f: &mut Frame, picker: &MemoryPicker, short_term_tail: &[
                     .enumerate()
                     .map(|(index, entry)| {
                         let style = if index == picker.long_term_cursor {
-                            Style::default().fg(Color::Black).bg(Color::Cyan).add_modifier(Modifier::BOLD)
+                            Style::default()
+                                .fg(Color::Black)
+                                .bg(Color::Cyan)
+                                .add_modifier(Modifier::BOLD)
                         } else {
                             Style::default().fg(Color::White)
                         };
@@ -8375,14 +9291,27 @@ fn render_memory_popup(f: &mut Frame, picker: &MemoryPicker, short_term_tail: &[
             }
         }
     };
-    f.render_widget(Paragraph::new(Text::from(lines)).wrap(Wrap { trim: false }), rows[2]);
+    f.render_widget(
+        Paragraph::new(Text::from(lines)).wrap(Wrap { trim: false }),
+        rows[2],
+    );
 
     let hint = match picker.current_section() {
         MemorySection::ShortTerm => " ←/→ — раздел · Esc — закрыть",
-        MemorySection::Working => " ←/→ — раздел · ↑/↓ — выбор · Enter — править · n — новая · d — удалить · t — завершить задачу · Esc — закрыть",
-        MemorySection::LongTerm => " ←/→ — раздел · ↑/↓ — выбор · Enter — править · n — новая · d — удалить · Esc — закрыть",
+        MemorySection::Working => {
+            " ←/→ — раздел · ↑/↓ — выбор · Enter — править · n — новая · d — удалить · t — завершить задачу · Esc — закрыть"
+        }
+        MemorySection::LongTerm => {
+            " ←/→ — раздел · ↑/↓ — выбор · Enter — править · n — новая · d — удалить · Esc — закрыть"
+        }
     };
-    f.render_widget(Paragraph::new(Line::from(Span::styled(hint, Style::default().fg(Color::DarkGray)))), rows[3]);
+    f.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            hint,
+            Style::default().fg(Color::DarkGray),
+        ))),
+        rows[3],
+    );
 }
 
 /// Экран состояния задачи чата: этап, шаг, ожидаемое действие, пауза,
@@ -8433,7 +9362,10 @@ fn render_activity_popup(f: &mut Frame, activity: &mut ActivityState) {
             }
         }
         None if !activity.loaded => {
-            lines.push(Line::from(Span::styled(" Загрузка...", Style::default().fg(Color::DarkGray))));
+            lines.push(Line::from(Span::styled(
+                " Загрузка...",
+                Style::default().fg(Color::DarkGray),
+            )));
         }
         None => lines.push(Line::from(Span::styled(
             " Непрочитанных сводок нет. b — собрать сводку сейчас",
@@ -8446,7 +9378,9 @@ fn render_activity_popup(f: &mut Frame, activity: &mut ActivityState) {
     activity.max_scroll = clamp_u16(total.saturating_sub(rows[0].height as usize));
     activity.scroll = activity.scroll.min(activity.max_scroll);
     f.render_widget(
-        Paragraph::new(text).wrap(Wrap { trim: false }).scroll((activity.scroll, 0)),
+        Paragraph::new(text)
+            .wrap(Wrap { trim: false })
+            .scroll((activity.scroll, 0)),
         rows[0],
     );
     f.render_widget(
@@ -8471,15 +9405,26 @@ fn render_task_popup(f: &mut Frame, picker: &TaskPicker) {
     f.render_widget(block, area);
 
     if let Some(editor) = &picker.editor {
-        let field_label = if editor.editing_expected_action { "Ожидаемое действие" } else { "Шаг" };
+        let field_label = if editor.editing_expected_action {
+            "Ожидаемое действие"
+        } else {
+            "Шаг"
+        };
         let rows = Layout::default()
             .direction(Direction::Vertical)
-            .constraints([Constraint::Length(1), Constraint::Min(0), Constraint::Length(1)])
+            .constraints([
+                Constraint::Length(1),
+                Constraint::Min(0),
+                Constraint::Length(1),
+            ])
             .split(inner);
         f.render_widget(
             Paragraph::new(Line::from(vec![
                 Span::raw(format!(" {field_label}: ")),
-                Span::styled(editor.value.clone(), Style::default().fg(Color::Black).bg(Color::Cyan)),
+                Span::styled(
+                    editor.value.clone(),
+                    Style::default().fg(Color::Black).bg(Color::Cyan),
+                ),
             ]))
             .wrap(Wrap { trim: false }),
             rows[0],
@@ -8501,25 +9446,52 @@ fn render_task_popup(f: &mut Frame, picker: &TaskPicker) {
 
     let mut lines: Vec<Line> = Vec::new();
     if picker.loading {
-        lines.push(Line::from(Span::styled(" Загрузка...", Style::default().fg(Color::DarkGray))));
+        lines.push(Line::from(Span::styled(
+            " Загрузка...",
+            Style::default().fg(Color::DarkGray),
+        )));
     } else if let Some(error) = &picker.error {
-        lines.push(Line::from(Span::styled(format!(" Ошибка: {error}"), Style::default().fg(Color::Red))));
+        lines.push(Line::from(Span::styled(
+            format!(" Ошибка: {error}"),
+            Style::default().fg(Color::Red),
+        )));
     } else if let Some(task) = &picker.state {
         lines.push(Line::from(Span::styled(
-            format!(" Этап: {}{}", task.stage, if task.paused { " (на паузе)" } else { "" }),
-            Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+            format!(
+                " Этап: {}{}",
+                task.stage,
+                if task.paused {
+                    " (на паузе)"
+                } else {
+                    ""
+                }
+            ),
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
         )));
         lines.push(Line::from(format!(
             " Шаг: {}",
-            if task.step.is_empty() { "(не задан)" } else { &task.step }
+            if task.step.is_empty() {
+                "(не задан)"
+            } else {
+                &task.step
+            }
         )));
         lines.push(Line::from(format!(
             " Ожидаемое действие: {}",
-            if task.expected_action.is_empty() { "(не задано)" } else { &task.expected_action }
+            if task.expected_action.is_empty() {
+                "(не задано)"
+            } else {
+                &task.expected_action
+            }
         )));
         if task.paused && !task.resume_brief.is_empty() {
             lines.push(Line::raw(""));
-            lines.push(Line::from(Span::styled(" Бриф возобновления:", Style::default().fg(Color::DarkGray))));
+            lines.push(Line::from(Span::styled(
+                " Бриф возобновления:",
+                Style::default().fg(Color::DarkGray),
+            )));
             for line in task.resume_brief.lines() {
                 lines.push(Line::from(format!(" {line}")));
             }
@@ -8535,19 +9507,31 @@ fn render_task_popup(f: &mut Frame, picker: &TaskPicker) {
         )));
         if !task.transitions.is_empty() {
             lines.push(Line::raw(""));
-            lines.push(Line::from(Span::styled(" Последние переходы:", Style::default().fg(Color::DarkGray))));
+            lines.push(Line::from(Span::styled(
+                " Последние переходы:",
+                Style::default().fg(Color::DarkGray),
+            )));
             for transition in task.transitions.iter().rev().take(5) {
                 lines.push(Line::from(Span::styled(
-                    format!(" {} → {} ({})", transition.from_stage, transition.to_stage, transition.source),
+                    format!(
+                        " {} → {} ({})",
+                        transition.from_stage, transition.to_stage, transition.source
+                    ),
                     Style::default().fg(Color::DarkGray),
                 )));
             }
         }
     } else {
-        lines.push(Line::from(Span::styled(" Состояние задачи недоступно", Style::default().fg(Color::DarkGray))));
+        lines.push(Line::from(Span::styled(
+            " Состояние задачи недоступно",
+            Style::default().fg(Color::DarkGray),
+        )));
     }
 
-    f.render_widget(Paragraph::new(Text::from(lines)).wrap(Wrap { trim: false }), rows[0]);
+    f.render_widget(
+        Paragraph::new(Text::from(lines)).wrap(Wrap { trim: false }),
+        rows[0],
+    );
     f.render_widget(
         Paragraph::new(Line::from(Span::styled(
             " ←/→ — переход · Enter — применить · s — шаг · a — ожидаемое действие · p — пауза · r — возобновить · Esc — закрыть",
@@ -8561,7 +9545,10 @@ fn render_memory_editor(f: &mut Frame, editor: &MemoryEditor, area: Rect) {
     let field_count = if editor.for_long_term { 3 } else { 2 };
     let mut constraints = vec![Constraint::Length(1); field_count];
     constraints.push(Constraint::Min(0));
-    let rows = Layout::default().direction(Direction::Vertical).constraints(constraints).split(area);
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints(constraints)
+        .split(area);
 
     let field_style = |index: usize| {
         if editor.field == index {
@@ -8658,14 +9645,21 @@ mod tests {
     fn loaded_list_opens_first_chat_in_service_order() {
         let mut state = test_state();
         handle_chats_loaded(
-            Ok(vec![summary("chat-1", "Первый", 0), summary("chat-2", "Второй", 4)]),
+            Ok(vec![
+                summary("chat-1", "Первый", 0),
+                summary("chat-2", "Второй", 4),
+            ]),
             &mut state,
             &channel(),
         );
 
         assert!(matches!(state.chats_load, ChatsLoad::Loaded));
         assert_eq!(
-            state.chats.iter().map(|c| c.id.as_str()).collect::<Vec<_>>(),
+            state
+                .chats
+                .iter()
+                .map(|c| c.id.as_str())
+                .collect::<Vec<_>>(),
             vec!["chat-1", "chat-2"]
         );
         assert_eq!(state.panes, vec!["chat-1".to_string()]);
@@ -8726,11 +9720,20 @@ mod tests {
         let mut editor = SettingsEditor::from_chat(&session, &Config::default(), &[], &[], &[]);
         assert_eq!(editor.build_context_strategy(), None);
         editor.cycle_context_strategy(1);
-        assert_eq!(editor.build_context_strategy(), Some(ContextStrategy::Summary));
+        assert_eq!(
+            editor.build_context_strategy(),
+            Some(ContextStrategy::Summary)
+        );
         editor.cycle_context_strategy(1);
-        assert_eq!(editor.build_context_strategy(), Some(ContextStrategy::SlidingWindow));
+        assert_eq!(
+            editor.build_context_strategy(),
+            Some(ContextStrategy::SlidingWindow)
+        );
         editor.cycle_context_strategy(-1);
-        assert_eq!(editor.build_context_strategy(), Some(ContextStrategy::Summary));
+        assert_eq!(
+            editor.build_context_strategy(),
+            Some(ContextStrategy::Summary)
+        );
     }
 
     #[test]
@@ -8745,17 +9748,30 @@ mod tests {
             history_loaded: true,
         };
         let profiles = vec![
-            ProfileChoice { id: "teacher".to_string(), name: "Преподаватель".to_string(), built_in: true },
-            ProfileChoice { id: "reviewer".to_string(), name: "Ревьюер".to_string(), built_in: true },
+            ProfileChoice {
+                id: "teacher".to_string(),
+                name: "Преподаватель".to_string(),
+                built_in: true,
+            },
+            ProfileChoice {
+                id: "reviewer".to_string(),
+                name: "Ревьюер".to_string(),
+                built_in: true,
+            },
         ];
-        let mut editor = SettingsEditor::from_chat(&session, &Config::default(), &[], &[], &profiles);
+        let mut editor =
+            SettingsEditor::from_chat(&session, &Config::default(), &[], &[], &profiles);
         assert_eq!(editor.build_profile_id(), None);
         editor.cycle_profile(1);
         assert_eq!(editor.build_profile_id(), Some("teacher".to_string()));
         editor.cycle_profile(1);
         assert_eq!(editor.build_profile_id(), Some("reviewer".to_string()));
         editor.cycle_profile(1);
-        assert_eq!(editor.build_profile_id(), None, "перебор возвращается к «без профиля»");
+        assert_eq!(
+            editor.build_profile_id(),
+            None,
+            "перебор возвращается к «без профиля»"
+        );
         editor.cycle_profile(-1);
         assert_eq!(editor.build_profile_id(), Some("reviewer".to_string()));
     }
@@ -8773,12 +9789,18 @@ mod tests {
         };
         let mut editor = SettingsEditor::from_chat(&session, &Config::default(), &[], &[], &[]);
         editor.profile_id = "own-profile-id".to_string();
-        assert_eq!(editor.build_profile_id(), Some("own-profile-id".to_string()));
+        assert_eq!(
+            editor.build_profile_id(),
+            Some("own-profile-id".to_string())
+        );
     }
 
     #[test]
     fn existing_chat_profile_is_loaded_into_editor() {
-        let settings = ChatSettings { profile_id: Some("psychologist".to_string()), ..ChatSettings::default() };
+        let settings = ChatSettings {
+            profile_id: Some("psychologist".to_string()),
+            ..ChatSettings::default()
+        };
         let session = ChatSession {
             id: "chat-1".to_string(),
             title: "Чат".to_string(),
@@ -8809,7 +9831,11 @@ mod tests {
             .position(|s| *s == SettingsSection::Memory)
             .expect("раздел «Память» существует");
         editor.context_strategy = ContextStrategy::SlidingWindow.as_str().to_string();
-        assert!(!editor.visible_fields().contains(&FormatField::MemoryRouterEnabled));
+        assert!(
+            !editor
+                .visible_fields()
+                .contains(&FormatField::MemoryRouterEnabled)
+        );
         editor.memory_layers_enabled = "on".to_string();
         let fields = editor.visible_fields();
         assert!(fields.contains(&FormatField::MemoryRouterEnabled));
@@ -8854,9 +9880,17 @@ mod tests {
             .iter()
             .position(|s| *s == SettingsSection::Memory)
             .expect("раздел «Память» существует");
-        assert!(!editor.visible_fields().contains(&FormatField::TaskStateAutoEnabled));
+        assert!(
+            !editor
+                .visible_fields()
+                .contains(&FormatField::TaskStateAutoEnabled)
+        );
         editor.task_state_enabled = "on".to_string();
-        assert!(editor.visible_fields().contains(&FormatField::TaskStateAutoEnabled));
+        assert!(
+            editor
+                .visible_fields()
+                .contains(&FormatField::TaskStateAutoEnabled)
+        );
     }
 
     #[test]
@@ -8912,7 +9946,10 @@ mod tests {
     #[test]
     fn allowed_next_stages_seeds_task_picker_cursor_options() {
         let picker = TaskPicker::new("chat-1", "Чат");
-        assert!(picker.allowed_next_stages().is_empty(), "состояние ещё не загружено");
+        assert!(
+            picker.allowed_next_stages().is_empty(),
+            "состояние ещё не загружено"
+        );
     }
 
     fn task_picker_at(stage: &str) -> TaskPicker {
@@ -8934,7 +9971,10 @@ mod tests {
     /// (fix-task-state-clarification-stall, решение 5).
     #[test]
     fn task_picker_offers_transitions_for_clarification_stage() {
-        assert_eq!(task_picker_at("planning").allowed_next_stages(), vec!["clarification"]);
+        assert_eq!(
+            task_picker_at("planning").allowed_next_stages(),
+            vec!["clarification"]
+        );
         let mut picker = task_picker_at("clarification");
         assert_eq!(picker.allowed_next_stages(), vec!["execution", "planning"]);
 
@@ -8961,7 +10001,10 @@ mod tests {
         handle_chats_loaded(Err("сервис не ответил".to_string()), &mut state, &channel());
 
         let reason = state.blocked_reason().expect("причина недоступности");
-        assert!(reason.contains("сервис не ответил"), "причина потеряна: {reason}");
+        assert!(
+            reason.contains("сервис не ответил"),
+            "причина потеряна: {reason}"
+        );
         assert!(
             reason.contains(&state.config.effective_server_url()),
             "адрес сервиса не назван: {reason}"
@@ -8975,7 +10018,10 @@ mod tests {
     #[test]
     fn loading_and_failed_states_block_actions() {
         let mut state = test_state();
-        assert!(state.blocked_reason().is_some(), "во время загрузки писать нельзя");
+        assert!(
+            state.blocked_reason().is_some(),
+            "во время загрузки писать нельзя"
+        );
 
         state.chats_load = ChatsLoad::Failed("сервис недоступен".to_string());
         assert_eq!(
@@ -8991,8 +10037,16 @@ mod tests {
     #[tokio::test]
     async fn loaded_history_fills_chat_and_unblocks_input() {
         let mut state = test_state();
-        handle_chats_loaded(Ok(vec![summary("chat-1", "Чат", 2)]), &mut state, &channel());
-        state.chat_ui.entry("chat-1".to_string()).or_default().history_loading = true;
+        handle_chats_loaded(
+            Ok(vec![summary("chat-1", "Чат", 2)]),
+            &mut state,
+            &channel(),
+        );
+        state
+            .chat_ui
+            .entry("chat-1".to_string())
+            .or_default()
+            .history_loading = true;
 
         handle_history_loaded(
             "chat-1".to_string(),
@@ -9025,12 +10079,23 @@ mod tests {
     #[tokio::test]
     async fn failed_history_is_reported_and_leaves_chat_unloaded() {
         let mut state = test_state();
-        handle_chats_loaded(Ok(vec![summary("chat-1", "Чат", 2)]), &mut state, &channel());
+        handle_chats_loaded(
+            Ok(vec![summary("chat-1", "Чат", 2)]),
+            &mut state,
+            &channel(),
+        );
 
-        handle_history_loaded("chat-1".to_string(), Err("нет связи".to_string()), &mut state);
+        handle_history_loaded(
+            "chat-1".to_string(),
+            Err("нет связи".to_string()),
+            &mut state,
+        );
 
         assert!(!state.chats[0].history_loaded);
-        assert_eq!(state.chat_ui["chat-1"].history_error.as_deref(), Some("нет связи"));
+        assert_eq!(
+            state.chat_ui["chat-1"].history_error.as_deref(),
+            Some("нет связи")
+        );
     }
 
     // --- 4.5 Чат создаёт сервис ---
@@ -9053,19 +10118,35 @@ mod tests {
     #[test]
     fn rejected_create_leaves_list_untouched() {
         let mut state = test_state();
-        handle_chats_loaded(Ok(vec![summary("chat-1", "Первый", 0)]), &mut state, &channel());
+        handle_chats_loaded(
+            Ok(vec![summary("chat-1", "Первый", 0)]),
+            &mut state,
+            &channel(),
+        );
         state.creating_chat = true;
 
-        handle_chat_created(Err("400 invalid_request (request_id: req-1)".to_string()), &mut state);
+        handle_chat_created(
+            Err("400 invalid_request (request_id: req-1)".to_string()),
+            &mut state,
+        );
 
         assert_eq!(state.chats.len(), 1, "список не должен меняться");
-        assert!(state.active_notice().expect("уведомление").contains("req-1"));
+        assert!(
+            state
+                .active_notice()
+                .expect("уведомление")
+                .contains("req-1")
+        );
     }
 
     #[test]
     fn rejected_update_keeps_confirmed_settings() {
         let mut state = test_state();
-        handle_chats_loaded(Ok(vec![summary("chat-1", "Первый", 0)]), &mut state, &channel());
+        handle_chats_loaded(
+            Ok(vec![summary("chat-1", "Первый", 0)]),
+            &mut state,
+            &channel(),
+        );
 
         handle_chat_updated(
             "chat-1".to_string(),
@@ -9074,13 +10155,22 @@ mod tests {
         );
 
         assert_eq!(state.chats[0].title, "Первый");
-        assert!(state.active_notice().expect("уведомление").contains("req-2"));
+        assert!(
+            state
+                .active_notice()
+                .expect("уведомление")
+                .contains("req-2")
+        );
     }
 
     #[test]
     fn confirmed_update_applies_service_values() {
         let mut state = test_state();
-        handle_chats_loaded(Ok(vec![summary("chat-1", "Первый", 0)]), &mut state, &channel());
+        handle_chats_loaded(
+            Ok(vec![summary("chat-1", "Первый", 0)]),
+            &mut state,
+            &channel(),
+        );
 
         handle_chat_updated(
             "chat-1".to_string(),
@@ -9096,7 +10186,11 @@ mod tests {
     #[test]
     fn confirmed_delete_frees_pane_and_allows_empty_list() {
         let mut state = test_state();
-        handle_chats_loaded(Ok(vec![summary("chat-1", "Первый", 0)]), &mut state, &channel());
+        handle_chats_loaded(
+            Ok(vec![summary("chat-1", "Первый", 0)]),
+            &mut state,
+            &channel(),
+        );
 
         handle_chat_deleted("chat-1".to_string(), Ok(()), &mut state);
 
@@ -9108,9 +10202,17 @@ mod tests {
     #[test]
     fn rejected_delete_keeps_chat_in_list() {
         let mut state = test_state();
-        handle_chats_loaded(Ok(vec![summary("chat-1", "Первый", 0)]), &mut state, &channel());
+        handle_chats_loaded(
+            Ok(vec![summary("chat-1", "Первый", 0)]),
+            &mut state,
+            &channel(),
+        );
 
-        handle_chat_deleted("chat-1".to_string(), Err("нет связи".to_string()), &mut state);
+        handle_chat_deleted(
+            "chat-1".to_string(),
+            Err("нет связи".to_string()),
+            &mut state,
+        );
 
         assert_eq!(state.chats.len(), 1);
         assert_eq!(state.panes, vec!["chat-1".to_string()]);
@@ -9121,8 +10223,16 @@ mod tests {
     #[test]
     fn failed_append_keeps_exchange_for_retry() {
         let mut state = test_state();
-        handle_chats_loaded(Ok(vec![summary("chat-1", "Первый", 0)]), &mut state, &channel());
-        state.chat_ui.entry("chat-1".to_string()).or_default().unsaved = Some(UnsavedExchange {
+        handle_chats_loaded(
+            Ok(vec![summary("chat-1", "Первый", 0)]),
+            &mut state,
+            &channel(),
+        );
+        state
+            .chat_ui
+            .entry("chat-1".to_string())
+            .or_default()
+            .unsaved = Some(UnsavedExchange {
             reason: "ожидание".to_string(),
             messages: vec![Message::user("вопрос"), Message::assistant("ответ")],
         });
@@ -9133,17 +10243,37 @@ mod tests {
             &mut state,
         );
 
-        let unsaved = state.chat_ui["chat-1"].unsaved.as_ref().expect("обмен сохранён для повтора");
+        let unsaved = state.chat_ui["chat-1"]
+            .unsaved
+            .as_ref()
+            .expect("обмен сохранён для повтора");
         assert_eq!(unsaved.messages.len(), 2, "реплики не должны теряться");
-        assert!(unsaved.reason.contains("req-3"), "причина без request_id: {}", unsaved.reason);
-        assert!(state.active_notice().expect("уведомление").contains("Ctrl+U"));
+        assert!(
+            unsaved.reason.contains("req-3"),
+            "причина без request_id: {}",
+            unsaved.reason
+        );
+        assert!(
+            state
+                .active_notice()
+                .expect("уведомление")
+                .contains("Ctrl+U")
+        );
     }
 
     #[test]
     fn successful_append_clears_unsaved_mark() {
         let mut state = test_state();
-        handle_chats_loaded(Ok(vec![summary("chat-1", "Первый", 0)]), &mut state, &channel());
-        state.chat_ui.entry("chat-1".to_string()).or_default().unsaved = Some(UnsavedExchange {
+        handle_chats_loaded(
+            Ok(vec![summary("chat-1", "Первый", 0)]),
+            &mut state,
+            &channel(),
+        );
+        state
+            .chat_ui
+            .entry("chat-1".to_string())
+            .or_default()
+            .unsaved = Some(UnsavedExchange {
             reason: "ожидание".to_string(),
             messages: vec![Message::user("вопрос")],
         });
@@ -9159,7 +10289,10 @@ mod tests {
     async fn import_uses_loaded_history_and_keeps_source_timestamp() {
         let mut state = test_state();
         handle_chats_loaded(
-            Ok(vec![summary("target", "Цель", 0), summary("source", "Источник", 1)]),
+            Ok(vec![
+                summary("target", "Цель", 0),
+                summary("source", "Источник", 1),
+            ]),
             &mut state,
             &channel(),
         );
@@ -9182,7 +10315,11 @@ mod tests {
         import_context(&mut state, "target", &["source".to_string()], &channel());
 
         let target = &state.chats[state.chat_index("target").expect("целевой чат")];
-        assert_eq!(target.messages.len(), 1, "контекст переносится одной репликой");
+        assert_eq!(
+            target.messages.len(),
+            1,
+            "контекст переносится одной репликой"
+        );
         assert!(target.messages[0].content.contains("важный контекст"));
         assert_eq!(
             state.chats[state.chat_index("source").expect("чат-источник")].updated_at,
@@ -9196,7 +10333,10 @@ mod tests {
     async fn import_is_refused_while_source_history_is_missing() {
         let mut state = test_state();
         handle_chats_loaded(
-            Ok(vec![summary("target", "Цель", 0), summary("source", "Источник", 3)]),
+            Ok(vec![
+                summary("target", "Цель", 0),
+                summary("source", "Источник", 3),
+            ]),
             &mut state,
             &channel(),
         );
@@ -9204,11 +10344,16 @@ mod tests {
         import_context(&mut state, "target", &["source".to_string()], &channel());
 
         let target = &state.chats[state.chat_index("target").expect("целевой чат")];
-        assert!(target.messages.is_empty(), "без истории источника перенос не выполняется");
-        assert!(state
-            .active_notice()
-            .expect("уведомление")
-            .contains("не загружена"));
+        assert!(
+            target.messages.is_empty(),
+            "без истории источника перенос не выполняется"
+        );
+        assert!(
+            state
+                .active_notice()
+                .expect("уведомление")
+                .contains("не загружена")
+        );
     }
 
     // --- Список перезагружается, не теряя загруженную историю ---
@@ -9217,7 +10362,11 @@ mod tests {
     #[tokio::test]
     async fn reload_keeps_already_loaded_history() {
         let mut state = test_state();
-        handle_chats_loaded(Ok(vec![summary("chat-1", "Первый", 1)]), &mut state, &channel());
+        handle_chats_loaded(
+            Ok(vec![summary("chat-1", "Первый", 1)]),
+            &mut state,
+            &channel(),
+        );
         handle_history_loaded(
             "chat-1".to_string(),
             Ok(ChatHistory {
@@ -9232,9 +10381,16 @@ mod tests {
             &mut state,
         );
 
-        handle_chats_loaded(Ok(vec![summary("chat-1", "Первый", 1)]), &mut state, &channel());
+        handle_chats_loaded(
+            Ok(vec![summary("chat-1", "Первый", 1)]),
+            &mut state,
+            &channel(),
+        );
 
-        assert!(state.chats[0].history_loaded, "повторный запрос истории не нужен");
+        assert!(
+            state.chats[0].history_loaded,
+            "повторный запрос истории не нужен"
+        );
         assert_eq!(state.chats[0].messages.len(), 1);
     }
 
@@ -9302,7 +10458,10 @@ mod tests {
 
         let summary = token_counters(&totals).expect("есть телеметрия");
 
-        assert_eq!(summary, "↑ запрос 10 · ↓ ответ 5 · рассужд. 2 · всего 15 ток.");
+        assert_eq!(
+            summary,
+            "↑ запрос 10 · ↓ ответ 5 · рассужд. 2 · всего 15 ток."
+        );
     }
 
     #[test]
@@ -9344,8 +10503,14 @@ mod tests {
 
         assert!(line.contains("отправлено 6"));
         assert!(line.contains("отброшено 14"));
-        assert!(!line.contains("факт"), "поля стратегии facts не должны выводиться: {line}");
-        assert!(!line.contains("ветка"), "поле стратегии branching не должно выводиться: {line}");
+        assert!(
+            !line.contains("факт"),
+            "поля стратегии facts не должны выводиться: {line}"
+        );
+        assert!(
+            !line.contains("ветка"),
+            "поле стратегии branching не должно выводиться: {line}"
+        );
     }
 
     #[test]
@@ -9380,8 +10545,18 @@ mod tests {
     fn memory_picker_cycles_sections_and_moves_cursor_within_section() {
         let mut picker = MemoryPicker::new("chat-1", "Чат");
         picker.working = vec![
-            WorkingMemoryEntry { key: "a".to_string(), value: "1".to_string(), source: "manual".to_string(), updated_at: 1 },
-            WorkingMemoryEntry { key: "b".to_string(), value: "2".to_string(), source: "manual".to_string(), updated_at: 2 },
+            WorkingMemoryEntry {
+                key: "a".to_string(),
+                value: "1".to_string(),
+                source: "manual".to_string(),
+                updated_at: 1,
+            },
+            WorkingMemoryEntry {
+                key: "b".to_string(),
+                value: "2".to_string(),
+                source: "manual".to_string(),
+                updated_at: 2,
+            },
         ];
         assert!(matches!(picker.current_section(), MemorySection::ShortTerm));
         picker.cycle_section(1);
@@ -9392,7 +10567,10 @@ mod tests {
         picker.cycle_section(1);
         assert!(matches!(picker.current_section(), MemorySection::LongTerm));
         picker.cycle_section(1);
-        assert!(matches!(picker.current_section(), MemorySection::ShortTerm), "цикл разделов замкнут");
+        assert!(
+            matches!(picker.current_section(), MemorySection::ShortTerm),
+            "цикл разделов замкнут"
+        );
     }
 
     // --- 8.3 Экран фактов ---
@@ -9428,7 +10606,11 @@ mod tests {
         let mut state = test_state();
         state.facts = Some(FactsPicker::new("chat-1", "Чат"));
 
-        handle_facts_loaded("chat-1".to_string(), Err("сервис недоступен".to_string()), &mut state);
+        handle_facts_loaded(
+            "chat-1".to_string(),
+            Err("сервис недоступен".to_string()),
+            &mut state,
+        );
 
         let picker = state.facts.expect("экран фактов остаётся открытым");
         assert_eq!(picker.error.as_deref(), Some("сервис недоступен"));
@@ -9439,15 +10621,26 @@ mod tests {
         let mut state = test_state();
         let mut picker = FactsPicker::new("chat-1", "Чат");
         picker.facts = vec![fact("budget", "200000")];
-        picker.editor = Some(FactEditor { key: "budget".to_string(), value: "300000".to_string(), editing_key: false });
+        picker.editor = Some(FactEditor {
+            key: "budget".to_string(),
+            value: "300000".to_string(),
+            editing_key: false,
+        });
         state.facts = Some(picker);
 
-        handle_fact_set("chat-1".to_string(), Ok(fact("budget", "300000")), &mut state);
+        handle_fact_set(
+            "chat-1".to_string(),
+            Ok(fact("budget", "300000")),
+            &mut state,
+        );
 
         let picker = state.facts.expect("экран фактов");
         assert_eq!(picker.facts.len(), 1, "правка не создаёт вторую запись");
         assert_eq!(picker.facts[0].value, "300000");
-        assert!(picker.editor.is_none(), "редактор закрывается после сохранения");
+        assert!(
+            picker.editor.is_none(),
+            "редактор закрывается после сохранения"
+        );
     }
 
     #[test]
@@ -9484,7 +10677,10 @@ mod tests {
 
         handle_branches_loaded(
             "chat-1".to_string(),
-            Ok(vec![branch("root", "root", true), branch("b2", "альтернатива", false)]),
+            Ok(vec![
+                branch("root", "root", true),
+                branch("b2", "альтернатива", false),
+            ]),
             &mut state,
         );
 
@@ -9497,7 +10693,11 @@ mod tests {
     #[tokio::test]
     async fn branch_activated_marks_chat_history_for_reload() {
         let mut state = test_state();
-        handle_chats_loaded(Ok(vec![summary("chat-1", "Чат", 4)]), &mut state, &channel());
+        handle_chats_loaded(
+            Ok(vec![summary("chat-1", "Чат", 4)]),
+            &mut state,
+            &channel(),
+        );
         handle_history_loaded(
             "chat-1".to_string(),
             Ok(ChatHistory {
@@ -9513,7 +10713,12 @@ mod tests {
         );
         assert!(state.chats[0].history_loaded);
 
-        handle_branch_activated("chat-1".to_string(), Ok("b2".to_string()), &mut state, &channel());
+        handle_branch_activated(
+            "chat-1".to_string(),
+            Ok("b2".to_string()),
+            &mut state,
+            &channel(),
+        );
 
         assert!(
             !state.chats[0].history_loaded,
@@ -9544,8 +10749,16 @@ mod tests {
     #[tokio::test]
     async fn reloaded_shorter_history_clamps_selected_message() {
         let mut state = test_state();
-        handle_chats_loaded(Ok(vec![summary("chat-1", "Чат", 1)]), &mut state, &channel());
-        state.chat_ui.entry("chat-1".to_string()).or_default().selected_message = Some(5);
+        handle_chats_loaded(
+            Ok(vec![summary("chat-1", "Чат", 1)]),
+            &mut state,
+            &channel(),
+        );
+        state
+            .chat_ui
+            .entry("chat-1".to_string())
+            .or_default()
+            .selected_message = Some(5);
 
         handle_history_loaded(
             "chat-1".to_string(),
@@ -9571,8 +10784,16 @@ mod tests {
     #[tokio::test]
     async fn reloaded_empty_history_drops_selected_message() {
         let mut state = test_state();
-        handle_chats_loaded(Ok(vec![summary("chat-1", "Чат", 0)]), &mut state, &channel());
-        state.chat_ui.entry("chat-1".to_string()).or_default().selected_message = Some(2);
+        handle_chats_loaded(
+            Ok(vec![summary("chat-1", "Чат", 0)]),
+            &mut state,
+            &channel(),
+        );
+        state
+            .chat_ui
+            .entry("chat-1".to_string())
+            .or_default()
+            .selected_message = Some(2);
 
         handle_history_loaded(
             "chat-1".to_string(),
@@ -9588,7 +10809,10 @@ mod tests {
     }
 
     fn block(text: &str, height: usize) -> (Vec<Line<'static>>, usize) {
-        ((0..height).map(|_| Line::raw(text.to_string())).collect(), height)
+        (
+            (0..height).map(|_| Line::raw(text.to_string())).collect(),
+            height,
+        )
     }
 
     fn window(
@@ -9597,13 +10821,20 @@ mod tests {
         visible: usize,
     ) -> (Vec<String>, u16) {
         let (lines, offset) = visible_window(
-            blocks.iter().map(|(lines, height)| (lines.as_slice(), *height)),
+            blocks
+                .iter()
+                .map(|(lines, height)| (lines.as_slice(), *height)),
             scroll,
             visible,
         );
         let texts = lines
             .iter()
-            .map(|line| line.spans.iter().map(|span| span.content.as_ref()).collect())
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect()
+            })
             .collect();
         (texts, offset)
     }
@@ -9741,7 +10972,10 @@ mod tests {
         assert!(lines.contains(&"message:".to_string()));
         assert!(lines.contains(&"  вторая строка".to_string()));
         assert!(lines.contains(&"  • b.txt".to_string()));
-        assert_eq!(tool_arguments_lines(&serde_json::json!({})), vec!["без аргументов".to_string()]);
+        assert_eq!(
+            tool_arguments_lines(&serde_json::json!({})),
+            vec!["без аргументов".to_string()]
+        );
     }
 
     fn git_session(settings: ChatSettings) -> ChatSession {
@@ -9803,7 +11037,11 @@ mod tests {
             Message::assistant_with_tool_calls("", vec![git_call("git_status")]),
             Message::tool_result("call_0", "git_status", "clean"),
         ];
-        state.chat_ui.entry("chat-1".to_string()).or_default().pending = true;
+        state
+            .chat_ui
+            .entry("chat-1".to_string())
+            .or_default()
+            .pending = true;
         state
     }
 
@@ -9822,13 +11060,28 @@ mod tests {
     #[tokio::test]
     async fn ollama_tool_turn_is_appended_whole() {
         let mut state = ollama_state_with_turn();
-        handle_response("chat-1".to_string(), Ok(reply("всё чисто")), 0, &mut state, &channel());
+        handle_response(
+            "chat-1".to_string(),
+            Ok(reply("всё чисто")),
+            0,
+            &mut state,
+            &channel(),
+        );
 
-        let unsaved = state.chat_ui["chat-1"].unsaved.as_ref().expect("ход отправлен на запись");
+        let unsaved = state.chat_ui["chat-1"]
+            .unsaved
+            .as_ref()
+            .expect("ход отправлен на запись");
         let roles: Vec<String> = unsaved
             .messages
             .iter()
-            .map(|m| serde_json::to_value(m.role).unwrap().as_str().unwrap().to_string())
+            .map(|m| {
+                serde_json::to_value(m.role)
+                    .unwrap()
+                    .as_str()
+                    .unwrap()
+                    .to_string()
+            })
             .collect();
         assert_eq!(roles, vec!["user", "assistant", "tool", "assistant"]);
         assert_eq!(unsaved.messages[0].content, "покажи статус");
@@ -9846,9 +11099,21 @@ mod tests {
             &mut state,
             &channel(),
         );
-        let unsaved = state.chat_ui["chat-1"].unsaved.as_ref().expect("выполненная часть записывается");
-        assert_eq!(unsaved.messages.len(), 3, "реплика, вызов и результат — без текста ошибки");
-        assert!(unsaved.messages.iter().all(|m| !m.content.starts_with("Ошибка")));
+        let unsaved = state.chat_ui["chat-1"]
+            .unsaved
+            .as_ref()
+            .expect("выполненная часть записывается");
+        assert_eq!(
+            unsaved.messages.len(),
+            3,
+            "реплика, вызов и результат — без текста ошибки"
+        );
+        assert!(
+            unsaved
+                .messages
+                .iter()
+                .all(|m| !m.content.starts_with("Ошибка"))
+        );
     }
 
     #[tokio::test]
@@ -9867,9 +11132,17 @@ mod tests {
     #[test]
     fn server_start_failure_returns_line_to_input() {
         let mut state = test_state();
-        handle_chats_loaded(Ok(vec![summary("chat-1", "Первый", 0)]), &mut state, &channel());
+        handle_chats_loaded(
+            Ok(vec![summary("chat-1", "Первый", 0)]),
+            &mut state,
+            &channel(),
+        );
         state.chats[0].messages.push(Message::user("покажи статус"));
-        state.chat_ui.entry("chat-1".to_string()).or_default().pending = true;
+        state
+            .chat_ui
+            .entry("chat-1".to_string())
+            .or_default()
+            .pending = true;
 
         handle_tool_server_failed(
             "chat-1".to_string(),
@@ -9892,7 +11165,11 @@ mod tests {
             .iter()
             .map(|line| line.to_string())
             .collect();
-        assert!(collapsed.iter().any(|line| line.contains("git_diff — 3 стр.")));
+        assert!(
+            collapsed
+                .iter()
+                .any(|line| line.contains("git_diff — 3 стр."))
+        );
         assert!(!collapsed.iter().any(|line| line.contains("строка 2")));
 
         let expanded: Vec<String> = render_message_lines(&result, true, true)
@@ -9952,7 +11229,10 @@ mod tests {
         assert!(state.active_notice().unwrap().contains("Новая сводка"));
         state.notice = None;
         handle_activity_digests(Ok(vec![digest(1)]), &mut state);
-        assert!(state.active_notice().is_none(), "повтор той же сводки не объявляется");
+        assert!(
+            state.active_notice().is_none(),
+            "повтор той же сводки не объявляется"
+        );
     }
 
     #[tokio::test]
@@ -9965,7 +11245,12 @@ mod tests {
 
         handle_key(ctrl_a, &mut state, &agent, &tx);
         assert!(state.focus == Focus::Input);
-        assert!(state.active_notice().unwrap().contains("config activity set on"));
+        assert!(
+            state
+                .active_notice()
+                .unwrap()
+                .contains("config activity set on")
+        );
 
         state.config.activity_enabled = Some(true);
         handle_key(ctrl_a, &mut state, &agent, &tx);
@@ -10001,7 +11286,10 @@ mod tests {
         editor.field = 1;
         assert!(editor.current_field() == Some(FormatField::ActivityRoot));
         editor.field_value_mut().unwrap().push('/');
-        assert_eq!(editor.activity_values().root.as_deref(), Some("~/projects/"));
+        assert_eq!(
+            editor.activity_values().root.as_deref(),
+            Some("~/projects/")
+        );
         editor.field = 4;
         assert!(editor.current_field() == Some(FormatField::ActivityDaemon));
         assert!(editor.field_value_mut().is_none());
@@ -10024,12 +11312,23 @@ mod tests {
         let editor = state.settings.as_ref().unwrap();
         assert!(!editor.activity_daemon_busy);
         assert_eq!(editor.activity_daemon, "не найден activity-mcp");
-        assert!(state.active_notice().unwrap().contains("не найден activity-mcp"));
+        assert!(
+            state
+                .active_notice()
+                .unwrap()
+                .contains("не найден activity-mcp")
+        );
 
         state.notice = None;
         handle_daemon_state(Ok("работает, проектов: 3".into()), false, &mut state, &tx);
-        assert_eq!(state.settings.as_ref().unwrap().activity_daemon, "работает, проектов: 3");
-        assert!(state.active_notice().is_none(), "проверка статуса не объявляется");
+        assert_eq!(
+            state.settings.as_ref().unwrap().activity_daemon,
+            "работает, проектов: 3"
+        );
+        assert!(
+            state.active_notice().is_none(),
+            "проверка статуса не объявляется"
+        );
     }
 
     /// Редактор с курсором на поле «Каталог проектов» раздела активности.
@@ -10039,7 +11338,13 @@ mod tests {
             activity_root: Some("~/projects".into()),
             ..Config::default()
         };
-        let mut editor = SettingsEditor::from_chat(&git_session(ChatSettings::default()), &config, &[], &[], &[]);
+        let mut editor = SettingsEditor::from_chat(
+            &git_session(ChatSettings::default()),
+            &config,
+            &[],
+            &[],
+            &[],
+        );
         editor.section = SettingsSection::ALL
             .iter()
             .position(|s| *s == SettingsSection::Activity)
@@ -10060,7 +11365,11 @@ mod tests {
         state.focus = Focus::Settings;
         handle_settings_key(ctrl_x, &mut state, &tx);
         assert!(state.folder_pick == Some(FormatField::ActivityRoot));
-        assert_eq!(state.settings.as_ref().unwrap().activity_root, "~/projects", "клавиша не печатает «x»");
+        assert_eq!(
+            state.settings.as_ref().unwrap().activity_root,
+            "~/projects",
+            "клавиша не печатает «x»"
+        );
 
         // Не каталог: запроса нет, и значение поля не меняется.
         state.folder_pick = None;
@@ -10081,18 +11390,22 @@ mod tests {
         assert_eq!(editor.activity_root, "~/projects");
         assert!(message.contains("не выбран"));
 
-        let message = editor.apply_picked_folder(
-            FormatField::ActivityRoot,
-            Err(anyhow::anyhow!("сеанс SSH")),
-        );
+        let message = editor
+            .apply_picked_folder(FormatField::ActivityRoot, Err(anyhow::anyhow!("сеанс SSH")));
         assert_eq!(editor.activity_root, "~/projects");
         assert!(message.contains("сеанс SSH") && message.contains("вручную"));
 
-        let message = editor.apply_picked_folder(FormatField::ActivityRoot, Ok(Some(PathBuf::from("/Users/me/code"))));
+        let message = editor.apply_picked_folder(
+            FormatField::ActivityRoot,
+            Ok(Some(PathBuf::from("/Users/me/code"))),
+        );
         assert_eq!(editor.activity_root, "/Users/me/code");
         assert!(message.contains("Ctrl+S"));
         // Сохраняется тем же путём, что и ручной ввод.
-        assert_eq!(editor.activity_values().root.as_deref(), Some("/Users/me/code"));
+        assert_eq!(
+            editor.activity_values().root.as_deref(),
+            Some("/Users/me/code")
+        );
 
         editor.apply_picked_folder(FormatField::GitRepository, Ok(Some(PathBuf::from("/repo"))));
         assert_eq!(editor.git_repository, "/repo");
@@ -10112,11 +11425,24 @@ mod tests {
 
     /// Редактор на разделе «Индекс документов» с курсором в полях.
     fn editor_on_index(config: &Config) -> SettingsEditor {
-        let mut editor = SettingsEditor::from_chat(&git_session(ChatSettings::default()), config, &[], &[], &[]);
+        let mut editor =
+            SettingsEditor::from_chat(&git_session(ChatSettings::default()), config, &[], &[], &[]);
         editor.section = SettingsSection::ALL
             .iter()
             .position(|s| *s == SettingsSection::Index)
             .expect("раздел «Индекс документов» существует");
+        editor.pane = SettingsPane::Fields;
+        editor
+    }
+
+    /// Редактор на отдельной вкладке параметров RAG-поиска.
+    fn editor_on_index_search(config: &Config) -> SettingsEditor {
+        let mut editor =
+            SettingsEditor::from_chat(&git_session(ChatSettings::default()), config, &[], &[], &[]);
+        editor.section = SettingsSection::ALL
+            .iter()
+            .position(|s| *s == SettingsSection::IndexSearch)
+            .expect("раздел «Поиск индекса» существует");
         editor.pane = SettingsPane::Fields;
         editor
     }
@@ -10128,6 +11454,12 @@ mod tests {
             index_strategy: Some("structure".into()),
             index_model: Some("bge-m3".into()),
             index_chunk_size: Some(900),
+            index_top_k: Some(7),
+            index_candidate_top_k: Some(30),
+            index_similarity_threshold: Some(0.7),
+            index_rewrite: Some(true),
+            index_rewrite_model: Some("qwen3".into()),
+            index_search_enabled: Some(true),
             ..Config::default()
         }
     }
@@ -10150,6 +11482,12 @@ mod tests {
                 max_section: None,
                 min_section: None,
                 ollama_url: None,
+                search_enabled: true,
+                top_k: Some(7),
+                candidate_top_k: Some(30),
+                similarity_threshold: Some(0.7),
+                rewrite: Some(true),
+                rewrite_model: Some("qwen3".into()),
             }
         );
         // Стратегия и единица — круг «не задано → … → не задано».
@@ -10166,6 +11504,10 @@ mod tests {
         assert_eq!(editor.index_model, "nomic-embed-text:latest");
         assert!(editor.cycle_index_model(1));
         assert_eq!(editor.index_model, "bge-m3");
+        editor.cycle_index_rewrite(1);
+        assert_eq!(editor.index_rewrite, "off");
+        editor.cycle_index_rewrite(1);
+        assert!(editor.index_rewrite.is_empty());
         // Ввод и Ctrl+D идут через общий путь текстовых полей.
         editor.field = 5;
         assert!(editor.current_field() == Some(FormatField::IndexChunkSize));
@@ -10174,7 +11516,36 @@ mod tests {
         editor.reset_field();
         assert_eq!(editor.index_chunk_size, "");
         assert!(empty_field_hint(FormatField::IndexRoot, &editor).contains("нечего собирать"));
-        assert!(Config::default().index_db.is_none() && !SettingsSection::Index.fields().is_empty());
+        assert!(
+            Config::default().index_db.is_none() && !SettingsSection::Index.fields().is_empty()
+        );
+    }
+
+    #[test]
+    fn index_search_section_contains_only_rag_settings() {
+        let editor = editor_on_index_search(&index_config());
+        assert!(
+            editor.visible_fields()
+                == vec![
+                    FormatField::IndexSearchEnabled,
+                    FormatField::IndexTopK,
+                    FormatField::IndexCandidateTopK,
+                    FormatField::IndexSimilarityThreshold,
+                    FormatField::IndexRewrite,
+                    FormatField::IndexRewriteModel,
+                ]
+        );
+        assert!(editor.current_section() == SettingsSection::IndexSearch);
+        assert!(editor.index_values().is_ok());
+
+        let mut state = test_state();
+        let (tx, _rx) = mpsc::unbounded_channel();
+        state.settings = Some(editor);
+        state.focus = Focus::Settings;
+        handle_settings_key(key(KeyCode::Char(' ')), &mut state, &tx);
+        let disabled = state.settings.as_ref().unwrap();
+        assert!(disabled.visible_fields() == vec![FormatField::IndexSearchEnabled]);
+        assert!(!disabled.index_values().unwrap().search_enabled);
     }
 
     #[test]
@@ -10186,6 +11557,24 @@ mod tests {
         assert!(editor.index_values().is_err(), "0 не размер");
         editor.index_overlap = " 150 ".into();
         assert_eq!(editor.index_values().unwrap().overlap, Some(150));
+        editor.index_top_k = "21".into();
+        assert!(editor.index_values().unwrap_err().contains("Top-k"));
+        editor.index_top_k.clear();
+        editor.index_candidate_top_k = "101".into();
+        assert!(
+            editor
+                .index_values()
+                .unwrap_err()
+                .contains("Candidate top-k")
+        );
+        editor.index_candidate_top_k.clear();
+        editor.index_similarity_threshold = "1.1".into();
+        assert!(editor.index_values().unwrap_err().contains("от -1 до 1"));
+        editor.index_similarity_threshold = " 0.7 ".into();
+        assert_eq!(
+            editor.index_values().unwrap().similarity_threshold,
+            Some(0.7)
+        );
     }
 
     #[test]
@@ -10200,6 +11589,12 @@ mod tests {
             assert_eq!(config.index_db.as_deref(), Some("/tmp/idx.db"));
             assert_eq!(config.index_model.as_deref(), Some("nomic-embed-text"));
             assert_eq!(config.index_chunk_size, Some(900));
+            assert_eq!(config.index_top_k, Some(7));
+            assert_eq!(config.index_candidate_top_k, Some(30));
+            assert_eq!(config.index_similarity_threshold, Some(0.7));
+            assert_eq!(config.index_rewrite, Some(true));
+            assert_eq!(config.index_rewrite_model.as_deref(), Some("qwen3"));
+            assert_eq!(config.index_search_enabled, Some(true));
             Ok(())
         });
         assert!(saved);
@@ -10218,16 +11613,23 @@ mod tests {
     async fn build_button_needs_a_directory_and_ignores_repeated_enter() {
         let mut state = test_state();
         let (tx, _rx) = mpsc::unbounded_channel();
-        state.config = Config { index_db: Some("/tmp/idx.db".into()), ..Config::default() };
+        state.config = Config {
+            index_db: Some("/tmp/idx.db".into()),
+            ..Config::default()
+        };
         let mut editor = editor_on_index(&state.config);
-        editor.field = 10;
+        editor.field = editor.visible_fields().len().saturating_sub(1);
         assert!(editor.current_field() == Some(FormatField::IndexBuild));
         state.settings = Some(editor);
         state.focus = Focus::Settings;
         handle_settings_key(key(KeyCode::Enter), &mut state, &tx);
         let editor = state.settings.as_mut().unwrap();
         assert!(!editor.index_busy);
-        assert!(editor.error.as_deref().unwrap().contains("каталог"), "{:?}", editor.error);
+        assert!(
+            editor.error.as_deref().unwrap().contains("каталог"),
+            "{:?}",
+            editor.error
+        );
 
         // Идущая сборка не запускает вторую.
         editor.error = None;
@@ -10247,13 +11649,21 @@ mod tests {
 
     /// Редактор на разделе «Пайплайн» с курсором в полях.
     fn editor_on_pipeline(config: &Config) -> SettingsEditor {
-        let mut editor = SettingsEditor::from_chat(&git_session(ChatSettings::default()), config, &[], &[], &[]);
+        let mut editor =
+            SettingsEditor::from_chat(&git_session(ChatSettings::default()), config, &[], &[], &[]);
         let position = SettingsSection::ALL
             .iter()
             .position(|s| *s == SettingsSection::Pipeline)
             .expect("раздел «Пайплайн» существует");
-        let activity = SettingsSection::ALL.iter().position(|s| *s == SettingsSection::Activity).unwrap();
-        assert_eq!(position, activity + 1, "раздел стоит сразу после «Сводок активности»");
+        let activity = SettingsSection::ALL
+            .iter()
+            .position(|s| *s == SettingsSection::Activity)
+            .unwrap();
+        assert_eq!(
+            position,
+            activity + 1,
+            "раздел стоит сразу после «Сводок активности»"
+        );
         editor.section = position;
         editor.pane = SettingsPane::Fields;
         editor
@@ -10269,14 +11679,25 @@ mod tests {
         let mut editor = editor_on_pipeline(&config);
         assert!(
             editor.visible_fields()
-                == vec![FormatField::PipelineEnabled, FormatField::PipelineRoot, FormatField::PipelineOutput]
+                == vec![
+                    FormatField::PipelineEnabled,
+                    FormatField::PipelineRoot,
+                    FormatField::PipelineOutput
+                ]
         );
-        assert!(editor.pipeline_enabled, "без поля в конфиге переключатель следует каталогу поиска");
+        assert!(
+            editor.pipeline_enabled,
+            "без поля в конфиге переключатель следует каталогу поиска"
+        );
         assert_eq!(editor.pipeline_root, "~/projects/ai");
         assert_eq!(editor.pipeline_output, "~/out");
         assert_eq!(
             editor.pipeline_values(),
-            PipelineValues { enabled: true, root: Some("~/projects/ai".into()), output: Some("~/out".into()) }
+            PipelineValues {
+                enabled: true,
+                root: Some("~/projects/ai".into()),
+                output: Some("~/out".into())
+            }
         );
 
         // Ввод и Ctrl+D идут через общий путь текстовых полей.
@@ -10289,14 +11710,20 @@ mod tests {
 
         let empty = editor_on_pipeline(&Config::default());
         assert!(!empty.pipeline_enabled);
-        assert!(empty.visible_fields() == vec![FormatField::PipelineEnabled], "каталоги скрыты при выключенном");
+        assert!(
+            empty.visible_fields() == vec![FormatField::PipelineEnabled],
+            "каталоги скрыты при выключенном"
+        );
         assert_eq!(empty.pipeline_root, "");
         assert_eq!(empty.pipeline_output, "");
         assert!(empty_field_hint(FormatField::PipelineRoot, &empty).contains("не работают"));
         assert!(empty_field_hint(FormatField::PipelineOutput, &empty).contains("каталог поиска"));
 
         // Выключенный переключатель в конфиге не прячет сохранённые каталоги.
-        let off = Config { pipeline_enabled: Some(false), ..config };
+        let off = Config {
+            pipeline_enabled: Some(false),
+            ..config
+        };
         let editor = editor_on_pipeline(&off);
         assert!(!editor.pipeline_enabled);
         assert_eq!(editor.pipeline_root, "~/projects/ai");
@@ -10306,7 +11733,10 @@ mod tests {
     fn pipeline_section_toggle_switches_and_ctrl_d_turns_off() {
         let mut state = test_state();
         let (tx, _rx) = mpsc::unbounded_channel();
-        let config = Config { pipeline_root: Some("/work".into()), ..Config::default() };
+        let config = Config {
+            pipeline_root: Some("/work".into()),
+            ..Config::default()
+        };
         state.settings = Some(editor_on_pipeline(&config));
         state.focus = Focus::Settings;
 
@@ -10314,7 +11744,11 @@ mod tests {
         let editor = state.settings.as_mut().unwrap();
         assert!(!editor.pipeline_enabled);
         assert!(editor.visible_fields() == vec![FormatField::PipelineEnabled]);
-        assert_eq!(editor.pipeline_values().root.as_deref(), Some("/work"), "выключение не стирает каталог");
+        assert_eq!(
+            editor.pipeline_values().root.as_deref(),
+            Some("/work"),
+            "выключение не стирает каталог"
+        );
 
         handle_settings_key(key(KeyCode::Right), &mut state, &tx);
         let editor = state.settings.as_mut().unwrap();
@@ -10333,7 +11767,10 @@ mod tests {
         let mut editor = editor_on_pipeline(&Config::default());
         // Подсказка идёт за несохранённым значением каталога поиска.
         editor.pipeline_root = "/work/".into();
-        assert_eq!(empty_field_hint(FormatField::PipelineOutput, &editor), "не задан — /work/pipeline-out");
+        assert_eq!(
+            empty_field_hint(FormatField::PipelineOutput, &editor),
+            "не задан — /work/pipeline-out"
+        );
     }
 
     #[test]
@@ -10350,41 +11787,67 @@ mod tests {
         handle_settings_key(ctrl_x, &mut state, &tx);
         assert!(state.folder_pick.is_none());
 
-        for (index, field) in [(1, FormatField::PipelineRoot), (2, FormatField::PipelineOutput)] {
+        for (index, field) in [
+            (1, FormatField::PipelineRoot),
+            (2, FormatField::PipelineOutput),
+        ] {
             state.folder_pick = None;
             state.settings.as_mut().unwrap().field = index;
             handle_settings_key(ctrl_x, &mut state, &tx);
             assert!(state.folder_pick == Some(field));
         }
         let editor = state.settings.as_ref().unwrap();
-        assert!(editor.pipeline_root.is_empty() && editor.pipeline_output.is_empty(), "клавиша не печатает «x»");
+        assert!(
+            editor.pipeline_root.is_empty() && editor.pipeline_output.is_empty(),
+            "клавиша не печатает «x»"
+        );
     }
 
     #[test]
     fn pipeline_section_picked_folder_fills_its_own_field() {
         let mut editor = editor_on_pipeline(&Config::default());
-        let message = editor.apply_picked_folder(FormatField::PipelineOutput, Ok(Some(PathBuf::from("/Users/me/out"))));
+        let message = editor.apply_picked_folder(
+            FormatField::PipelineOutput,
+            Ok(Some(PathBuf::from("/Users/me/out"))),
+        );
         assert!(message.contains("Ctrl+S"));
         assert_eq!(editor.pipeline_output, "/Users/me/out");
         assert_eq!(editor.pipeline_root, "");
 
-        editor.apply_picked_folder(FormatField::PipelineRoot, Ok(Some(PathBuf::from("/Users/me/code"))));
+        editor.apply_picked_folder(
+            FormatField::PipelineRoot,
+            Ok(Some(PathBuf::from("/Users/me/code"))),
+        );
         assert_eq!(editor.pipeline_root, "/Users/me/code");
         assert_eq!(editor.pipeline_output, "/Users/me/out");
 
         editor.apply_picked_folder(FormatField::PipelineRoot, Ok(None));
-        assert_eq!(editor.pipeline_root, "/Users/me/code", "отмена не меняет поле");
+        assert_eq!(
+            editor.pipeline_root, "/Users/me/code",
+            "отмена не меняет поле"
+        );
     }
 
     #[test]
     fn pipeline_section_values_turn_blank_into_none() {
         let mut editor = editor_on_pipeline(&Config::default());
-        assert_eq!(editor.pipeline_values(), PipelineValues { enabled: false, root: None, output: None });
+        assert_eq!(
+            editor.pipeline_values(),
+            PipelineValues {
+                enabled: false,
+                root: None,
+                output: None
+            }
+        );
         editor.pipeline_root = "  /work  ".into();
         editor.pipeline_output = "   ".into();
         assert_eq!(
             editor.pipeline_values(),
-            PipelineValues { enabled: false, root: Some("/work".into()), output: None }
+            PipelineValues {
+                enabled: false,
+                root: Some("/work".into()),
+                output: None
+            }
         );
     }
 
@@ -10392,7 +11855,11 @@ mod tests {
     fn pipeline_section_save_updates_config_only_on_change() {
         let mut state = test_state();
         let mut saves = 0;
-        let values = PipelineValues { enabled: true, root: Some("/work".into()), output: None };
+        let values = PipelineValues {
+            enabled: true,
+            root: Some("/work".into()),
+            output: None,
+        };
         save_pipeline_with(&mut state, values, |config| {
             saves += 1;
             assert_eq!(config.pipeline_root.as_deref(), Some("/work"));
@@ -10402,11 +11869,23 @@ mod tests {
         assert_eq!(saves, 1);
         assert!(state.config.pipeline_active());
         assert_eq!(state.config.pipeline_output, None);
-        assert_eq!(state.config.effective_pipeline_output().as_deref(), Some("/work/pipeline-out"));
-        assert!(state.active_notice().unwrap().contains("пайплайна сохранены"));
+        assert_eq!(
+            state.config.effective_pipeline_output().as_deref(),
+            Some("/work/pipeline-out")
+        );
+        assert!(
+            state
+                .active_notice()
+                .unwrap()
+                .contains("пайплайна сохранены")
+        );
 
         // Те же значения — файл не переписывается.
-        let same = PipelineValues { enabled: true, root: Some("/work".into()), output: None };
+        let same = PipelineValues {
+            enabled: true,
+            root: Some("/work".into()),
+            output: None,
+        };
         save_pipeline_with(&mut state, same, |_| {
             saves += 1;
             Ok(())
@@ -10414,7 +11893,11 @@ mod tests {
         assert_eq!(saves, 1);
 
         // Выключение переключателем сохраняет каталог в конфиге.
-        let off = PipelineValues { enabled: false, root: Some("/work".into()), output: None };
+        let off = PipelineValues {
+            enabled: false,
+            root: Some("/work".into()),
+            output: None,
+        };
         save_pipeline_with(&mut state, off, |_| Ok(()));
         assert!(!state.config.pipeline_active());
         assert_eq!(state.config.pipeline_enabled, Some(false));
@@ -10422,7 +11905,15 @@ mod tests {
         assert!(state.active_notice().unwrap().contains("выключены"));
 
         // Пустой каталог поиска тоже выключает пайплайн.
-        save_pipeline_with(&mut state, PipelineValues { enabled: true, root: None, output: None }, |_| Ok(()));
+        save_pipeline_with(
+            &mut state,
+            PipelineValues {
+                enabled: true,
+                root: None,
+                output: None,
+            },
+            |_| Ok(()),
+        );
         assert!(!state.config.pipeline_active());
     }
 
@@ -10441,7 +11932,10 @@ mod tests {
 
         state.notify_error("Не удалось сохранить конфиг: диск полон");
         age_notice(&mut state, Duration::from_secs(60));
-        assert_eq!(state.active_notice(), Some("Не удалось сохранить конфиг: диск полон"));
+        assert_eq!(
+            state.active_notice(),
+            Some("Не удалось сохранить конфиг: диск полон")
+        );
         assert!(state.active_notice_entry().unwrap().kind == NoticeKind::Error);
     }
 
@@ -10468,13 +11962,19 @@ mod tests {
 
         state.notify_error("Сообщение не отправлено: сервис недоступен");
         handle_key(key(KeyCode::Tab), &mut state, &agent, &tx);
-        assert!(state.active_notice().is_some(), "свежую ошибку клавиша не снимает");
+        assert!(
+            state.active_notice().is_some(),
+            "свежую ошибку клавиша не снимает"
+        );
 
         age_notice(&mut state, Duration::from_secs(2));
         let was_input = state.focus == Focus::Input;
         handle_key(key(KeyCode::Tab), &mut state, &agent, &tx);
         assert!(state.active_notice().is_none());
-        assert!(was_input != (state.focus == Focus::Input), "клавиша, снявшая ошибку, обработана как обычно");
+        assert!(
+            was_input != (state.focus == Focus::Input),
+            "клавиша, снявшая ошибку, обработана как обычно"
+        );
     }
 
     #[test]
@@ -10485,7 +11985,10 @@ mod tests {
         }
         assert_eq!(state.notice_log.len(), NOTICE_LOG_LIMIT);
         assert_eq!(state.notice_log.front().unwrap().text, "сообщение 5");
-        assert_eq!(state.notice_log.back().unwrap().text, format!("сообщение {}", NOTICE_LOG_LIMIT + 4));
+        assert_eq!(
+            state.notice_log.back().unwrap().text,
+            format!("сообщение {}", NOTICE_LOG_LIMIT + 4)
+        );
     }
 
     #[tokio::test]
@@ -10502,7 +12005,10 @@ mod tests {
         state.notify("третье");
         handle_key(ctrl_q, &mut state, &agent, &tx);
         assert!(state.notice_log_view.is_some());
-        assert!(state.active_notice().is_none(), "открытый журнал снимает ошибку внизу");
+        assert!(
+            state.active_notice().is_none(),
+            "открытый журнал снимает ошибку внизу"
+        );
 
         // Курсор ходит по записям в пределах журнала, клавиши окну под ним не достаются.
         handle_key(key(KeyCode::Down), &mut state, &agent, &tx);

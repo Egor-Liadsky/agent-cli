@@ -2,8 +2,8 @@ mod activity;
 mod activity_daemon;
 mod agent;
 mod chats;
-mod clipboard;
 mod cli;
+mod clipboard;
 mod folder_picker;
 mod index;
 mod logging;
@@ -15,18 +15,20 @@ mod tui;
 
 use agent::CliAgent;
 use agentcore::agent::{Agent, AgentReply, Message, MessageMeta};
+use agentcore::config::{Config, Provider, ReasoningMode, ThinkingMode};
 use anyhow::Context;
 use clap::Parser;
 use cli::{
-    ActivityAction, ActivityConfigAction, BranchesAction, Cli, Commands, ConfigAction, ContextLimitAction, FactsAction, FormatAction,
-    GitToolsAction, IndexAction, IndexConfigAction, OllamaAction, PipelineAction, PipelineConfigAction, ProfilesAction, SamplingAction, SummaryAction,
+    ActivityAction, ActivityConfigAction, BranchesAction, Cli, Commands, ConfigAction,
+    ContextLimitAction, FactsAction, FormatAction, GitToolsAction, IndexAction, IndexConfigAction,
+    OllamaAction, PipelineAction, PipelineConfigAction, ProfilesAction, SamplingAction,
+    SummaryAction,
 };
-use std::sync::Arc;
-use agentcore::config::{Config, Provider, ReasoningMode, ThinkingMode};
 use console::style;
 use indicatif::{ProgressBar, ProgressStyle};
-use logging::{exchange_log, UNAUTHORIZED_HINT};
+use logging::{UNAUTHORIZED_HINT, exchange_log};
 use markdown::agent_skin;
+use std::sync::Arc;
 use std::time::Duration;
 
 #[tokio::main]
@@ -63,7 +65,10 @@ async fn run_facts(chat_id: String, action: FactsAction) -> anyhow::Result<()> {
                 println!("Фактов нет.");
             }
             for fact in facts {
-                println!("{}: {} (через сообщение {})", fact.key, fact.value, fact.through_seq);
+                println!(
+                    "{}: {} (через сообщение {})",
+                    fact.key, fact.value, fact.through_seq
+                );
             }
         }
         FactsAction::Set { key, value } => {
@@ -127,7 +132,11 @@ async fn run_profiles(action: ProfilesAction) -> anyhow::Result<()> {
         ProfilesAction::List => {
             let profiles = client.profiles().await?;
             for profile in profiles {
-                let mark = if profile.built_in { "[встроенный]" } else { "[свой]" };
+                let mark = if profile.built_in {
+                    "[встроенный]"
+                } else {
+                    "[свой]"
+                };
                 println!("{mark} {} — {}", profile.id, profile.name);
             }
         }
@@ -156,7 +165,13 @@ async fn run_profiles(action: ProfilesAction) -> anyhow::Result<()> {
             let parsed: ProfileFile = serde_json::from_str(&content)
                 .with_context(|| format!("не удалось разобрать файл профиля {file}"))?;
             let created = client
-                .create_profile(&parsed.name, &parsed.persona, &parsed.style, &parsed.format, &parsed.constraints)
+                .create_profile(
+                    &parsed.name,
+                    &parsed.persona,
+                    &parsed.style,
+                    &parsed.format,
+                    &parsed.constraints,
+                )
                 .await?;
             println!("Создан профиль {} ({}).", created.name, created.id);
         }
@@ -170,7 +185,11 @@ async fn run_ask(prompt: String) -> anyhow::Result<()> {
         CliAgent::from_config(&config, exchange_log())?.with_unauthorized_hint(UNAUTHORIZED_HINT);
     let history = vec![Message::user(prompt)];
     let settings = config.default_chat_settings();
-    let reply = if settings.git_tools_active() || config.activity_chat_tools_active() || config.pipeline_active() || config.index_active() {
+    let reply = if settings.git_tools_active()
+        || config.activity_chat_tools_active()
+        || config.pipeline_active()
+        || config.index_active()
+    {
         ask_with_tools(&agent, &history, &settings, &config).await?
     } else {
         ask_with_spinner(&agent, &history, &settings).await?
@@ -211,7 +230,6 @@ fn load_config() -> anyhow::Result<Config> {
     }
     Ok(config)
 }
-
 
 fn run_config(action: ConfigAction) -> anyhow::Result<()> {
     match action {
@@ -263,9 +281,16 @@ fn run_config(action: ConfigAction) -> anyhow::Result<()> {
         ConfigAction::Index { action } => run_index_config(action)?,
         ConfigAction::SetInvariantsPath { path } => {
             let mut config = load_config()?;
-            config.invariants_path = if path.trim().is_empty() { None } else { Some(path) };
+            config.invariants_path = if path.trim().is_empty() {
+                None
+            } else {
+                Some(path)
+            };
             config.save()?;
-            println!("{}", style("Путь к файлу инвариантов сохранён.").green().bold());
+            println!(
+                "{}",
+                style("Путь к файлу инвариантов сохранён.").green().bold()
+            );
             print_invariants_path(&config);
         }
         ConfigAction::Invariants => run_config_invariants()?,
@@ -424,7 +449,11 @@ fn run_git_tools_action(action: GitToolsAction) -> anyhow::Result<()> {
             allowed_tools,
             max_iterations,
         } => {
-            if enabled.is_none() && repository.is_none() && allowed_tools.is_none() && max_iterations.is_none() {
+            if enabled.is_none()
+                && repository.is_none()
+                && allowed_tools.is_none()
+                && max_iterations.is_none()
+            {
                 anyhow::bail!(
                     "укажите хотя бы одно значение: enabled, --repository, --allowed-tools или --max-iterations"
                 );
@@ -445,7 +474,8 @@ fn run_git_tools_action(action: GitToolsAction) -> anyhow::Result<()> {
                 config.git_repository = Some(repository).filter(|path| !path.trim().is_empty());
             }
             if let Some(allowed) = allowed_tools {
-                config.git_allowed_tools = Some(parse_tool_list(&allowed)).filter(|list| !list.is_empty());
+                config.git_allowed_tools =
+                    Some(parse_tool_list(&allowed)).filter(|list| !list.is_empty());
             }
             if max_iterations.is_some() {
                 config.tool_max_iterations = max_iterations;
@@ -453,7 +483,9 @@ fn run_git_tools_action(action: GitToolsAction) -> anyhow::Result<()> {
             config.save()?;
             println!(
                 "{}",
-                style("Умолчания git-инструментов сохранены.").green().bold()
+                style("Умолчания git-инструментов сохранены.")
+                    .green()
+                    .bold()
             );
             print_git_tools(&config);
         }
@@ -464,7 +496,10 @@ fn run_git_tools_action(action: GitToolsAction) -> anyhow::Result<()> {
             config.git_allowed_tools = None;
             config.tool_max_iterations = None;
             config.save()?;
-            println!("{}", style("Умолчания git-инструментов сняты.").green().bold());
+            println!(
+                "{}",
+                style("Умолчания git-инструментов сняты.").green().bold()
+            );
         }
         GitToolsAction::Show => {
             let config = load_config()?;
@@ -476,7 +511,11 @@ fn run_git_tools_action(action: GitToolsAction) -> anyhow::Result<()> {
 
 fn run_pipeline_config(action: PipelineConfigAction) -> anyhow::Result<()> {
     match action {
-        PipelineConfigAction::Set { enabled, root, output } => {
+        PipelineConfigAction::Set {
+            enabled,
+            root,
+            output,
+        } => {
             if enabled.is_none() && root.is_none() && output.is_none() {
                 anyhow::bail!("укажите хотя бы одно значение: enabled, --root или --output");
             }
@@ -491,7 +530,10 @@ fn run_pipeline_config(action: PipelineConfigAction) -> anyhow::Result<()> {
                 config.pipeline_output = Some(output).filter(|output| !output.trim().is_empty());
             }
             config.save()?;
-            println!("{}", style("Настройки pipeline-mcp сохранены.").green().bold());
+            println!(
+                "{}",
+                style("Настройки pipeline-mcp сохранены.").green().bold()
+            );
             print_pipeline(&config);
         }
         PipelineConfigAction::Clear => {
@@ -511,12 +553,20 @@ fn print_pipeline(config: &Config) {
     println!(
         "{} {}",
         style("инструменты пайплайна в чатах:").cyan().bold(),
-        if config.pipeline_active() { "включены" } else { "выключены" }
+        if config.pipeline_active() {
+            "включены"
+        } else {
+            "выключены"
+        }
     );
     println!(
         "{} {}",
         style("переключатель:").cyan().bold(),
-        if config.pipeline_switch_on() { "вкл" } else { "выкл" }
+        if config.pipeline_switch_on() {
+            "вкл"
+        } else {
+            "выкл"
+        }
     );
     println!(
         "{} {}",
@@ -526,7 +576,10 @@ fn print_pipeline(config: &Config) {
     println!(
         "{} {}",
         style("каталог записи:").cyan().bold(),
-        config.effective_pipeline_output().as_deref().unwrap_or("(не задан)")
+        config
+            .effective_pipeline_output()
+            .as_deref()
+            .unwrap_or("(не задан)")
     );
 }
 
@@ -550,18 +603,37 @@ async fn run_pipeline_command(action: PipelineAction) -> anyhow::Result<()> {
         .ok_or_else(|| anyhow::anyhow!("не задан каталог поиска: --root <ПУТЬ> или agentcli config pipeline set --root <ПУТЬ>"))?;
     let output = output
         .filter(|output| !output.trim().is_empty())
-        .or_else(|| config.pipeline_output.clone().filter(|output| !output.trim().is_empty()))
-        .unwrap_or_else(|| format!("{}/{}", root.trim_end_matches('/'), agentcore::config::DEFAULT_PIPELINE_OUTPUT_DIR));
+        .or_else(|| {
+            config
+                .pipeline_output
+                .clone()
+                .filter(|output| !output.trim().is_empty())
+        })
+        .unwrap_or_else(|| {
+            format!(
+                "{}/{}",
+                root.trim_end_matches('/'),
+                agentcore::config::DEFAULT_PIPELINE_OUTPUT_DIR
+            )
+        });
     let sampler: Option<Arc<dyn pipeline::Sampler>> = if no_sampling {
         None
     } else {
-        let agent = CliAgent::from_config(&config, exchange_log())?.with_unauthorized_hint(UNAUTHORIZED_HINT);
+        let agent = CliAgent::from_config(&config, exchange_log())?
+            .with_unauthorized_hint(UNAUTHORIZED_HINT);
         Some(Arc::new(pipeline::AgentSampler {
             agent: Arc::new(agent),
             settings: config.default_chat_settings(),
         }))
     };
-    let server = pipeline::PipelineServer::start(&pipeline::server_program(), &root, &output, sampler, exchange_log()).await?;
+    let server = pipeline::PipelineServer::start(
+        &pipeline::server_program(),
+        &root,
+        &output,
+        sampler,
+        exchange_log(),
+    )
+    .await?;
     let request = pipeline::PipelineRequest {
         query: &query,
         file_name: &out,
@@ -572,12 +644,22 @@ async fn run_pipeline_command(action: PipelineAction) -> anyhow::Result<()> {
     server.shutdown().await;
     let report = result?;
 
-    let matches = report.search["matches"].as_array().map(Vec::len).unwrap_or(0);
+    let matches = report.search["matches"]
+        .as_array()
+        .map(Vec::len)
+        .unwrap_or(0);
     println!(
         "{} {matches} строк в {} файлах{}",
         style("search:").cyan().bold(),
-        report.summary["sources"].as_array().map(Vec::len).unwrap_or(0),
-        if report.search["truncated"] == true { " (список обрезан)" } else { "" }
+        report.summary["sources"]
+            .as_array()
+            .map(Vec::len)
+            .unwrap_or(0),
+        if report.search["truncated"] == true {
+            " (список обрезан)"
+        } else {
+            ""
+        }
     );
     println!(
         "{} {} строк, метод {}",
@@ -586,7 +668,10 @@ async fn run_pipeline_command(action: PipelineAction) -> anyhow::Result<()> {
         report.summary["method"].as_str().unwrap_or("?")
     );
     if let Some(reason) = report.summary["fallback_reason"].as_str() {
-        println!("  {}", style(format!("sampling не использован: {reason}")).yellow());
+        println!(
+            "  {}",
+            style(format!("sampling не использован: {reason}")).yellow()
+        );
     }
     println!(
         "{} {} ({} байт, sha256 {})",
@@ -627,10 +712,36 @@ fn set_number(slot: &mut Option<usize>, value: Option<usize>) {
     }
 }
 
+fn set_threshold(slot: &mut Option<f32>, value: Option<String>) -> anyhow::Result<()> {
+    let Some(value) = value else {
+        return Ok(());
+    };
+    if value.trim().is_empty() {
+        *slot = None;
+        return Ok(());
+    }
+    let value: f32 = value
+        .trim()
+        .parse()
+        .map_err(|_| anyhow::anyhow!("similarity-threshold должен быть числом от -1 до 1"))?;
+    if !(-1.0..=1.0).contains(&value) {
+        anyhow::bail!("similarity-threshold должен быть числом от -1 до 1");
+    }
+    *slot = Some(value);
+    Ok(())
+}
+
 fn check_choice(what: &str, value: &Option<String>, allowed: &[&str]) -> anyhow::Result<()> {
-    match value.as_deref().map(str::trim).filter(|value| !value.is_empty()) {
+    match value
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
         Some(value) if !allowed.contains(&value) => {
-            anyhow::bail!("неизвестное значение {what}: «{value}». Доступны: {}", allowed.join(", "))
+            anyhow::bail!(
+                "неизвестное значение {what}: «{value}». Доступны: {}",
+                allowed.join(", ")
+            )
         }
         _ => Ok(()),
     }
@@ -649,11 +760,39 @@ fn run_index_config(action: IndexConfigAction) -> anyhow::Result<()> {
             max_section,
             min_section,
             ollama_url,
+            top_k,
+            candidate_top_k,
+            similarity_threshold,
+            rewrite,
+            rewrite_model,
         } => {
-            if [&root, &db, &strategy, &model, &unit, &ollama_url].iter().all(|value| value.is_none())
-                && [chunk_size, overlap, max_section, min_section].iter().all(Option::is_none)
+            if [
+                &root,
+                &db,
+                &strategy,
+                &model,
+                &unit,
+                &ollama_url,
+                &rewrite,
+                &rewrite_model,
+                &similarity_threshold,
+            ]
+            .iter()
+            .all(|value| value.is_none())
+                && [
+                    chunk_size,
+                    overlap,
+                    max_section,
+                    min_section,
+                    top_k,
+                    candidate_top_k,
+                ]
+                .iter()
+                .all(Option::is_none)
             {
-                anyhow::bail!("укажите хотя бы одно значение: --root, --db, --strategy, --model, --unit, --chunk-size и т. д.");
+                anyhow::bail!(
+                    "укажите хотя бы одно значение: --root, --db, --strategy, --model, --unit, --chunk-size и т. д."
+                );
             }
             check_choice("--strategy", &strategy, &INDEX_STRATEGIES)?;
             check_choice("--unit", &unit, &INDEX_UNITS)?;
@@ -664,10 +803,17 @@ fn run_index_config(action: IndexConfigAction) -> anyhow::Result<()> {
             set_text(&mut config.index_model, model);
             set_text(&mut config.index_unit, unit);
             set_text(&mut config.index_ollama_url, ollama_url);
+            set_text(&mut config.index_rewrite_model, rewrite_model);
             set_number(&mut config.index_chunk_size, chunk_size);
             set_number(&mut config.index_overlap, overlap);
             set_number(&mut config.index_max_section, max_section);
             set_number(&mut config.index_min_section, min_section);
+            set_number(&mut config.index_top_k, top_k);
+            set_number(&mut config.index_candidate_top_k, candidate_top_k);
+            set_threshold(&mut config.index_similarity_threshold, similarity_threshold)?;
+            if let Some(rewrite) = rewrite {
+                config.index_rewrite = Some(parse_bool_flag(&rewrite)?);
+            }
             config.save()?;
             println!("{}", style("Настройки индекса сохранены.").green().bold());
             print_index(&config);
@@ -676,6 +822,7 @@ fn run_index_config(action: IndexConfigAction) -> anyhow::Result<()> {
             let mut config = load_config()?;
             config.index_root = None;
             config.index_db = None;
+            config.index_search_enabled = None;
             config.index_strategy = None;
             config.index_model = None;
             config.index_unit = None;
@@ -684,6 +831,11 @@ fn run_index_config(action: IndexConfigAction) -> anyhow::Result<()> {
             config.index_max_section = None;
             config.index_min_section = None;
             config.index_ollama_url = None;
+            config.index_top_k = None;
+            config.index_candidate_top_k = None;
+            config.index_similarity_threshold = None;
+            config.index_rewrite = None;
+            config.index_rewrite_model = None;
             config.save()?;
             println!("{}", style("Настройки индекса сняты.").green().bold());
         }
@@ -693,20 +845,79 @@ fn run_index_config(action: IndexConfigAction) -> anyhow::Result<()> {
 }
 
 fn print_index(config: &Config) {
-    let text = |value: &Option<String>, default: &str| value.clone().filter(|v| !v.trim().is_empty()).unwrap_or_else(|| default.to_string());
-    let number = |value: Option<usize>, default: usize| value.map(|v| v.to_string()).unwrap_or_else(|| format!("{default} (умолчание)"));
-    let line = |label: &str, value: String| println!("{} {value}", style(format!("{label}:")).cyan().bold());
-    line("инструменты индекса в чатах", if config.index_active() { "включены".into() } else { "выключены (не задана база)".into() });
+    let text = |value: &Option<String>, default: &str| {
+        value
+            .clone()
+            .filter(|v| !v.trim().is_empty())
+            .unwrap_or_else(|| default.to_string())
+    };
+    let number = |value: Option<usize>, default: usize| {
+        value
+            .map(|v| v.to_string())
+            .unwrap_or_else(|| format!("{default} (умолчание)"))
+    };
+    let line = |label: &str, value: String| {
+        println!("{} {value}", style(format!("{label}:")).cyan().bold())
+    };
+    let active = if !config.index_search_switch_on() {
+        "выключены (поиск отключён)"
+    } else if config.index_active() {
+        "включены"
+    } else {
+        "выключены (не задана база)"
+    };
+    line("инструменты индекса в чатах", active.into());
+    line(
+        "поиск по индексу",
+        if config.index_search_switch_on() {
+            "включён".into()
+        } else {
+            "выключен".into()
+        },
+    );
     line("каталог .docx", text(&config.index_root, "(не задан)"));
     line("база", text(&config.index_db, "(не задана)"));
     line("стратегия", text(&config.index_strategy, "all (умолчание)"));
-    line("модель", text(&config.index_model, "nomic-embed-text (умолчание)"));
-    line("единица размеров", text(&config.index_unit, "chars (умолчание)"));
+    line(
+        "модель",
+        text(&config.index_model, "nomic-embed-text (умолчание)"),
+    );
+    line(
+        "единица размеров",
+        text(&config.index_unit, "chars (умолчание)"),
+    );
     line("chunk-size", number(config.index_chunk_size, 1200));
     line("overlap", number(config.index_overlap, 200));
     line("max-section", number(config.index_max_section, 1500));
     line("min-section", number(config.index_min_section, 200));
-    line("Ollama", text(&config.index_ollama_url, "http://localhost:11434 (умолчание)"));
+    line(
+        "Ollama",
+        text(
+            &config.index_ollama_url,
+            "http://localhost:11434 (умолчание)",
+        ),
+    );
+    line("top-k", number(config.index_top_k, 5));
+    line("candidate-top-k", number(config.index_candidate_top_k, 20));
+    line(
+        "similarity-threshold (RAG)",
+        config.index_similarity_threshold.map_or_else(
+            || "0.500 (умолчание; ручной поиск без фильтра)".into(),
+            |value| format!("{value:.3}"),
+        ),
+    );
+    line(
+        "query rewrite",
+        if config.index_rewrite == Some(true) {
+            "включён".into()
+        } else {
+            "выключен (умолчание)".into()
+        },
+    );
+    line(
+        "rewrite-модель",
+        text(&config.index_rewrite_model, "(модель эмбеддингов)"),
+    );
 }
 
 /// Текст ошибки инструмента индекса — как ошибка команды.
@@ -751,17 +962,38 @@ async fn run_index_command(action: IndexAction) -> anyhow::Result<()> {
             }
             (index::INDEX_BUILD, arguments, settings)
         }
-        IndexAction::Search { query, strategy, top_k } => {
+        IndexAction::Search {
+            query,
+            strategy,
+            top_k,
+            candidate_top_k,
+            similarity_threshold,
+            rewrite,
+            no_rewrite,
+        } => {
             check_choice("--strategy", &strategy, &["fixed", "structure"])?;
             set_text(&mut config.index_strategy, strategy);
             let settings = index::IndexSettings::from_config(&config)?;
-            let mut arguments = serde_json::json!({ "query": query });
+            let mut arguments = settings.search_arguments(&query);
             if let Some(top_k) = top_k {
                 arguments["top_k"] = serde_json::json!(top_k);
             }
+            if let Some(candidate_top_k) = candidate_top_k {
+                arguments["candidate_top_k"] = serde_json::json!(candidate_top_k);
+            }
+            if let Some(similarity_threshold) = similarity_threshold {
+                arguments["similarity_threshold"] = serde_json::json!(similarity_threshold);
+            }
+            if rewrite || no_rewrite {
+                arguments["rewrite"] = serde_json::json!(rewrite);
+            }
             (index::INDEX_SEARCH, arguments, settings)
         }
-        IndexAction::Status => (index::INDEX_STATUS, serde_json::json!({}), index::IndexSettings::from_config(&config)?),
+        IndexAction::Status => (
+            index::INDEX_STATUS,
+            serde_json::json!({}),
+            index::IndexSettings::from_config(&config)?,
+        ),
         // Модели не зависят от базы: без заданной пойдёт умолчание сервера.
         IndexAction::Models => {
             let mut settings = index::IndexSettings::from_config(&config).unwrap_or_default();
@@ -772,7 +1004,13 @@ async fn run_index_command(action: IndexAction) -> anyhow::Result<()> {
             (index::INDEX_MODELS, serde_json::json!({}), settings)
         }
     };
-    let server = index::IndexServer::start(&index::server_program(), &progress, index::Progress::Terminal, exchange_log()).await?;
+    let server = index::IndexServer::start(
+        &index::server_program(),
+        &progress,
+        index::Progress::Terminal,
+        exchange_log(),
+    )
+    .await?;
     let result = server.call_json(tool, arguments).await;
     server.shutdown().await;
     let value = result?.map_err(|message| index_tool_error(tool, message))?;
@@ -784,11 +1022,20 @@ fn print_index_result(tool: &str, value: &serde_json::Value) {
     let head = |text: &str| style(text.to_string()).cyan().bold();
     match tool {
         index::INDEX_BUILD => {
-            println!("{} {} (dim {}), база {}", head("модель:"), value["model"].as_str().unwrap_or("?"), value["dim"], value["db"].as_str().unwrap_or("?"));
+            println!(
+                "{} {} (dim {}), база {}",
+                head("модель:"),
+                value["model"].as_str().unwrap_or("?"),
+                value["dim"],
+                value["db"].as_str().unwrap_or("?")
+            );
             for strategy in value["strategies"].as_array().into_iter().flatten() {
                 println!(
                     "{} {} чанков из {} файлов ({} символов), эмбеддинг {} мс",
-                    head(&format!("{}:", strategy["strategy"].as_str().unwrap_or("?"))),
+                    head(&format!(
+                        "{}:",
+                        strategy["strategy"].as_str().unwrap_or("?")
+                    )),
                     strategy["chunks"],
                     strategy["files"],
                     strategy["chars"],
@@ -813,12 +1060,23 @@ fn print_index_result(tool: &str, value: &serde_json::Value) {
                     "\n{} {:.3}  {}  {}",
                     head(&format!("{}.", i + 1)),
                     hit["score"].as_f64().unwrap_or(0.0),
-                    hit["section"].as_str().filter(|s| !s.is_empty()).unwrap_or("(без раздела)"),
+                    hit["section"]
+                        .as_str()
+                        .filter(|s| !s.is_empty())
+                        .unwrap_or("(без раздела)"),
                     style(hit["source"].as_str().unwrap_or("?")).dim()
                 );
                 let text = hit["text"].as_str().unwrap_or_default();
                 let preview: String = text.chars().take(300).collect();
-                println!("   {}{}", preview.replace('\n', " "), if text.chars().count() > 300 { "…" } else { "" });
+                println!(
+                    "   {}{}",
+                    preview.replace('\n', " "),
+                    if text.chars().count() > 300 {
+                        "…"
+                    } else {
+                        ""
+                    }
+                );
             }
         }
         index::INDEX_STATUS => {
@@ -827,11 +1085,18 @@ fn print_index_result(tool: &str, value: &serde_json::Value) {
                 println!("файла базы ещё нет: agentcli index build");
                 return;
             }
-            println!("{} {}", head("модель запросов:"), value["search_model"].as_str().unwrap_or("?"));
+            println!(
+                "{} {}",
+                head("модель запросов:"),
+                value["search_model"].as_str().unwrap_or("?")
+            );
             for strategy in value["strategies"].as_array().into_iter().flatten() {
                 println!(
                     "{} {} чанков, {} файлов, модель {} (dim {}), собрано {}",
-                    head(&format!("{}:", strategy["strategy"].as_str().unwrap_or("?"))),
+                    head(&format!(
+                        "{}:",
+                        strategy["strategy"].as_str().unwrap_or("?")
+                    )),
                     strategy["chunks"],
                     strategy["files"],
                     strategy["model"].as_str().unwrap_or("?"),
@@ -850,8 +1115,14 @@ fn print_index_result(tool: &str, value: &serde_json::Value) {
                 println!(
                     "{}  dim {}  контекст {}",
                     model["name"].as_str().unwrap_or("?"),
-                    model["dim"].as_u64().map(|v| v.to_string()).unwrap_or_else(|| "?".into()),
-                    model["context_length"].as_u64().map(|v| v.to_string()).unwrap_or_else(|| "?".into())
+                    model["dim"]
+                        .as_u64()
+                        .map(|v| v.to_string())
+                        .unwrap_or_else(|| "?".into()),
+                    model["context_length"]
+                        .as_u64()
+                        .map(|v| v.to_string())
+                        .unwrap_or_else(|| "?".into())
                 );
             }
         }
@@ -884,7 +1155,10 @@ fn run_activity_config(action: ActivityConfigAction) -> anyhow::Result<()> {
             if let Some(secs) = poll_secs
                 && secs < agentcore::config::MIN_ACTIVITY_POLL_SECS
             {
-                anyhow::bail!("--poll-secs должен быть не меньше {}", agentcore::config::MIN_ACTIVITY_POLL_SECS);
+                anyhow::bail!(
+                    "--poll-secs должен быть не меньше {}",
+                    agentcore::config::MIN_ACTIVITY_POLL_SECS
+                );
             }
             let mut config = load_config()?;
             if let Some(enabled) = enabled {
@@ -906,10 +1180,14 @@ fn run_activity_config(action: ActivityConfigAction) -> anyhow::Result<()> {
                 config.activity_root = Some(root).filter(|root| !root.trim().is_empty());
             }
             if let Some(schedule) = schedule {
-                config.activity_schedule = Some(schedule).filter(|schedule| !schedule.trim().is_empty());
+                config.activity_schedule =
+                    Some(schedule).filter(|schedule| !schedule.trim().is_empty());
             }
             config.save()?;
-            println!("{}", style("Настройки activity-mcp сохранены.").green().bold());
+            println!(
+                "{}",
+                style("Настройки activity-mcp сохранены.").green().bold()
+            );
             print_activity(&config);
         }
         ActivityConfigAction::Clear => {
@@ -930,17 +1208,31 @@ fn run_activity_config(action: ActivityConfigAction) -> anyhow::Result<()> {
 }
 
 fn print_activity(config: &Config) {
-    let on_off = |value: bool| if value { "включены" } else { "выключены" };
+    let on_off = |value: bool| {
+        if value {
+            "включены"
+        } else {
+            "выключены"
+        }
+    };
     println!(
         "{} {}",
         style("сводки активности (activity-mcp):").cyan().bold(),
         on_off(config.activity_active())
     );
-    println!("{} {}", style("адрес:").cyan().bold(), config.effective_activity_url());
+    println!(
+        "{} {}",
+        style("адрес:").cyan().bold(),
+        config.effective_activity_url()
+    );
     println!(
         "{} {}",
         style("токен:").cyan().bold(),
-        if config.activity_token.is_some() { "задан" } else { "<нет>" }
+        if config.activity_token.is_some() {
+            "задан"
+        } else {
+            "<нет>"
+        }
     );
     println!(
         "{} {} с",
@@ -960,12 +1252,19 @@ fn print_activity(config: &Config) {
     println!(
         "{} {}",
         style("расписание сводок:").cyan().bold(),
-        config.activity_schedule.as_deref().unwrap_or("<умолчание демона>")
+        config
+            .activity_schedule
+            .as_deref()
+            .unwrap_or("<умолчание демона>")
     );
     println!(
         "{} {}",
         style("демон зарегистрирован клиентом:").cyan().bold(),
-        if activity_daemon::installed() { "да" } else { "нет" }
+        if activity_daemon::installed() {
+            "да"
+        } else {
+            "нет"
+        }
     );
 }
 
@@ -984,7 +1283,12 @@ async fn run_activity(action: ActivityAction) -> anyhow::Result<()> {
         }
         ActivityAction::Stop => {
             activity_daemon::stop().await?;
-            println!("{}", style("Демон activity-mcp остановлен и снят с автозапуска.").green().bold());
+            println!(
+                "{}",
+                style("Демон activity-mcp остановлен и снят с автозапуска.")
+                    .green()
+                    .bold()
+            );
             return Ok(());
         }
         _ => {}
@@ -997,23 +1301,40 @@ async fn run_activity(action: ActivityAction) -> anyhow::Result<()> {
 }
 
 fn print_digest(digest: &activity::Digest) {
-    let mark = if digest.acked { " (прочитана)" } else { "" };
+    let mark = if digest.acked {
+        " (прочитана)"
+    } else {
+        ""
+    };
     println!(
         "{}",
-        style(format!("Сводка #{}{mark}: {} — {}", digest.id, digest.period_from, digest.period_to))
-            .cyan()
-            .bold()
+        style(format!(
+            "Сводка #{}{mark}: {} — {}",
+            digest.id, digest.period_from, digest.period_to
+        ))
+        .cyan()
+        .bold()
     );
     print_markdown(&digest.text);
     println!();
 }
 
-async fn run_activity_action(client: &activity::ActivityClient, action: ActivityAction) -> anyhow::Result<()> {
+async fn run_activity_action(
+    client: &activity::ActivityClient,
+    action: ActivityAction,
+) -> anyhow::Result<()> {
     match action {
         ActivityAction::Digest { all, keep_unread } => {
             let mut digests = client.digests(!all, if all { 5 } else { 20 }).await?;
             if digests.is_empty() {
-                println!("{}", if all { "Сводок пока нет." } else { "Непрочитанных сводок нет." });
+                println!(
+                    "{}",
+                    if all {
+                        "Сводок пока нет."
+                    } else {
+                        "Непрочитанных сводок нет."
+                    }
+                );
             }
             // Старые первыми: читаются в том порядке, в каком шли периоды.
             digests.reverse();
@@ -1028,13 +1349,17 @@ async fn run_activity_action(client: &activity::ActivityClient, action: Activity
             Some(digest) => print_digest(&digest),
             None => println!("С прошлой сводки изменений нет."),
         },
-        ActivityAction::Start | ActivityAction::Stop => unreachable!("обрабатываются в run_activity"),
+        ActivityAction::Start | ActivityAction::Stop => {
+            unreachable!("обрабатываются в run_activity")
+        }
         ActivityAction::Ack { id } => {
             client.ack(id).await?;
             println!("Сводка {id} отмечена прочитанной.");
         }
         ActivityAction::Status => {
-            let (content, is_error) = client.call("activity_projects", &serde_json::json!({})).await?;
+            let (content, is_error) = client
+                .call("activity_projects", &serde_json::json!({}))
+                .await?;
             let text: String = content
                 .iter()
                 .filter_map(|item| item.get("text").and_then(serde_json::Value::as_str))
@@ -1044,16 +1369,28 @@ async fn run_activity_action(client: &activity::ActivityClient, action: Activity
             }
             let parsed: serde_json::Value = serde_json::from_str(&text)?;
             let projects = parsed["projects"].as_array().cloned().unwrap_or_default();
-            let active: Vec<&serde_json::Value> = projects.iter().filter(|p| p["removed"] != true).collect();
-            println!("{} {}", style("демон доступен, проектов:").green().bold(), active.len());
+            let active: Vec<&serde_json::Value> =
+                projects.iter().filter(|p| p["removed"] != true).collect();
+            println!(
+                "{} {}",
+                style("демон доступен, проектов:").green().bold(),
+                active.len()
+            );
             if activity_daemon::installed() {
                 println!("  (запущен клиентом: agentcli activity stop — остановить)");
             }
             for project in active {
                 let branch = project["branch"].as_str().unwrap_or("-");
                 let dirty = project["uncommitted_files"].as_i64().unwrap_or(0);
-                let dirty = if dirty > 0 { format!(", незакоммичено: {dirty}") } else { String::new() };
-                println!("  {} ({branch}{dirty})", project["name"].as_str().unwrap_or("?"));
+                let dirty = if dirty > 0 {
+                    format!(", незакоммичено: {dirty}")
+                } else {
+                    String::new()
+                };
+                println!(
+                    "  {} ({branch}{dirty})",
+                    project["name"].as_str().unwrap_or("?")
+                );
             }
         }
     }
@@ -1101,7 +1438,10 @@ fn print_git_tools(config: &Config) {
         config
             .tool_max_iterations
             .map(|v| v.to_string())
-            .unwrap_or_else(|| format!("{} (по умолчанию)", agentcore::config::DEFAULT_TOOL_MAX_ITERATIONS))
+            .unwrap_or_else(|| format!(
+                "{} (по умолчанию)",
+                agentcore::config::DEFAULT_TOOL_MAX_ITERATIONS
+            ))
     );
 }
 
@@ -1109,14 +1449,18 @@ fn parse_bool_flag(value: &str) -> anyhow::Result<bool> {
     match value.trim().to_ascii_lowercase().as_str() {
         "1" | "true" | "yes" | "on" => Ok(true),
         "0" | "false" | "no" | "off" => Ok(false),
-        other => anyhow::bail!("enabled должен быть true/false (или on/off, yes/no), задано: {other}"),
+        other => {
+            anyhow::bail!("enabled должен быть true/false (или on/off, yes/no), задано: {other}")
+        }
     }
 }
 
 fn print_summary(config: &Config) {
     println!(
         "{} {}",
-        style("компактизация истории для новых чатов:").cyan().bold(),
+        style("компактизация истории для новых чатов:")
+            .cyan()
+            .bold(),
         match config.summary_enabled {
             None => "<умолчание сервиса>".to_string(),
             Some(true) => "включена".to_string(),
@@ -1125,7 +1469,9 @@ fn print_summary(config: &Config) {
     );
     println!(
         "{} {}",
-        style("дословный хвост компактизации (сообщений):").cyan().bold(),
+        style("дословный хвост компактизации (сообщений):")
+            .cyan()
+            .bold(),
         config
             .summary_keep_messages
             .map(|v| v.to_string())
@@ -1248,7 +1594,9 @@ fn show_config() -> anyhow::Result<()> {
     );
     println!(
         "{} {}",
-        style("режим ответа (по умолчанию для новых чатов):").cyan().bold(),
+        style("режим ответа (по умолчанию для новых чатов):")
+            .cyan()
+            .bold(),
         if config.custom_response_mode {
             "кастомный"
         } else {
@@ -1300,13 +1648,19 @@ fn run_format_action(action: FormatAction) -> anyhow::Result<()> {
             let mut config = Config::load()?;
             config.custom_response_mode = true;
             config.save()?;
-            println!("{}", style("Кастомный режим ответа включён.").green().bold());
+            println!(
+                "{}",
+                style("Кастомный режим ответа включён.").green().bold()
+            );
         }
         FormatAction::Disable => {
             let mut config = Config::load()?;
             config.custom_response_mode = false;
             config.save()?;
-            println!("{}", style("Кастомный режим ответа выключен.").green().bold());
+            println!(
+                "{}",
+                style("Кастомный режим ответа выключен.").green().bold()
+            );
         }
         FormatAction::Reset => {
             let mut config = Config::load()?;
@@ -1363,7 +1717,10 @@ fn run_reasoning_action(
             .collect();
     }
     config.save()?;
-    println!("{}", style("Настройки рассуждения сохранены.").green().bold());
+    println!(
+        "{}",
+        style("Настройки рассуждения сохранены.").green().bold()
+    );
     print_reasoning(&config);
     Ok(())
 }
@@ -1419,13 +1776,19 @@ fn run_sampling_action(action: SamplingAction) -> anyhow::Result<()> {
                 config.sampling.presence_penalty = presence_penalty;
             }
             config.save()?;
-            println!("{}", style("Параметры сэмплирования сохранены.").green().bold());
+            println!(
+                "{}",
+                style("Параметры сэмплирования сохранены.").green().bold()
+            );
         }
         SamplingAction::Reset => {
             let mut config = Config::load()?;
             config.sampling = Default::default();
             config.save()?;
-            println!("{}", style("Параметры сэмплирования сброшены.").green().bold());
+            println!(
+                "{}",
+                style("Параметры сэмплирования сброшены.").green().bold()
+            );
         }
         SamplingAction::Show => {
             let config = Config::load()?;
@@ -1530,9 +1893,7 @@ fn format_stats_line(meta: &MessageMeta) -> String {
         parts.push(format!("{:.1} с", ms as f64 / 1000.0));
     }
     match (meta.prompt_tokens, meta.completion_tokens) {
-        (Some(prompt), Some(completion)) => {
-            parts.push(format!("токены ↑{prompt} ↓{completion}"))
-        }
+        (Some(prompt), Some(completion)) => parts.push(format!("токены ↑{prompt} ↓{completion}")),
         (Some(prompt), None) => parts.push(format!("токены ↑{prompt}")),
         (None, Some(completion)) => parts.push(format!("токены ↓{completion}")),
         (None, None) => {}
@@ -1615,8 +1976,11 @@ struct SpinnerObserver(ProgressBar);
 
 impl tool_loop::TurnObserver for SpinnerObserver {
     fn running(&self, call: &agentcore::agent::ToolCall) {
-        self.0
-            .set_message(style(format!("Инструмент {}...", call.name)).magenta().to_string());
+        self.0.set_message(
+            style(format!("Инструмент {}...", call.name))
+                .magenta()
+                .to_string(),
+        );
     }
 }
 
@@ -1641,7 +2005,12 @@ async fn ask_with_tools(
     // Демон сводок необязателен: без него вопрос задаётся без его
     // инструментов, а не отклоняется.
     let activity_tools = if config.activity_chat_tools_active() {
-        match activity::ActivityTools::connect(&activity::Endpoint::from_config(config), exchange_log()).await {
+        match activity::ActivityTools::connect(
+            &activity::Endpoint::from_config(config),
+            exchange_log(),
+        )
+        .await
+        {
             Ok(tools) => Some(tools),
             Err(err) => {
                 eprintln!(
@@ -1659,10 +2028,15 @@ async fn ask_with_tools(
     // настройками: серверу нужен владеющий указатель, а `agent` заимствован.
     let pipeline_tools = if config.pipeline_active() {
         let sampler: Arc<dyn pipeline::Sampler> = Arc::new(pipeline::AgentSampler {
-            agent: Arc::new(CliAgent::from_config(config, exchange_log())?.with_unauthorized_hint(UNAUTHORIZED_HINT)),
+            agent: Arc::new(
+                CliAgent::from_config(config, exchange_log())?
+                    .with_unauthorized_hint(UNAUTHORIZED_HINT),
+            ),
             settings: settings.clone(),
         });
-        match pipeline::PipelineServer::start_from_config(config, Some(sampler), exchange_log()).await {
+        match pipeline::PipelineServer::start_from_config(config, Some(sampler), exchange_log())
+            .await
+        {
             Ok(server) => Some(pipeline::PipelineTools { server }),
             Err(err) => {
                 eprintln!(
@@ -1676,24 +2050,12 @@ async fn ask_with_tools(
     } else {
         None
     };
-    // Индекс документов тоже необязателен; `index_build` в `ask` отклоняет
-    // `DenyWrites`, поэтому ход сборки показывать некому.
+    // Если индекс включён, без него нельзя безопасно отвечать на вопрос.
     let index_tools = if config.index_active() {
-        let started = match index::IndexSettings::from_config(config) {
-            Ok(settings) => index::IndexTools::start(&settings, index::Progress::Discard, exchange_log()).await,
-            Err(err) => Err(err),
-        };
-        match started {
-            Ok(tools) => Some(tools),
-            Err(err) => {
-                eprintln!(
-                    "{} {}",
-                    style("Внимание:").yellow().bold(),
-                    style(format!("инструменты индекса недоступны: {err}")).yellow()
-                );
-                None
-            }
-        }
+        let settings = index::IndexSettings::from_config(config)?;
+        Some(
+            index::IndexTools::start(&settings, index::Progress::Discard, exchange_log()).await?,
+        )
     } else {
         None
     };
@@ -1708,14 +2070,31 @@ async fn ask_with_tools(
 
     let result = {
         let tools = tool_loop::ToolSet::default()
-            .with(git_tools.as_ref().map(|tools| tools as &dyn tool_loop::ToolExecutor))
-            .with(activity_tools.as_ref().map(|tools| tools as &dyn tool_loop::ToolExecutor))
-            .with(pipeline_tools.as_ref().map(|tools| tools as &dyn tool_loop::ToolExecutor))
-            .with(index_tools.as_ref().map(|tools| tools as &dyn tool_loop::ToolExecutor));
+            .with(
+                git_tools
+                    .as_ref()
+                    .map(|tools| tools as &dyn tool_loop::ToolExecutor),
+            )
+            .with(
+                activity_tools
+                    .as_ref()
+                    .map(|tools| tools as &dyn tool_loop::ToolExecutor),
+            )
+            .with(
+                pipeline_tools
+                    .as_ref()
+                    .map(|tools| tools as &dyn tool_loop::ToolExecutor),
+            )
+            .with(
+                index_tools
+                    .as_ref()
+                    .map(|tools| tools as &dyn tool_loop::ToolExecutor),
+            );
         let mut backend = tool_loop::HistoryTurn {
             agent,
             history,
             settings,
+            instruction: None,
         };
         let observer = SpinnerObserver(spinner.clone());
         tool_loop::run_tool_loop(
@@ -1742,4 +2121,3 @@ async fn ask_with_tools(
     }
     result.map_err(|err| err.error)
 }
-

@@ -1,6 +1,6 @@
 use std::sync::OnceLock;
 
-use termimad::{crossterm::style::Color, MadSkin};
+use termimad::{MadSkin, crossterm::style::Color};
 
 /// Оформление markdown для ответов агента.
 ///

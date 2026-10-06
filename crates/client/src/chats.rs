@@ -6,10 +6,12 @@
 //! те же, что у [`ServerAgent`](crate::ServerAgent): вызывающая сторона
 //! различает причины через `downcast_ref::<AgentError>`, а не по тексту.
 
-use crate::{header_request_id, parse_service_error, ResponseFormatPayload};
-use agentcore::agent::{transport_error, AgentError, Message, MessageMeta, Role, ToolCall};
+use crate::{ResponseFormatPayload, header_request_id, parse_service_error};
+use agentcore::agent::{AgentError, Message, MessageMeta, Role, ToolCall, transport_error};
 use agentcore::config::{ChatSettings, ContextStrategy, Provider, ReasoningMode, ThinkingMode};
-use agentcore::logging::{request_id, unix_timestamp, ExchangeLog, RequestLogEntry, ResponseLogEntry};
+use agentcore::logging::{
+    ExchangeLog, RequestLogEntry, ResponseLogEntry, request_id, unix_timestamp,
+};
 use anyhow::Result;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -138,7 +140,11 @@ const TASK_STAGE_EDGES: [(&str, &str); 7] = [
 /// используется экраном состояния задачи, чтобы не предлагать заведомо
 /// недопустимые переходы (specs/task-state, design.md решение 9).
 pub fn allowed_next_stages(from: &str) -> Vec<&'static str> {
-    TASK_STAGE_EDGES.iter().filter(|(a, _)| *a == from).map(|(_, b)| *b).collect()
+    TASK_STAGE_EDGES
+        .iter()
+        .filter(|(a, _)| *a == from)
+        .map(|(_, b)| *b)
+        .collect()
 }
 
 /// Ветка чата стратегии `branching`.
@@ -166,7 +172,11 @@ pub struct ChatsClient {
 }
 
 impl ChatsClient {
-    pub fn new(server_url: impl Into<String>, token: impl Into<String>, log: Arc<ExchangeLog>) -> Self {
+    pub fn new(
+        server_url: impl Into<String>,
+        token: impl Into<String>,
+        log: Arc<ExchangeLog>,
+    ) -> Self {
         Self {
             client: reqwest::Client::new(),
             server_url: server_url.into(),
@@ -204,9 +214,14 @@ impl ChatsClient {
         let raw = self.send_raw(method, url, body).await?;
         // Ответ без тела (`204 No Content`) разбирается как `null`: так
         // `delete` возвращает `()` тем же путём, что остальные операции.
-        let text = if raw.trim().is_empty() { "null" } else { raw.as_str() };
-        serde_json::from_str(text)
-            .map_err(|err| AgentError::Decode(format!("не удалось разобрать ответ сервиса: {err}")).into())
+        let text = if raw.trim().is_empty() {
+            "null"
+        } else {
+            raw.as_str()
+        };
+        serde_json::from_str(text).map_err(|err| {
+            AgentError::Decode(format!("не удалось разобрать ответ сервиса: {err}")).into()
+        })
     }
 
     async fn send_raw(
@@ -273,7 +288,9 @@ impl ChatsClient {
         let mut cursor: Option<String> = None;
         loop {
             let url = match &cursor {
-                Some(cursor) => self.url(&format!("/chats?limit={CHATS_PAGE_LIMIT}&cursor={cursor}")),
+                Some(cursor) => {
+                    self.url(&format!("/chats?limit={CHATS_PAGE_LIMIT}&cursor={cursor}"))
+                }
                 None => self.url(&format!("/chats?limit={CHATS_PAGE_LIMIT}")),
             };
             let page: ChatListPayload = self.send(reqwest::Method::GET, url, None).await?;
@@ -405,10 +422,19 @@ impl ChatsClient {
                 None,
             )
             .await?;
-        Ok(payload.entries.into_iter().map(WorkingMemoryEntry::from).collect())
+        Ok(payload
+            .entries
+            .into_iter()
+            .map(WorkingMemoryEntry::from)
+            .collect())
     }
 
-    pub async fn set_working_memory(&self, chat_id: &str, key: &str, value: &str) -> Result<WorkingMemoryEntry> {
+    pub async fn set_working_memory(
+        &self,
+        chat_id: &str,
+        key: &str,
+        value: &str,
+    ) -> Result<WorkingMemoryEntry> {
         let payload: WorkingMemoryEntryPayload = self
             .send(
                 reqwest::Method::POST,
@@ -432,7 +458,11 @@ impl ChatsClient {
     /// Явное завершение текущей задачи: перенос отмеченных ключей в
     /// долговременную память, затем очистка рабочей памяти прежней задачи
     /// (specs/memory-layers, «Рабочая память привязана к задаче»).
-    pub async fn finish_task(&self, chat_id: &str, carry_forward_keys: &[String]) -> Result<Vec<LongTermMemoryEntry>> {
+    pub async fn finish_task(
+        &self,
+        chat_id: &str,
+        carry_forward_keys: &[String],
+    ) -> Result<Vec<LongTermMemoryEntry>> {
         let payload: LongTermMemoryPayload = self
             .send(
                 reqwest::Method::POST,
@@ -440,14 +470,22 @@ impl ChatsClient {
                 Some(serde_json::json!({ "carry_forward_keys": carry_forward_keys })),
             )
             .await?;
-        Ok(payload.entries.into_iter().map(LongTermMemoryEntry::from).collect())
+        Ok(payload
+            .entries
+            .into_iter()
+            .map(LongTermMemoryEntry::from)
+            .collect())
     }
 
     /// Состояние активной задачи чата вместе с журналом переходов
     /// (specs/task-state).
     pub async fn task(&self, chat_id: &str) -> Result<TaskState> {
         let payload: TaskStatePayload = self
-            .send(reqwest::Method::GET, self.url(&format!("/chats/{chat_id}/task")), None)
+            .send(
+                reqwest::Method::GET,
+                self.url(&format!("/chats/{chat_id}/task")),
+                None,
+            )
             .await?;
         Ok(TaskState::from(payload))
     }
@@ -508,9 +546,14 @@ impl ChatsClient {
 
     /// Долговременная память владельца (specs/memory-layers).
     pub async fn long_term_memory(&self) -> Result<Vec<LongTermMemoryEntry>> {
-        let payload: LongTermMemoryPayload =
-            self.send(reqwest::Method::GET, self.url("/memory/long-term"), None).await?;
-        Ok(payload.entries.into_iter().map(LongTermMemoryEntry::from).collect())
+        let payload: LongTermMemoryPayload = self
+            .send(reqwest::Method::GET, self.url("/memory/long-term"), None)
+            .await?;
+        Ok(payload
+            .entries
+            .into_iter()
+            .map(LongTermMemoryEntry::from)
+            .collect())
     }
 
     pub async fn set_long_term_memory(
@@ -530,20 +573,32 @@ impl ChatsClient {
     }
 
     pub async fn delete_long_term_memory(&self, id: &str) -> Result<()> {
-        self.send_raw(reqwest::Method::DELETE, self.url(&format!("/memory/long-term?id={id}")), None).await?;
+        self.send_raw(
+            reqwest::Method::DELETE,
+            self.url(&format!("/memory/long-term?id={id}")),
+            None,
+        )
+        .await?;
         Ok(())
     }
 
     /// Профили, доступные владельцу: встроенные плюс собственные
     /// (specs/user-profiles, «Встроенные профили видны без создания»).
     pub async fn profiles(&self) -> Result<Vec<Profile>> {
-        let payload: ProfilesPayload = self.send(reqwest::Method::GET, self.url("/profiles"), None).await?;
+        let payload: ProfilesPayload = self
+            .send(reqwest::Method::GET, self.url("/profiles"), None)
+            .await?;
         Ok(payload.profiles.into_iter().map(Profile::from).collect())
     }
 
     pub async fn profile(&self, id: &str) -> Result<Profile> {
-        let payload: ProfilePayload =
-            self.send(reqwest::Method::GET, self.url(&format!("/profiles/{id}")), None).await?;
+        let payload: ProfilePayload = self
+            .send(
+                reqwest::Method::GET,
+                self.url(&format!("/profiles/{id}")),
+                None,
+            )
+            .await?;
         Ok(Profile::from(payload))
     }
 
@@ -571,7 +626,11 @@ impl ChatsClient {
         Ok(Profile::from(payload))
     }
 
-    pub async fn create(&self, title: Option<&str>, settings: &ChatSettings) -> Result<ChatSummary> {
+    pub async fn create(
+        &self,
+        title: Option<&str>,
+        settings: &ChatSettings,
+    ) -> Result<ChatSummary> {
         let mut body = serde_json::json!({ "settings": settings_payload(settings) });
         if let Some(title) = title.map(str::trim).filter(|title| !title.is_empty()) {
             body["title"] = serde_json::Value::String(title.to_string());
@@ -592,7 +651,10 @@ impl ChatsClient {
     ) -> Result<ChatSummary> {
         let mut body = serde_json::Map::new();
         if let Some(title) = title.map(str::trim).filter(|title| !title.is_empty()) {
-            body.insert("title".to_string(), serde_json::Value::String(title.to_string()));
+            body.insert(
+                "title".to_string(),
+                serde_json::Value::String(title.to_string()),
+            );
         }
         if let Some(settings) = settings {
             body.insert("settings".to_string(), settings_payload(settings));
@@ -608,8 +670,12 @@ impl ChatsClient {
     }
 
     pub async fn delete(&self, id: &str) -> Result<()> {
-        self.send_raw(reqwest::Method::DELETE, self.url(&format!("/chats/{id}")), None)
-            .await?;
+        self.send_raw(
+            reqwest::Method::DELETE,
+            self.url(&format!("/chats/{id}")),
+            None,
+        )
+        .await?;
         Ok(())
     }
 
@@ -617,7 +683,8 @@ impl ChatsClient {
     /// клиент, и в сервис он уходит одним запросом — иначе в чате мог бы
     /// остаться вопрос без ответа.
     pub async fn append(&self, id: &str, messages: &[Message]) -> Result<Vec<i64>> {
-        let payload: Vec<NewMessagePayload> = messages.iter().map(NewMessagePayload::from).collect();
+        let payload: Vec<NewMessagePayload> =
+            messages.iter().map(NewMessagePayload::from).collect();
         let response: AppendPayload = self
             .send(
                 reqwest::Method::POST,
@@ -639,7 +706,10 @@ fn settings_payload(settings: &ChatSettings) -> serde_json::Value {
             Provider::Cloud => "cloud",
             Provider::Ollama => "ollama",
         },
-        model: settings.model.clone().filter(|model| !model.trim().is_empty()),
+        model: settings
+            .model
+            .clone()
+            .filter(|model| !model.trim().is_empty()),
         reasoning: settings.reasoning,
         thinking: settings.thinking,
         experts: settings.experts.clone(),
@@ -910,7 +980,12 @@ struct WorkingMemoryEntryPayload {
 
 impl From<WorkingMemoryEntryPayload> for WorkingMemoryEntry {
     fn from(payload: WorkingMemoryEntryPayload) -> Self {
-        Self { key: payload.key, value: payload.value, source: payload.source, updated_at: payload.updated_at }
+        Self {
+            key: payload.key,
+            value: payload.value,
+            source: payload.source,
+            updated_at: payload.updated_at,
+        }
     }
 }
 
@@ -956,7 +1031,11 @@ impl From<TaskStatePayload> for TaskState {
             expected_action: payload.expected_action,
             paused: payload.paused,
             resume_brief: payload.resume_brief,
-            transitions: payload.transitions.into_iter().map(TaskTransition::from).collect(),
+            transitions: payload
+                .transitions
+                .into_iter()
+                .map(TaskTransition::from)
+                .collect(),
         }
     }
 }

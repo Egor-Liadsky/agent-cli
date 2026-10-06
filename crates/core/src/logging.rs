@@ -9,8 +9,8 @@
 use serde::Serialize;
 use std::io::Write;
 use std::path::PathBuf;
-use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::Arc;
+use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread::JoinHandle;
 use std::time::{SystemTime, UNIX_EPOCH};
 

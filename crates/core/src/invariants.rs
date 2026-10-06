@@ -132,8 +132,9 @@ impl InvariantGuard {
             .or_else(|| trimmed.strip_prefix("```"))
             .map(|rest| rest.trim_end_matches("```").trim())
             .unwrap_or(trimmed);
-        serde_json::from_str(json)
-            .with_context(|| format!("вердикт InvariantGuard не в ожидаемом формате JSON: {content}"))
+        serde_json::from_str(json).with_context(|| {
+            format!("вердикт InvariantGuard не в ожидаемом формате JSON: {content}")
+        })
     }
 }
 
@@ -307,8 +308,12 @@ category = "security"
     }
 
     fn context_with(invariants: InvariantSet) -> RequestContext {
-        RequestContext::new("req-1", vec![Message::user("вопрос")], ChatSettings::default())
-            .with_invariants(invariants)
+        RequestContext::new(
+            "req-1",
+            vec![Message::user("вопрос")],
+            ChatSettings::default(),
+        )
+        .with_invariants(invariants)
     }
 
     fn reply(content: &str) -> AgentReply {
@@ -328,7 +333,10 @@ category = "security"
         let agent = FakeAgent::new("не важно");
         let guard = InvariantGuard::new(agent.clone());
         let outcome = guard
-            .check(&context_with(InvariantSet::default()), &reply("любой ответ"))
+            .check(
+                &context_with(InvariantSet::default()),
+                &reply("любой ответ"),
+            )
             .await
             .expect("проверка");
         assert!(matches!(outcome, PolicyOutcome::Pass));
@@ -361,7 +369,8 @@ category = "security"
 
     #[tokio::test]
     async fn no_violation_verdict_passes() {
-        let agent = FakeAgent::new(r#"{"violated": false, "invariant_id": null, "explanation": null}"#);
+        let agent =
+            FakeAgent::new(r#"{"violated": false, "invariant_id": null, "explanation": null}"#);
         let guard = InvariantGuard::new(agent);
         let set = InvariantSet {
             invariants: vec![secret_invariant()],
@@ -401,7 +410,10 @@ category = "security"
             } => {
                 assert_eq!(stage, "invariant-guard");
                 assert_eq!(code, INVARIANT_VIOLATION_CODE);
-                assert!(policy.input.is_empty(), "отказ не должен попасть во входной лог");
+                assert!(
+                    policy.input.is_empty(),
+                    "отказ не должен попасть во входной лог"
+                );
                 assert_eq!(policy.output.len(), 1);
                 assert_eq!(policy.output[0].stage, "invariant-guard");
             }
@@ -428,7 +440,11 @@ category = "security"
                 panic!("не ожидался отказ, получен {stage}/{code}")
             }
         }
-        assert_eq!(agent.calls(), 1, "InvariantGuard не должен вызывать агента при пустом наборе");
+        assert_eq!(
+            agent.calls(),
+            1,
+            "InvariantGuard не должен вызывать агента при пустом наборе"
+        );
     }
 
     #[tokio::test]

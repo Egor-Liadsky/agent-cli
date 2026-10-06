@@ -18,17 +18,19 @@ use crate::pipeline::expand;
 use crate::tool_loop::ToolExecutor;
 use agentcore::agent::{AgentError, ToolCall, ToolSpec};
 use agentcore::config::Config;
-use agentcore::logging::{request_id, unix_timestamp, ExchangeLog, RequestLogEntry, ResponseLogEntry};
+use agentcore::logging::{
+    ExchangeLog, RequestLogEntry, ResponseLogEntry, request_id, unix_timestamp,
+};
 use anyhow::Result;
 use async_trait::async_trait;
 use rmcp::model::{CallToolRequestParams, CallToolResult, ContentBlock};
 use rmcp::service::{RunningService, ServiceError};
 use rmcp::transport::TokioChildProcess;
 use rmcp::{RoleClient, ServiceExt};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufReadExt, BufReader};
 
@@ -40,6 +42,8 @@ pub const INDEX_SEARCH: &str = "index_search";
 pub const INDEX_STATUS: &str = "index_status";
 pub const INDEX_MODELS: &str = "index_models";
 pub const INDEX_BUILD: &str = "index_build";
+const DEFAULT_RAG_THRESHOLD: f32 = 0.5;
+const RAG_INSTRUCTION: &str = "Ответь только по чанкам, полученным через index_search. Используй отдельные заголовки \"Ответ\", \"Источники\" и \"Цитаты\". В \"Ответе\" пиши каждый факт отдельным пунктом и заканчивай пункт ссылкой [chunk_id]. В \"Источниках\" укажи для каждого использованного чанка строку `- chunk_id: <id>; source: <source>; section: <section>` с точными значениями из результата. В \"Цитатах\" приведи для каждого пункта точную непрерывную цитату из этого чанка в формате `- <chunk_id>: «цитата»`. Не добавляй факты, которые цитата не подтверждает. Если чанки не отвечают на вопрос, напиши \"Не знаю\" и задай уточняющий вопрос. Порог релевантности задаёт клиент; не пытайся менять его.";
 
 /// Читающие инструменты; всё прочее, включая будущие, — пишущее.
 pub const READ_ONLY_TOOLS: [&str; 3] = [INDEX_SEARCH, INDEX_STATUS, INDEX_MODELS];
@@ -87,7 +91,10 @@ fn unavailable(reason: impl Into<String>) -> AgentError {
 }
 
 fn non_empty(value: &Option<String>) -> Option<&str> {
-    value.as_deref().map(str::trim).filter(|value| !value.is_empty())
+    value
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
 }
 
 /// Настройки индекса, снятые с конфига: их можно поправить флагами команды,
@@ -104,13 +111,24 @@ pub struct IndexSettings {
     pub max_section: Option<usize>,
     pub min_section: Option<usize>,
     pub ollama_url: Option<String>,
+    pub top_k: Option<usize>,
+    pub candidate_top_k: Option<usize>,
+    pub similarity_threshold: Option<f32>,
+    pub rewrite: Option<bool>,
+    pub rewrite_model: Option<String>,
 }
 
 impl IndexSettings {
+    fn effective_similarity_threshold(&self) -> f32 {
+        self.similarity_threshold.unwrap_or(DEFAULT_RAG_THRESHOLD)
+    }
+
     /// `Err`, если база не задана: без неё нечего открывать и некуда строить.
     pub fn from_config(config: &Config) -> Result<Self> {
         let db = non_empty(&config.index_db)
-            .ok_or_else(|| anyhow::anyhow!("не задана база индекса: agentcli config index set --db <ФАЙЛ>"))?
+            .ok_or_else(|| {
+                anyhow::anyhow!("не задана база индекса: agentcli config index set --db <ФАЙЛ>")
+            })?
             .to_string();
         Ok(Self {
             root: non_empty(&config.index_root).map(str::to_string),
@@ -123,6 +141,11 @@ impl IndexSettings {
             max_section: config.index_max_section,
             min_section: config.index_min_section,
             ollama_url: non_empty(&config.index_ollama_url).map(str::to_string),
+            top_k: config.index_top_k,
+            candidate_top_k: config.index_candidate_top_k,
+            similarity_threshold: config.index_similarity_threshold,
+            rewrite: config.index_rewrite,
+            rewrite_model: non_empty(&config.index_rewrite_model).map(str::to_string),
         })
     }
 
@@ -131,8 +154,16 @@ impl IndexSettings {
     /// процессе работают одной моделью. Стратегия `all` поиску не подходит —
     /// её решает сервер (единственная в базе) или сама модель аргументом.
     pub fn serve_args(&self) -> Vec<String> {
-        let mut args = vec!["serve".to_string(), "--db".to_string(), expand(&self.db).to_string_lossy().into_owned()];
-        if let Some(strategy) = self.strategy.as_deref().filter(|strategy| *strategy != "all") {
+        let mut args = vec![
+            "serve".to_string(),
+            "--db".to_string(),
+            expand(&self.db).to_string_lossy().into_owned(),
+        ];
+        if let Some(strategy) = self
+            .strategy
+            .as_deref()
+            .filter(|strategy| *strategy != "all")
+        {
             args.extend(["--strategy".to_string(), strategy.to_string()]);
         }
         if let Some(model) = &self.model {
@@ -140,6 +171,30 @@ impl IndexSettings {
         }
         if let Some(url) = &self.ollama_url {
             args.extend(["--ollama-url".to_string(), url.clone()]);
+        }
+        if let Some(model) = &self.rewrite_model {
+            args.extend(["--rewrite-model".to_string(), model.clone()]);
+        }
+        args
+    }
+
+    /// Аргументы index_search из настроек; явные аргументы модели имеют приоритет.
+    pub fn search_arguments(&self, query: &str) -> Value {
+        let mut args = json!({ "query": query });
+        if let Some(object) = args.as_object_mut() {
+            if let Some(value) = self.top_k {
+                object.insert("top_k".into(), json!(value));
+            }
+            if let Some(value) = self.candidate_top_k {
+                object.insert("candidate_top_k".into(), json!(value));
+            }
+            object.insert(
+                "similarity_threshold".into(),
+                json!(self.effective_similarity_threshold()),
+            );
+            if let Some(value) = self.rewrite {
+                object.insert("rewrite".into(), json!(value));
+            }
         }
         args
     }
@@ -184,7 +239,12 @@ pub struct IndexServer {
 }
 
 impl IndexServer {
-    pub async fn start(program: &Path, settings: &IndexSettings, progress: Progress, log: Arc<ExchangeLog>) -> Result<Self> {
+    pub async fn start(
+        program: &Path,
+        settings: &IndexSettings,
+        progress: Progress,
+        log: Arc<ExchangeLog>,
+    ) -> Result<Self> {
         let mut command = tokio::process::Command::new(program);
         command.args(settings.serve_args()).kill_on_drop(true);
         let stderr = match progress {
@@ -216,15 +276,18 @@ impl IndexServer {
                 .serve(transport)
                 .await
                 .map_err(|err| unavailable(format!("рукопожатие MCP не прошло: {err}")))?;
-            let tools = service
-                .peer()
-                .list_all_tools()
-                .await
-                .map_err(|err| unavailable(format!("не удалось получить список инструментов: {err}")))?;
+            let tools = service.peer().list_all_tools().await.map_err(|err| {
+                unavailable(format!("не удалось получить список инструментов: {err}"))
+            })?;
             Ok::<_, AgentError>((service, tools))
         })
         .await
-        .map_err(|_| unavailable(format!("сервер не запустился за {} с", START_TIMEOUT.as_secs())))??;
+        .map_err(|_| {
+            unavailable(format!(
+                "сервер не запустился за {} с",
+                START_TIMEOUT.as_secs()
+            ))
+        })??;
         let specs = tools
             .into_iter()
             .map(|tool| ToolSpec {
@@ -246,7 +309,11 @@ impl IndexServer {
 
     /// Сырой результат вызова с записью в журнал обмена. `Err` — сервер не
     /// ответил (упал, завис): это уже не ошибка инструмента.
-    async fn call_raw(&self, name: &str, arguments: &Value) -> std::result::Result<CallToolResult, AgentError> {
+    async fn call_raw(
+        &self,
+        name: &str,
+        arguments: &Value,
+    ) -> std::result::Result<CallToolResult, AgentError> {
         let arguments = arguments.as_object().cloned().unwrap_or_default();
         let id = request_id();
         self.log.log_request(&RequestLogEntry {
@@ -261,18 +328,30 @@ impl IndexServer {
             Some(service) => service.peer().clone(),
             None => return Err(unavailable("сервер уже остановлен")),
         };
-        let timeout = if name == INDEX_BUILD { BUILD_TIMEOUT } else { CALL_TIMEOUT };
+        let timeout = if name == INDEX_BUILD {
+            BUILD_TIMEOUT
+        } else {
+            CALL_TIMEOUT
+        };
         let params = CallToolRequestParams::new(name.to_string()).with_arguments(arguments);
         let outcome = tokio::time::timeout(timeout, peer.call_tool(params)).await;
         let (status, logged, result) = match outcome {
             Ok(Ok(result)) => {
-                let status = if result.is_error == Some(true) { 500 } else { 200 };
+                let status = if result.is_error == Some(true) {
+                    500
+                } else {
+                    200
+                };
                 let text = serde_json::to_string(&result.content).unwrap_or_default();
                 (status, text, Ok(result))
             }
             Ok(Err(ServiceError::McpError(error))) => {
                 let text = format!("Ошибка инструмента: {}", error.message);
-                (500, text.clone(), Ok(CallToolResult::error(vec![ContentBlock::text(text)])))
+                (
+                    500,
+                    text.clone(),
+                    Ok(CallToolResult::error(vec![ContentBlock::text(text)])),
+                )
             }
             Ok(Err(error)) => {
                 let text = format!("сервер перестал отвечать: {error}");
@@ -295,7 +374,11 @@ impl IndexServer {
 
     /// Вызов инструмента как данных: JSON из `structuredContent` либо текст
     /// ошибки инструмента. Внешний `Err` — сервер недоступен.
-    pub async fn call_json(&self, name: &str, arguments: Value) -> Result<std::result::Result<Value, String>> {
+    pub async fn call_json(
+        &self,
+        name: &str,
+        arguments: Value,
+    ) -> Result<std::result::Result<Value, String>> {
         let result = self.call_raw(name, &arguments).await?;
         let content = content_array(&result);
         if result.is_error == Some(true) {
@@ -329,7 +412,13 @@ pub fn build_summary(value: &Value) -> String {
         .as_array()
         .into_iter()
         .flatten()
-        .map(|s| format!("{} — {} чанков", s["strategy"].as_str().unwrap_or("?"), s["chunks"]))
+        .map(|s| {
+            format!(
+                "{} — {} чанков",
+                s["strategy"].as_str().unwrap_or("?"),
+                s["chunks"]
+            )
+        })
         .collect();
     format!(
         "готово: {} (модель {}, dim {})",
@@ -345,25 +434,128 @@ pub struct IndexTools {
     /// Настройки сборки из конфига: подставляются в `index_build`, чего
     /// модель не назвала сама.
     build_defaults: Option<Value>,
+    search_defaults: Value,
+    grounding_threshold: f32,
+    grounding_hits: Mutex<Vec<GroundingHit>>,
 }
 
 impl IndexTools {
-    pub async fn start(settings: &IndexSettings, progress: Progress, log: Arc<ExchangeLog>) -> Result<Self> {
+    pub async fn start(
+        settings: &IndexSettings,
+        progress: Progress,
+        log: Arc<ExchangeLog>,
+    ) -> Result<Self> {
         let server = IndexServer::start(&server_program(), settings, progress, log).await?;
         Ok(Self {
             server,
             build_defaults: settings.build_arguments(),
+            search_defaults: settings.search_arguments(""),
+            grounding_threshold: settings.effective_similarity_threshold(),
+            grounding_hits: Mutex::new(Vec::new()),
         })
     }
 }
 
 /// Аргументы модели поверх настроек конфига: явное слово модели весомее.
 fn merge_build_arguments(defaults: Option<&Value>, given: &Value) -> Value {
-    let mut merged = defaults.and_then(Value::as_object).cloned().unwrap_or_default();
+    let mut merged = defaults
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
     if let Some(given) = given.as_object() {
         merged.extend(given.clone());
     }
     Value::Object(merged)
+}
+
+fn merge_search_arguments(defaults: &Value, given: &Value) -> Value {
+    let mut merged = defaults.as_object().cloned().unwrap_or_default();
+    if let Some(given) = given.as_object() {
+        merged.extend(given.clone());
+    }
+    merged.insert(
+        "similarity_threshold".into(),
+        defaults
+            .get("similarity_threshold")
+            .cloned()
+            .unwrap_or_else(|| json!(DEFAULT_RAG_THRESHOLD)),
+    );
+    Value::Object(merged)
+}
+
+#[derive(Debug, Clone)]
+struct GroundingHit {
+    chunk_id: String,
+    source: String,
+    section: String,
+    text: String,
+}
+
+fn validate_grounded_answer(
+    answer: &str,
+    hits: &[GroundingHit],
+) -> std::result::Result<(), String> {
+    let mut section = "";
+    let (mut claims, mut sources, mut quotes) = (Vec::new(), Vec::new(), Vec::new());
+    for raw_line in answer.lines() {
+        let line = raw_line.trim();
+        let heading = line
+            .trim_start_matches('#')
+            .trim()
+            .trim_matches('*')
+            .trim()
+            .trim_end_matches(':')
+            .trim();
+        if ["Ответ", "Источники", "Цитаты"].contains(&heading) {
+            section = heading;
+        } else if !line.is_empty() {
+            match section {
+                "Ответ" => claims.push(line),
+                "Источники" => sources.push(line),
+                "Цитаты" => quotes.push(line),
+                _ => return Err("текст вне обязательных разделов".into()),
+            }
+        }
+    }
+    if claims.is_empty() || sources.is_empty() || quotes.is_empty() {
+        return Err("нужны непустые разделы «Ответ», «Источники» и «Цитаты»".into());
+    }
+
+    for claim in claims {
+        if !claim.starts_with("- ") {
+            return Err("каждое утверждение должно быть отдельным пунктом".into());
+        }
+        let Some((text, reference)) = claim.rsplit_once(" [") else {
+            return Err("у утверждения нет ссылки [chunk_id]".into());
+        };
+        let Some(chunk_id) = reference.strip_suffix(']') else {
+            return Err("ссылка на chunk_id оформлена неверно".into());
+        };
+        if text.trim().len() <= 2 {
+            return Err("пустое утверждение".into());
+        }
+        let hit = hits
+            .iter()
+            .find(|hit| hit.chunk_id == chunk_id)
+            .ok_or_else(|| "утверждение ссылается на неизвестный chunk_id".to_string())?;
+        let expected_source = format!(
+            "- chunk_id: {}; source: {}; section: {}",
+            hit.chunk_id, hit.source, hit.section
+        );
+        if !sources.contains(&expected_source.as_str()) {
+            return Err(format!("нет полного источника для {}", hit.chunk_id));
+        }
+        let prefix = format!("- {}: «", hit.chunk_id);
+        let quote = quotes
+            .iter()
+            .filter_map(|line| line.strip_prefix(&prefix))
+            .find_map(|quote| quote.strip_suffix('»'))
+            .filter(|quote| !quote.is_empty() && hit.text.contains(quote));
+        if quote.is_none() {
+            return Err(format!("нет дословной цитаты из {}", hit.chunk_id));
+        }
+    }
+    Ok(())
 }
 
 #[async_trait]
@@ -379,7 +571,10 @@ impl ToolExecutor for IndexTools {
                 // его знать, а без `input` в `required` она не будет выдумывать путь.
                 if spec.name == INDEX_BUILD
                     && self.build_defaults.is_some()
-                    && let Some(required) = spec.parameters.get_mut("required").and_then(Value::as_array_mut)
+                    && let Some(required) = spec
+                        .parameters
+                        .get_mut("required")
+                        .and_then(Value::as_array_mut)
                 {
                     required.retain(|name| name != "input");
                 }
@@ -392,12 +587,71 @@ impl ToolExecutor for IndexTools {
         !is_read_only(name)
     }
 
+    fn grounding_instruction(&self) -> Option<&'static str> {
+        Some(RAG_INSTRUCTION)
+    }
+
+    fn grounding_has_context(&self) -> bool {
+        self.grounding_hits
+            .lock()
+            .is_ok_and(|hits| !hits.is_empty())
+    }
+
+    fn validate_grounded_answer(&self, answer: &str) -> std::result::Result<(), String> {
+        let hits = self
+            .grounding_hits
+            .lock()
+            .map_err(|_| "не удалось прочитать источники индекса".to_string())?;
+        validate_grounded_answer(answer, &hits)
+    }
+
     async fn call(&self, call: &ToolCall) -> Result<String> {
         let arguments = if call.name == INDEX_BUILD {
             merge_build_arguments(self.build_defaults.as_ref(), &call.arguments)
+        } else if call.name == INDEX_SEARCH {
+            merge_search_arguments(&self.search_defaults, &call.arguments)
         } else {
             call.arguments.clone()
         };
+        if call.name == INDEX_SEARCH {
+            return match self.server.call_json(INDEX_SEARCH, arguments).await? {
+                Ok(mut value) => {
+                    let eligible: Vec<Value> = value["hits"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .filter(|hit| {
+                            hit["score"]
+                                .as_f64()
+                                .is_some_and(|score| score >= f64::from(self.grounding_threshold))
+                        })
+                        .cloned()
+                        .collect();
+                    let mut trusted = self.grounding_hits.lock().map_err(|_| {
+                        anyhow::anyhow!("не удалось сохранить результаты index_search")
+                    })?;
+                    for hit in &eligible {
+                        let parsed = GroundingHit {
+                            chunk_id: hit["chunk_id"].as_str().unwrap_or_default().to_string(),
+                            source: hit["source"].as_str().unwrap_or_default().to_string(),
+                            section: hit["section"].as_str().unwrap_or_default().to_string(),
+                            text: hit["text"].as_str().unwrap_or_default().to_string(),
+                        };
+                        if !parsed.chunk_id.is_empty()
+                            && !trusted
+                                .iter()
+                                .any(|existing| existing.chunk_id == parsed.chunk_id)
+                        {
+                            trusted.push(parsed);
+                        }
+                    }
+                    value["hits"] = json!(eligible);
+                    value["results"] = json!(eligible.len());
+                    Ok(serde_json::to_string(&value)?)
+                }
+                Err(error) => Ok(error),
+            };
+        }
         let result = self.server.call_raw(&call.name, &arguments).await?;
         Ok(format_result(&content_array(&result), result.is_error == Some(true)))
     }
@@ -419,6 +673,7 @@ mod tests {
             max_section: Some(600),
             min_section: None,
             ollama_url: Some("http://gpu:11434".into()),
+            ..IndexSettings::default()
         }
     }
 
@@ -426,10 +681,24 @@ mod tests {
     fn serve_args_carry_db_model_and_url() {
         assert_eq!(
             settings().serve_args(),
-            ["serve", "--db", "/tmp/idx.db", "--strategy", "structure", "--model", "bge-m3", "--ollama-url", "http://gpu:11434"]
+            [
+                "serve",
+                "--db",
+                "/tmp/idx.db",
+                "--strategy",
+                "structure",
+                "--model",
+                "bge-m3",
+                "--ollama-url",
+                "http://gpu:11434"
+            ]
         );
         // Пустые настройки — сервер берёт свои умолчания; `all` поиску не нужна.
-        let bare = IndexSettings { db: "/i.db".into(), strategy: Some("all".into()), ..IndexSettings::default() };
+        let bare = IndexSettings {
+            db: "/i.db".into(),
+            strategy: Some("all".into()),
+            ..IndexSettings::default()
+        };
         assert_eq!(bare.serve_args(), ["serve", "--db", "/i.db"]);
     }
 
@@ -439,8 +708,89 @@ mod tests {
             settings().build_arguments().unwrap(),
             json!({ "input": "/notes", "strategy": "structure", "unit": "tokens", "chunk_size": 400, "max_section": 600 })
         );
-        let no_root = IndexSettings { db: "/i.db".into(), ..IndexSettings::default() };
+        let no_root = IndexSettings {
+            db: "/i.db".into(),
+            ..IndexSettings::default()
+        };
         assert_eq!(no_root.build_arguments(), None);
+    }
+
+    #[test]
+    fn search_arguments_enforce_the_configured_minimum() {
+        let bare = IndexSettings {
+            db: "/tmp/idx.db".into(),
+            ..IndexSettings::default()
+        };
+        assert_eq!(
+            bare.search_arguments("legacy"),
+            json!({ "query": "legacy", "similarity_threshold": 0.5 })
+        );
+        let mut settings = settings();
+        settings.top_k = Some(3);
+        settings.candidate_top_k = Some(12);
+        settings.similarity_threshold = Some(0.7);
+        settings.rewrite = Some(true);
+        settings.rewrite_model = Some("qwen".into());
+        assert_eq!(
+            settings.search_arguments("UDP"),
+            json!({
+                "query": "UDP",
+                "top_k": 3,
+                "candidate_top_k": 12,
+                "similarity_threshold": 0.7_f32,
+                "rewrite": true
+            })
+        );
+        assert_eq!(
+            merge_search_arguments(
+                &settings.search_arguments(""),
+                &json!({"query": "TCP", "top_k": 1, "similarity_threshold": -1.0})
+            ),
+            json!({
+                "query": "TCP",
+                "top_k": 1,
+                "candidate_top_k": 12,
+                "similarity_threshold": 0.7_f32,
+                "rewrite": true
+            })
+        );
+        assert!(
+            settings
+                .serve_args()
+                .ends_with(&["--rewrite-model".into(), "qwen".into()])
+        );
+        assert_eq!(
+            merge_search_arguments(
+                &bare.search_arguments(""),
+                &json!({"query": "TCP", "similarity_threshold": -1.0})
+            )["similarity_threshold"],
+            0.5
+        );
+    }
+
+    #[test]
+    fn grounded_answers_need_known_sources_and_exact_quotes() {
+        let hit = GroundingHit {
+            chunk_id: "fixed:notes:0001".into(),
+            source: "notes.docx".into(),
+            section: "Guide > Basics".into(),
+            text: "Для поиска вектор хранится в базе SQLite и сравнивается с вопросом.".into(),
+        };
+        let valid = "## Ответ\n- Индекс хранит вектор чанка [fixed:notes:0001]\n\
+## Источники\n- chunk_id: fixed:notes:0001; source: notes.docx; section: Guide > Basics\n\
+## Цитаты\n- fixed:notes:0001: «вектор хранится в базе SQLite»";
+        assert!(validate_grounded_answer(valid, std::slice::from_ref(&hit)).is_ok());
+
+        for invalid in [
+            valid.replace(" [fixed:notes:0001]", ""),
+            valid.replace("source: notes.docx", "source: other.docx"),
+            valid.replace("вектор хранится в базе SQLite", "Вектор всегда точен."),
+        ] {
+            assert!(
+                validate_grounded_answer(&invalid, std::slice::from_ref(&hit)).is_err(),
+                "неверная атрибуция прошла: {invalid}"
+            );
+        }
     }
 
     #[test]
@@ -462,12 +812,18 @@ mod tests {
     #[test]
     fn model_arguments_win_over_config_defaults() {
         let defaults = settings().build_arguments();
-        let merged = merge_build_arguments(defaults.as_ref(), &json!({ "strategy": "fixed", "min_chars": 0 }));
+        let merged = merge_build_arguments(
+            defaults.as_ref(),
+            &json!({ "strategy": "fixed", "min_chars": 0 }),
+        );
         assert_eq!(merged["strategy"], "fixed");
         assert_eq!(merged["input"], "/notes");
         assert_eq!(merged["chunk_size"], 400);
         assert_eq!(merged["min_chars"], 0);
-        assert_eq!(merge_build_arguments(None, &json!({ "input": "/x" })), json!({ "input": "/x" }));
+        assert_eq!(
+            merge_build_arguments(None, &json!({ "input": "/x" })),
+            json!({ "input": "/x" })
+        );
     }
 
     #[test]
@@ -488,7 +844,10 @@ mod tests {
     #[tokio::test]
     #[ignore]
     async fn live_index_builds_and_searches_against_real_server() {
-        let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
         let dir = std::env::temp_dir().join(format!("agentcli-index-{nanos}"));
         std::fs::create_dir_all(&dir).unwrap();
         let settings = IndexSettings {
@@ -496,22 +855,47 @@ mod tests {
             ollama_url: std::env::var("INDEX_OLLAMA_URL").ok(),
             ..IndexSettings::default()
         };
-        let server = IndexServer::start(&server_program(), &settings, Progress::Discard, Arc::new(ExchangeLog::disabled()))
-            .await
-            .expect("запуск index-mcp");
-        let names: Vec<&str> = server.specs().iter().map(|spec| spec.name.as_str()).collect();
+        let server = IndexServer::start(
+            &server_program(),
+            &settings,
+            Progress::Discard,
+            Arc::new(ExchangeLog::disabled()),
+        )
+        .await
+        .expect("запуск index-mcp");
+        let names: Vec<&str> = server
+            .specs()
+            .iter()
+            .map(|spec| spec.name.as_str())
+            .collect();
         for tool in [INDEX_SEARCH, INDEX_STATUS, INDEX_MODELS, INDEX_BUILD] {
             assert!(names.contains(&tool), "{names:?}");
         }
-        let status = server.call_json(INDEX_STATUS, json!({})).await.unwrap().unwrap();
+        let status = server
+            .call_json(INDEX_STATUS, json!({}))
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(status["exists"], false);
-        let models = server.call_json(INDEX_MODELS, json!({})).await.unwrap().unwrap();
+        let models = server
+            .call_json(INDEX_MODELS, json!({}))
+            .await
+            .unwrap()
+            .unwrap();
         assert!(
-            models["models"].as_array().unwrap().iter().any(|m| m["name"].as_str().unwrap().starts_with("nomic-embed-text")),
+            models["models"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|m| m["name"].as_str().unwrap().starts_with("nomic-embed-text")),
             "{models}"
         );
         // Корпус без .docx строить нечем: сервер отвечает ошибкой инструмента, а не падает.
-        let err = server.call_json(INDEX_BUILD, json!({ "input": dir })).await.unwrap().unwrap_err();
+        let err = server
+            .call_json(INDEX_BUILD, json!({ "input": dir }))
+            .await
+            .unwrap()
+            .unwrap_err();
         assert!(err.contains("нет файлов .docx"), "{err}");
         server.shutdown().await;
     }

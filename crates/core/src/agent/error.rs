@@ -246,6 +246,9 @@ mod tests {
         };
         assert_eq!(error.request_id(), Some("req-7"));
         assert!(error.to_string().contains("req-7"));
-        assert_eq!(AgentError::ToolLoopLimit { iterations: 3 }.request_id(), None);
+        assert_eq!(
+            AgentError::ToolLoopLimit { iterations: 3 }.request_id(),
+            None
+        );
     }
 }

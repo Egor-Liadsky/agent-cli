@@ -11,8 +11,8 @@
 use crate::activity::{ActivityClient, Endpoint};
 use agentcore::config::Config;
 use agentcore::logging::ExchangeLog;
-use anyhow::{anyhow, bail, Context, Result};
-use serde_json::{json, Value};
+use anyhow::{Context, Result, anyhow, bail};
+use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -69,7 +69,8 @@ pub fn listen_address(url: &str) -> Result<String> {
     let (host, port) = authority
         .rsplit_once(':')
         .ok_or_else(|| anyhow!("в адресе демона {url} нет порта"))?;
-    port.parse::<u16>().map_err(|_| anyhow!("неверный порт в адресе демона {url}"))?;
+    port.parse::<u16>()
+        .map_err(|_| anyhow!("неверный порт в адресе демона {url}"))?;
     let host = match host {
         "localhost" | "127.0.0.1" => "127.0.0.1",
         "[::1]" => "[::1]",
@@ -95,7 +96,9 @@ impl DaemonSpec {
             .as_deref()
             .map(str::trim)
             .filter(|root| !root.is_empty())
-            .ok_or_else(|| anyhow!("не задан каталог проектов: поле «Каталог проектов» в Ctrl+P или --root"))?;
+            .ok_or_else(|| {
+                anyhow!("не задан каталог проектов: поле «Каталог проектов» в Ctrl+P или --root")
+            })?;
         let root = expand_home(root);
         if !root.is_dir() {
             bail!("каталог проектов {} не существует", root.display());
@@ -108,7 +111,10 @@ impl DaemonSpec {
                 .activity_schedule
                 .clone()
                 .filter(|schedule| !schedule.trim().is_empty()),
-            token: config.activity_token.clone().filter(|token| !token.trim().is_empty()),
+            token: config
+                .activity_token
+                .clone()
+                .filter(|token| !token.trim().is_empty()),
         })
     }
 
@@ -125,7 +131,10 @@ impl DaemonSpec {
             args.extend(["--schedule".to_string(), schedule.clone()]);
         }
         if let Some(file) = token_file {
-            args.extend(["--token-file".to_string(), file.to_string_lossy().into_owned()]);
+            args.extend([
+                "--token-file".to_string(),
+                file.to_string_lossy().into_owned(),
+            ]);
         }
         args
     }
@@ -133,7 +142,9 @@ impl DaemonSpec {
 
 fn expand_home(path: &str) -> PathBuf {
     match path.strip_prefix("~/") {
-        Some(rest) => dirs::home_dir().map(|home| home.join(rest)).unwrap_or_else(|| PathBuf::from(path)),
+        Some(rest) => dirs::home_dir()
+            .map(|home| home.join(rest))
+            .unwrap_or_else(|| PathBuf::from(path)),
         None => PathBuf::from(path),
     }
 }
@@ -144,7 +155,9 @@ fn home() -> Result<PathBuf> {
 
 /// Токен — в файл рядом с конфигом клиента, только для владельца.
 fn write_token_file(token: &str) -> Result<PathBuf> {
-    let dir = dirs::config_dir().context("не удалось определить каталог конфигов")?.join("agentcli");
+    let dir = dirs::config_dir()
+        .context("не удалось определить каталог конфигов")?
+        .join("agentcli");
     std::fs::create_dir_all(&dir)?;
     let path = dir.join("activity-token");
     std::fs::write(&path, token)?;
@@ -166,7 +179,12 @@ fn xml_escape(value: &str) -> String {
 
 /// LaunchAgent: запуск при входе, перезапуск после падения, не чаще раза в
 /// 30 с. `PATH` берётся у клиента: демону нужен тот же `git`.
-pub fn launchd_plist(spec: &DaemonSpec, token_file: Option<&Path>, log: &Path, path_env: &str) -> String {
+pub fn launchd_plist(
+    spec: &DaemonSpec,
+    token_file: Option<&Path>,
+    log: &Path,
+    path_env: &str,
+) -> String {
     let mut args = vec![spec.program.to_string_lossy().into_owned()];
     args.extend(spec.arguments(token_file));
     let args: String = args
@@ -209,7 +227,13 @@ pub fn launchd_plist(spec: &DaemonSpec, token_file: Option<&Path>, log: &Path, p
 
 /// Аргумент `ExecStart` в кавычках systemd.
 fn systemd_quote(value: &str) -> String {
-    format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\"").replace('%', "%%"))
+    format!(
+        "\"{}\"",
+        value
+            .replace('\\', "\\\\")
+            .replace('"', "\\\"")
+            .replace('%', "%%")
+    )
 }
 
 pub fn systemd_unit(spec: &DaemonSpec, token_file: Option<&Path>, path_env: &str) -> String {
@@ -250,7 +274,9 @@ fn supervisor() -> Result<Supervisor> {
 }
 
 fn launchd_plist_path() -> Result<PathBuf> {
-    Ok(home()?.join("Library/LaunchAgents").join(format!("{LAUNCHD_LABEL}.plist")))
+    Ok(home()?
+        .join("Library/LaunchAgents")
+        .join(format!("{LAUNCHD_LABEL}.plist")))
 }
 
 fn systemd_unit_path() -> Result<PathBuf> {
@@ -280,7 +306,11 @@ async fn run(program: &str, args: &[&str]) -> Result<String> {
         Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
     } else {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        bail!("{program} {} завершился с ошибкой: {}", args.join(" "), stderr.trim())
+        bail!(
+            "{program} {} завершился с ошибкой: {}",
+            args.join(" "),
+            stderr.trim()
+        )
     }
 }
 
@@ -300,11 +330,22 @@ pub async fn start(spec: &DaemonSpec) -> Result<String> {
             if let Some(parent) = plist.parent() {
                 std::fs::create_dir_all(parent)?;
             }
-            std::fs::write(&plist, launchd_plist(spec, token_file.as_deref(), &log, &path_env))?;
+            std::fs::write(
+                &plist,
+                launchd_plist(spec, token_file.as_deref(), &log, &path_env),
+            )?;
             let domain = launchd_domain().await?;
             // Прежняя регистрация снимается: bootstrap поверх неё отказывает.
-            let _ = run("launchctl", &["bootout", &format!("{domain}/{LAUNCHD_LABEL}")]).await;
-            run("launchctl", &["bootstrap", &domain, &plist.to_string_lossy()]).await?;
+            let _ = run(
+                "launchctl",
+                &["bootout", &format!("{domain}/{LAUNCHD_LABEL}")],
+            )
+            .await;
+            run(
+                "launchctl",
+                &["bootstrap", &domain, &plist.to_string_lossy()],
+            )
+            .await?;
             Ok(format!("launchd, журнал: {}", log.display()))
         }
         Supervisor::Systemd => {
@@ -316,7 +357,9 @@ pub async fn start(spec: &DaemonSpec) -> Result<String> {
             run("systemctl", &["--user", "daemon-reload"]).await?;
             run("systemctl", &["--user", "enable", SYSTEMD_UNIT]).await?;
             run("systemctl", &["--user", "restart", SYSTEMD_UNIT]).await?;
-            Ok(format!("systemd --user, журнал: journalctl --user -u {SYSTEMD_UNIT}"))
+            Ok(format!(
+                "systemd --user, журнал: journalctl --user -u {SYSTEMD_UNIT}"
+            ))
         }
     }
 }
@@ -328,13 +371,19 @@ pub async fn stop() -> Result<()> {
         Supervisor::Launchd => {
             let plist = launchd_plist_path()?;
             let domain = launchd_domain().await?;
-            let unloaded = run("launchctl", &["bootout", &format!("{domain}/{LAUNCHD_LABEL}")]).await;
+            let unloaded = run(
+                "launchctl",
+                &["bootout", &format!("{domain}/{LAUNCHD_LABEL}")],
+            )
+            .await;
             let existed = plist.is_file();
             if existed {
                 std::fs::remove_file(&plist)?;
             }
             if unloaded.is_err() && !existed {
-                bail!("демон не зарегистрирован клиентом: если он запущен вручную, остановите его там же");
+                bail!(
+                    "демон не зарегистрирован клиентом: если он запущен вручную, остановите его там же"
+                );
             }
         }
         Supervisor::Systemd => {
@@ -350,8 +399,13 @@ pub async fn stop() -> Result<()> {
 }
 
 /// Состояние демона одной строкой: отвечает ли он и сколько проектов видит.
-pub async fn status(endpoint: &Endpoint, log: Arc<ExchangeLog>) -> std::result::Result<String, String> {
-    let client = ActivityClient::connect(endpoint, log).await.map_err(|err| err.to_string())?;
+pub async fn status(
+    endpoint: &Endpoint,
+    log: Arc<ExchangeLog>,
+) -> std::result::Result<String, String> {
+    let client = ActivityClient::connect(endpoint, log)
+        .await
+        .map_err(|err| err.to_string())?;
     let result = client.call("activity_projects", &json!({})).await;
     client.close().await;
     let (content, is_error) = result.map_err(|err| err.to_string())?;
@@ -364,13 +418,20 @@ pub async fn status(endpoint: &Endpoint, log: Arc<ExchangeLog>) -> std::result::
     }
     let projects = serde_json::from_str::<Value>(&text)
         .ok()
-        .and_then(|value| value["projects"].as_array().map(|list| list.iter().filter(|p| p["removed"] != true).count()))
+        .and_then(|value| {
+            value["projects"]
+                .as_array()
+                .map(|list| list.iter().filter(|p| p["removed"] != true).count())
+        })
         .unwrap_or(0);
     Ok(format!("работает, проектов: {projects}"))
 }
 
 /// Ждёт, пока запущенный демон начнёт отвечать.
-pub async fn wait_ready(endpoint: &Endpoint, log: Arc<ExchangeLog>) -> std::result::Result<String, String> {
+pub async fn wait_ready(
+    endpoint: &Endpoint,
+    log: Arc<ExchangeLog>,
+) -> std::result::Result<String, String> {
     let started = Instant::now();
     loop {
         match status(endpoint, log.clone()).await {
@@ -388,7 +449,10 @@ pub async fn wait_ready(endpoint: &Endpoint, log: Arc<ExchangeLog>) -> std::resu
 
 /// Запуск целиком, для TUI и CLI: параметры из конфига, регистрация,
 /// ожидание ответа.
-pub async fn start_from_config(config: &Config, log: Arc<ExchangeLog>) -> std::result::Result<String, String> {
+pub async fn start_from_config(
+    config: &Config,
+    log: Arc<ExchangeLog>,
+) -> std::result::Result<String, String> {
     let spec = DaemonSpec::from_config(config).map_err(|err| format!("{err:#}"))?;
     let place = start(&spec).await.map_err(|err| format!("{err:#}"))?;
     let status = wait_ready(&Endpoint::from_config(config), log).await?;
@@ -411,9 +475,18 @@ mod tests {
 
     #[test]
     fn listen_address_is_loopback_only() {
-        assert_eq!(listen_address("http://127.0.0.1:7878/mcp").unwrap(), "127.0.0.1:7878");
-        assert_eq!(listen_address("http://localhost:9000/mcp").unwrap(), "127.0.0.1:9000");
-        assert_eq!(listen_address("http://[::1]:7878/mcp").unwrap(), "[::1]:7878");
+        assert_eq!(
+            listen_address("http://127.0.0.1:7878/mcp").unwrap(),
+            "127.0.0.1:7878"
+        );
+        assert_eq!(
+            listen_address("http://localhost:9000/mcp").unwrap(),
+            "127.0.0.1:9000"
+        );
+        assert_eq!(
+            listen_address("http://[::1]:7878/mcp").unwrap(),
+            "[::1]:7878"
+        );
         assert!(listen_address("http://10.0.0.5:7878/mcp").is_err());
         assert!(listen_address("https://127.0.0.1:7878/mcp").is_err());
         assert!(listen_address("http://127.0.0.1/mcp").is_err());
@@ -435,7 +508,10 @@ mod tests {
                 "/c/activity-token"
             ]
         );
-        let no_schedule = DaemonSpec { schedule: None, ..spec() };
+        let no_schedule = DaemonSpec {
+            schedule: None,
+            ..spec()
+        };
         assert_eq!(no_schedule.arguments(None).len(), 4);
     }
 
@@ -451,7 +527,10 @@ mod tests {
     #[test]
     fn systemd_unit_quotes_arguments() {
         let unit = systemd_unit(&spec(), None, "/usr/bin");
-        assert!(unit.contains(r#"ExecStart="/opt/bin/activity-mcp" "--root" "/Users/я/projects & co""#), "{unit}");
+        assert!(
+            unit.contains(r#"ExecStart="/opt/bin/activity-mcp" "--root" "/Users/я/projects & co""#),
+            "{unit}"
+        );
         assert!(unit.contains(r#"Environment="PATH=/usr/bin""#));
         assert_eq!(systemd_quote(r#"a"b%c"#), r#""a\"b%%c""#);
     }
@@ -464,7 +543,9 @@ mod tests {
         };
         let err = DaemonSpec::from_config(&missing).unwrap_err().to_string();
         assert!(err.contains("не существует"), "{err}");
-        let err = DaemonSpec::from_config(&Config::default()).unwrap_err().to_string();
+        let err = DaemonSpec::from_config(&Config::default())
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("каталог проектов"), "{err}");
     }
 
@@ -474,7 +555,10 @@ mod tests {
     #[tokio::test]
     #[ignore]
     async fn live_start_and_stop_through_supervisor() {
-        let root = std::env::temp_dir().join(format!("agentcli-daemon-live-{}", agentcore::logging::request_id()));
+        let root = std::env::temp_dir().join(format!(
+            "agentcli-daemon-live-{}",
+            agentcore::logging::request_id()
+        ));
         let project = root.join("app");
         std::fs::create_dir_all(&project).unwrap();
         let status = std::process::Command::new("git")

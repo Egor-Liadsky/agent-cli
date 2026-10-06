@@ -9,20 +9,22 @@
 //! соединение открывается на одну операцию: демон перезапускается
 //! независимо, и долгоживущая сессия пережила бы его только переподключением.
 
-use crate::mcp::{format_result, ServerTool};
+use crate::mcp::{ServerTool, format_result};
 use crate::tool_loop::ToolExecutor;
 use agentcore::agent::{AgentError, ToolCall, ToolSpec};
 use agentcore::config::Config;
-use agentcore::logging::{request_id, unix_timestamp, ExchangeLog, RequestLogEntry, ResponseLogEntry};
+use agentcore::logging::{
+    ExchangeLog, RequestLogEntry, ResponseLogEntry, request_id, unix_timestamp,
+};
 use anyhow::Result;
 use async_trait::async_trait;
 use rmcp::model::CallToolRequestParams;
 use rmcp::service::{RunningService, ServiceError};
-use rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig;
 use rmcp::transport::StreamableHttpClientTransport;
+use rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig;
 use rmcp::{RoleClient, ServiceExt};
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -57,7 +59,10 @@ impl Endpoint {
     pub fn from_config(config: &Config) -> Self {
         Self {
             url: config.effective_activity_url(),
-            token: config.activity_token.clone().filter(|token| !token.trim().is_empty()),
+            token: config
+                .activity_token
+                .clone()
+                .filter(|token| !token.trim().is_empty()),
         }
     }
 }
@@ -101,7 +106,10 @@ pub struct ActivityClient {
 }
 
 impl ActivityClient {
-    pub async fn connect(endpoint: &Endpoint, log: Arc<ExchangeLog>) -> std::result::Result<Self, AgentError> {
+    pub async fn connect(
+        endpoint: &Endpoint,
+        log: Arc<ExchangeLog>,
+    ) -> std::result::Result<Self, AgentError> {
         let mut config = StreamableHttpClientTransportConfig::with_uri(endpoint.url.clone());
         if let Some(token) = &endpoint.token {
             config = config.auth_header(token.clone());
@@ -128,7 +136,9 @@ impl ActivityClient {
         let tools = tokio::time::timeout(CALL_TIMEOUT, self.service.peer().list_all_tools())
             .await
             .map_err(|_| unavailable("tools/list не уложился в срок"))?
-            .map_err(|err| unavailable(format!("не удалось получить список инструментов: {err}")))?;
+            .map_err(|err| {
+                unavailable(format!("не удалось получить список инструментов: {err}"))
+            })?;
         Ok(tools
             .into_iter()
             .map(|tool| ServerTool {
@@ -141,7 +151,11 @@ impl ActivityClient {
 
     /// Вызов инструмента: элементы `content` и признак ошибки инструмента.
     /// `Err` — только если демон недоступен или протокол сломался.
-    pub async fn call(&self, name: &str, arguments: &Value) -> std::result::Result<(Vec<Value>, bool), AgentError> {
+    pub async fn call(
+        &self,
+        name: &str,
+        arguments: &Value,
+    ) -> std::result::Result<(Vec<Value>, bool), AgentError> {
         let id = request_id();
         let url = format!("{}#tools/call", self.url);
         self.log.log_request(&RequestLogEntry {
@@ -154,7 +168,8 @@ impl ActivityClient {
         let started_at = Instant::now();
         let params = CallToolRequestParams::new(name.to_string())
             .with_arguments(arguments.as_object().cloned().unwrap_or_default());
-        let outcome = tokio::time::timeout(CALL_TIMEOUT, self.service.peer().call_tool(params)).await;
+        let outcome =
+            tokio::time::timeout(CALL_TIMEOUT, self.service.peer().call_tool(params)).await;
         let result = match outcome {
             Ok(Ok(result)) => {
                 let content = serde_json::to_value(&result.content)
@@ -169,7 +184,10 @@ impl ActivityClient {
                 Ok((vec![json!({ "type": "text", "text": error.message })], true))
             }
             Ok(Err(error)) => Err(unavailable(format!("демон перестал отвечать: {error}"))),
-            Err(_) => Err(unavailable(format!("вызов {name} не уложился в {} с", CALL_TIMEOUT.as_secs()))),
+            Err(_) => Err(unavailable(format!(
+                "вызов {name} не уложился в {} с",
+                CALL_TIMEOUT.as_secs()
+            ))),
         };
         let (status, logged) = match &result {
             Ok((content, is_error)) => (if *is_error { 500 } else { 200 }, raw_text(content)),
@@ -187,19 +205,27 @@ impl ActivityClient {
 
     /// Вызов, ответ которого клиент разбирает сам: ошибка инструмента здесь
     /// — ошибка операции.
-    async fn call_json<T: serde::de::DeserializeOwned>(&self, name: &str, arguments: Value) -> Result<T> {
+    async fn call_json<T: serde::de::DeserializeOwned>(
+        &self,
+        name: &str,
+        arguments: Value,
+    ) -> Result<T> {
         let (content, is_error) = self.call(name, &arguments).await?;
         let text = raw_text(&content);
         if is_error {
             anyhow::bail!("{name}: {text}");
         }
-        serde_json::from_str(&text).map_err(|err| anyhow::anyhow!("{name}: ответ не разобран ({err}): {text}"))
+        serde_json::from_str(&text)
+            .map_err(|err| anyhow::anyhow!("{name}: ответ не разобран ({err}): {text}"))
     }
 
     /// Сводки, новые первыми.
     pub async fn digests(&self, unread_only: bool, limit: u32) -> Result<Vec<Digest>> {
         let list: DigestList = self
-            .call_json("activity_digest", json!({ "unread_only": unread_only, "limit": limit }))
+            .call_json(
+                "activity_digest",
+                json!({ "unread_only": unread_only, "limit": limit }),
+            )
             .await?;
         Ok(list.digests)
     }
@@ -260,7 +286,10 @@ pub struct ActivityTools {
 }
 
 impl ActivityTools {
-    pub async fn connect(endpoint: &Endpoint, log: Arc<ExchangeLog>) -> std::result::Result<Self, AgentError> {
+    pub async fn connect(
+        endpoint: &Endpoint,
+        log: Arc<ExchangeLog>,
+    ) -> std::result::Result<Self, AgentError> {
         let client = ActivityClient::connect(endpoint, log).await?;
         let tools = client.tools().await?;
         Ok(Self { client, tools })
@@ -320,7 +349,8 @@ mod tests {
         let list: DigestList = serde_json::from_str(&text).unwrap();
         assert_eq!(list.digests[0].id, 3);
         assert!(retell_prompt(&list.digests[0]).ends_with("## Активность"));
-        let built: BuiltDigest = serde_json::from_str(r#"{ "digest": null, "note": "x" }"#).unwrap();
+        let built: BuiltDigest =
+            serde_json::from_str(r#"{ "digest": null, "note": "x" }"#).unwrap();
         assert!(built.digest.is_none());
     }
 
@@ -354,7 +384,8 @@ mod tests {
     #[ignore]
     async fn live_daemon_lists_tools_and_digests() {
         let endpoint = Endpoint {
-            url: std::env::var("AGENTCLI_ACTIVITY_URL").unwrap_or_else(|_| agentcore::config::DEFAULT_ACTIVITY_URL.into()),
+            url: std::env::var("AGENTCLI_ACTIVITY_URL")
+                .unwrap_or_else(|_| agentcore::config::DEFAULT_ACTIVITY_URL.into()),
             token: std::env::var("AGENTCLI_ACTIVITY_TOKEN").ok(),
         };
         let tools = ActivityTools::connect(&endpoint, Arc::new(ExchangeLog::disabled()))

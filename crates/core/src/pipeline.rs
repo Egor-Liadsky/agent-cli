@@ -56,7 +56,11 @@ impl PolicyRecord {
         }
     }
 
-    pub fn reject(stage: impl Into<String>, code: impl Into<String>, reason: impl Into<String>) -> Self {
+    pub fn reject(
+        stage: impl Into<String>,
+        code: impl Into<String>,
+        reason: impl Into<String>,
+    ) -> Self {
         Self {
             stage: stage.into(),
             action: PolicyAction::Reject,
@@ -114,7 +118,11 @@ pub struct RequestContext {
 }
 
 impl RequestContext {
-    pub fn new(request_id: impl Into<String>, history: Vec<Message>, settings: ChatSettings) -> Self {
+    pub fn new(
+        request_id: impl Into<String>,
+        history: Vec<Message>,
+        settings: ChatSettings,
+    ) -> Self {
         Self {
             request_id: request_id.into(),
             history,
@@ -531,9 +539,9 @@ mod tests {
         }
 
         async fn check(&self, _context: &RequestContext) -> Result<PolicyOutcome> {
-            Ok(PolicyOutcome::Rewrite(Box::new(PolicyPayload::History(vec![
-                Message::user("изменённый вопрос"),
-            ]))))
+            Ok(PolicyOutcome::Rewrite(Box::new(PolicyPayload::History(
+                vec![Message::user("изменённый вопрос")],
+            ))))
         }
     }
 
@@ -572,7 +580,11 @@ mod tests {
             "mask-output"
         }
 
-        async fn check(&self, context: &RequestContext, reply: &AgentReply) -> Result<PolicyOutcome> {
+        async fn check(
+            &self,
+            context: &RequestContext,
+            reply: &AgentReply,
+        ) -> Result<PolicyOutcome> {
             assert_eq!(
                 context.policy.input.len(),
                 1,
@@ -580,7 +592,9 @@ mod tests {
             );
             let mut masked = reply.clone();
             masked.content = "***".to_string();
-            Ok(PolicyOutcome::Rewrite(Box::new(PolicyPayload::Reply(Box::new(masked)))))
+            Ok(PolicyOutcome::Rewrite(Box::new(PolicyPayload::Reply(
+                Box::new(masked),
+            ))))
         }
     }
 
@@ -592,7 +606,11 @@ mod tests {
             "reject-output"
         }
 
-        async fn check(&self, _context: &RequestContext, _reply: &AgentReply) -> Result<PolicyOutcome> {
+        async fn check(
+            &self,
+            _context: &RequestContext,
+            _reply: &AgentReply,
+        ) -> Result<PolicyOutcome> {
             Ok(PolicyOutcome::reject("unsafe", "ответ запрещён правилом"))
         }
     }
@@ -612,9 +630,7 @@ mod tests {
             _reply: &AgentReply,
             agent: &dyn Agent,
         ) -> Result<JudgeVerdict> {
-            let review = agent
-                .ask(&context.history, &context.settings)
-                .await?;
+            let review = agent.ask(&context.history, &context.settings).await?;
             Ok(JudgeVerdict {
                 stage: self.name().to_string(),
                 verdict: "ok".to_string(),
@@ -667,7 +683,8 @@ mod tests {
     #[tokio::test]
     async fn pass_keeps_history_unchanged() {
         let agent = FakeAgent::new("ответ модели");
-        let pipeline = Pipeline::new(agent.clone()).with_input_policies(vec![Arc::new(AllowAllInput)]);
+        let pipeline =
+            Pipeline::new(agent.clone()).with_input_policies(vec![Arc::new(AllowAllInput)]);
         completed(pipeline.run(context()).await.expect("конвейер"));
         assert_eq!(agent.last_history()[0].content, "исходный вопрос");
     }
@@ -675,7 +692,8 @@ mod tests {
     #[tokio::test]
     async fn input_rewrite_reaches_model() {
         let agent = FakeAgent::new("ответ модели");
-        let pipeline = Pipeline::new(agent.clone()).with_input_policies(vec![Arc::new(RewriteHistory)]);
+        let pipeline =
+            Pipeline::new(agent.clone()).with_input_policies(vec![Arc::new(RewriteHistory)]);
         let (_, policy) = completed(pipeline.run(context()).await.expect("конвейер"));
         assert_eq!(agent.last_history()[0].content, "изменённый вопрос");
         assert_eq!(policy.input[0].action, PolicyAction::Rewrite);
@@ -695,7 +713,8 @@ mod tests {
     #[tokio::test]
     async fn input_reject_skips_model() {
         let agent = FakeAgent::new("ответ модели");
-        let pipeline = Pipeline::new(agent.clone()).with_input_policies(vec![Arc::new(RejectInput)]);
+        let pipeline =
+            Pipeline::new(agent.clone()).with_input_policies(vec![Arc::new(RejectInput)]);
         match pipeline.run(context()).await.expect("конвейер") {
             PipelineOutcome::Rejected {
                 stage,
@@ -716,7 +735,8 @@ mod tests {
     #[tokio::test]
     async fn output_reject_hides_reply() {
         let agent = FakeAgent::new("ответ модели");
-        let pipeline = Pipeline::new(agent.clone()).with_output_policies(vec![Arc::new(RejectOutput)]);
+        let pipeline =
+            Pipeline::new(agent.clone()).with_output_policies(vec![Arc::new(RejectOutput)]);
         match pipeline.run(context()).await.expect("конвейер") {
             PipelineOutcome::Rejected { stage, code, .. } => {
                 assert_eq!(stage, "reject-output");
@@ -730,7 +750,8 @@ mod tests {
     #[tokio::test]
     async fn stage_error_differs_from_reject() {
         let agent = FakeAgent::new("ответ модели");
-        let pipeline = Pipeline::new(agent.clone()).with_input_policies(vec![Arc::new(FailingInput)]);
+        let pipeline =
+            Pipeline::new(agent.clone()).with_input_policies(vec![Arc::new(FailingInput)]);
         let err = pipeline
             .run(context())
             .await
@@ -829,7 +850,12 @@ mod tests {
             ],
             ChatSettings::default(),
         );
-        completed(Pipeline::new(agent.clone()).run(context).await.expect("конвейер"));
+        completed(
+            Pipeline::new(agent.clone())
+                .run(context)
+                .await
+                .expect("конвейер"),
+        );
         let history = agent.last_history();
         assert_eq!(history.len(), 3);
         assert_eq!(history[1].tool_calls.len(), 1);
@@ -855,7 +881,12 @@ mod tests {
             parameters: serde_json::json!({ "type": "object" }),
         };
         let context = context().with_tools(vec![spec.clone()]);
-        completed(Pipeline::new(agent.clone()).run(context).await.expect("конвейер"));
+        completed(
+            Pipeline::new(agent.clone())
+                .run(context)
+                .await
+                .expect("конвейер"),
+        );
         assert_eq!(*agent.last_tools.lock().unwrap(), vec![spec]);
     }
 }

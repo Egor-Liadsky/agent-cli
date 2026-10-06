@@ -17,9 +17,10 @@ pub const UNAUTHORIZED_HINT: &str = "Задайте токен в настрой
 
 pub fn log_dir() -> Option<PathBuf> {
     if let Ok(value) = std::env::var(LOG_DIR_ENV)
-        && !value.trim().is_empty() {
-            return Some(PathBuf::from(value));
-        }
+        && !value.trim().is_empty()
+    {
+        return Some(PathBuf::from(value));
+    }
     dirs::data_dir().map(|dir| dir.join("agentcli").join("logs"))
 }
 

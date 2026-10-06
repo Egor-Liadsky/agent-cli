@@ -187,7 +187,10 @@ impl ReasoningMode {
             ),
             ReasoningMode::ExpertPanel => {
                 let roles: Vec<String> = if experts.is_empty() {
-                    Self::DEFAULT_EXPERTS.iter().map(|e| e.to_string()).collect()
+                    Self::DEFAULT_EXPERTS
+                        .iter()
+                        .map(|e| e.to_string())
+                        .collect()
                 } else {
                     experts.to_vec()
                 };
@@ -618,10 +621,14 @@ pub struct Config {
     /// клиента, как `pipeline_*`: индекс не привязан к чату.
     #[serde(default)]
     pub index_root: Option<String>,
-    /// Файл базы SQLite индекса. Задан — модели в чатах доступны
-    /// `index_search` и `index_status`; не задан — инструменты выключены.
+    /// Файл базы SQLite индекса. Нужен индексным инструментам; их отдельный
+    /// переключатель хранится в `index_search_enabled`.
     #[serde(default)]
     pub index_db: Option<String>,
+    /// Переключатель индексных инструментов в чатах. `None` — включено для
+    /// обратной совместимости, `Some(false)` сохраняет остальные настройки.
+    #[serde(default)]
+    pub index_search_enabled: Option<bool>,
     /// Стратегия chunking: `fixed`, `structure` или `all`. Пусто —
     /// умолчание `index-mcp build`.
     #[serde(default)]
@@ -644,6 +651,21 @@ pub struct Config {
     /// Адрес Ollama для `index-mcp`. Пусто — `http://localhost:11434`.
     #[serde(default)]
     pub index_ollama_url: Option<String>,
+    /// Сколько результатов возвращать после фильтрации index_search.
+    #[serde(default)]
+    pub index_top_k: Option<usize>,
+    /// Сколько кандидатов брать до фильтрации index_search.
+    #[serde(default)]
+    pub index_candidate_top_k: Option<usize>,
+    /// Минимальный cosine score; пусто — фильтр выключен.
+    #[serde(default)]
+    pub index_similarity_threshold: Option<f32>,
+    /// Включать query rewrite перед эмбеддингом.
+    #[serde(default)]
+    pub index_rewrite: Option<bool>,
+    /// Модель Ollama для query rewrite.
+    #[serde(default)]
+    pub index_rewrite_model: Option<String>,
 }
 
 /// Подкаталог корня поиска, куда пишет пайплайн, если `pipeline_output` не
@@ -658,26 +680,49 @@ impl Config {
     /// Положение переключателя, как его показывают TUI и `config pipeline
     /// show`: без явного значения — включён, если задан каталог поиска.
     pub fn pipeline_switch_on(&self) -> bool {
-        self.pipeline_enabled.unwrap_or_else(|| self.pipeline_root_set())
+        self.pipeline_enabled
+            .unwrap_or_else(|| self.pipeline_root_set())
     }
 
-    /// Инструменты индекса документов в чатах включены заданной базой.
+    /// Инструменты индекса документов в чатах включены заданной базой и
+    /// переключателем поиска.
     pub fn index_active(&self) -> bool {
-        self.index_db.as_deref().is_some_and(|db| !db.trim().is_empty())
+        self.index_search_switch_on()
+            && self
+                .index_db
+                .as_deref()
+                .is_some_and(|db| !db.trim().is_empty())
+    }
+
+    /// Положение переключателя поиска: отсутствие поля сохраняет прежнее
+    /// поведение старых конфигов.
+    pub fn index_search_switch_on(&self) -> bool {
+        self.index_search_enabled.unwrap_or(true)
     }
 
     fn pipeline_root_set(&self) -> bool {
-        self.pipeline_root.as_deref().is_some_and(|root| !root.trim().is_empty())
+        self.pipeline_root
+            .as_deref()
+            .is_some_and(|root| !root.trim().is_empty())
     }
 
     pub fn effective_pipeline_output(&self) -> Option<String> {
-        match self.pipeline_output.as_deref().filter(|dir| !dir.trim().is_empty()) {
+        match self
+            .pipeline_output
+            .as_deref()
+            .filter(|dir| !dir.trim().is_empty())
+        {
             Some(dir) => Some(dir.to_string()),
             None => self
                 .pipeline_root
                 .as_deref()
                 .filter(|root| !root.trim().is_empty())
-                .map(|root| format!("{}/{DEFAULT_PIPELINE_OUTPUT_DIR}", root.trim_end_matches('/'))),
+                .map(|root| {
+                    format!(
+                        "{}/{DEFAULT_PIPELINE_OUTPUT_DIR}",
+                        root.trim_end_matches('/')
+                    )
+                }),
         }
     }
 }
@@ -715,7 +760,8 @@ impl Config {
 
 impl Config {
     fn path() -> Result<PathBuf> {
-        let dir = dirs::config_dir().context("не удалось определить домашнюю директорию конфигов")?;
+        let dir =
+            dirs::config_dir().context("не удалось определить домашнюю директорию конфигов")?;
         Ok(dir.join("agentcli").join("config.toml"))
     }
 
@@ -935,7 +981,10 @@ client_token = "t"
         assert_eq!(settings.git_allowed_tools, None);
         assert_eq!(settings.tool_max_iterations, None);
         assert!(!settings.git_tools_active());
-        assert_eq!(settings.effective_tool_max_iterations(), DEFAULT_TOOL_MAX_ITERATIONS);
+        assert_eq!(
+            settings.effective_tool_max_iterations(),
+            DEFAULT_TOOL_MAX_ITERATIONS
+        );
     }
 
     #[test]
@@ -944,7 +993,10 @@ client_token = "t"
             tool_max_iterations: Some(1000),
             ..ChatSettings::default()
         };
-        assert_eq!(settings.effective_tool_max_iterations(), MAX_TOOL_ITERATIONS);
+        assert_eq!(
+            settings.effective_tool_max_iterations(),
+            MAX_TOOL_ITERATIONS
+        );
         settings.tool_max_iterations = Some(0);
         assert_eq!(settings.effective_tool_max_iterations(), 1);
     }
@@ -1037,7 +1089,10 @@ server_url = "http://127.0.0.1:9000"
         let json = serde_json::to_string(&settings).expect("сериализация");
         assert!(json.contains("\"sliding_window\""));
         let parsed: ChatSettings = serde_json::from_str(&json).expect("разбор");
-        assert_eq!(parsed.context_strategy, Some(ContextStrategy::SlidingWindow));
+        assert_eq!(
+            parsed.context_strategy,
+            Some(ContextStrategy::SlidingWindow)
+        );
     }
 
     #[test]
@@ -1174,7 +1229,10 @@ client_token = "t"
         assert_eq!(config.effective_pipeline_output(), None);
         config.pipeline_root = Some("/work/".to_string());
         assert!(config.pipeline_active());
-        assert_eq!(config.effective_pipeline_output().as_deref(), Some("/work/pipeline-out"));
+        assert_eq!(
+            config.effective_pipeline_output().as_deref(),
+            Some("/work/pipeline-out")
+        );
         config.pipeline_output = Some("/out".to_string());
         assert_eq!(config.effective_pipeline_output().as_deref(), Some("/out"));
         config.pipeline_root = Some("  ".to_string());
@@ -1184,11 +1242,24 @@ client_token = "t"
     #[test]
     fn index_tools_follow_the_database_path() {
         assert!(!Config::default().index_active());
-        let config = Config { index_db: Some("  ".to_string()), ..Config::default() };
+        let config = Config {
+            index_db: Some("  ".to_string()),
+            ..Config::default()
+        };
         assert!(!config.index_active());
-        let config = Config { index_db: Some("/tmp/idx.db".to_string()), ..Config::default() };
+        let config = Config {
+            index_db: Some("/tmp/idx.db".to_string()),
+            ..Config::default()
+        };
         assert!(config.index_active());
-        let parsed: Config = toml::from_str("index_db = \"/i.db\"\nindex_chunk_size = 900\n").unwrap();
+        let config = Config {
+            index_db: Some("/tmp/idx.db".to_string()),
+            index_search_enabled: Some(false),
+            ..Config::default()
+        };
+        assert!(!config.index_active());
+        let parsed: Config =
+            toml::from_str("index_db = \"/i.db\"\nindex_chunk_size = 900\n").unwrap();
         assert!(parsed.index_active());
         assert_eq!(parsed.index_chunk_size, Some(900));
         assert_eq!(parsed.index_model, None);
@@ -1196,20 +1267,32 @@ client_token = "t"
 
     #[test]
     fn pipeline_switch_keeps_directories_when_off() {
-        let mut config = Config { pipeline_root: Some("/work".to_string()), ..Config::default() };
+        let mut config = Config {
+            pipeline_root: Some("/work".to_string()),
+            ..Config::default()
+        };
         assert!(config.pipeline_switch_on() && config.pipeline_active());
 
         config.pipeline_enabled = Some(false);
         assert!(!config.pipeline_switch_on() && !config.pipeline_active());
-        assert_eq!(config.effective_pipeline_output().as_deref(), Some("/work/pipeline-out"));
+        assert_eq!(
+            config.effective_pipeline_output().as_deref(),
+            Some("/work/pipeline-out")
+        );
 
         // Включённый переключатель без каталога поиска инструменты не даёт.
-        let empty = Config { pipeline_enabled: Some(true), ..Config::default() };
+        let empty = Config {
+            pipeline_enabled: Some(true),
+            ..Config::default()
+        };
         assert!(empty.pipeline_switch_on() && !empty.pipeline_active());
         assert!(!Config::default().pipeline_switch_on());
 
         let parsed: Config = toml::from_str("pipeline_root = \"/work\"\n").unwrap();
         assert_eq!(parsed.pipeline_enabled, None);
-        assert!(parsed.pipeline_active(), "конфиг без поля работает как раньше");
+        assert!(
+            parsed.pipeline_active(),
+            "конфиг без поля работает как раньше"
+        );
     }
 }

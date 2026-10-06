@@ -87,7 +87,6 @@ pub fn last_activity_label(updated_at: u64) -> String {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -110,7 +109,10 @@ mod tests {
     #[test]
     fn history_replaces_messages_and_marks_chat_loaded() {
         let mut chat = ChatSession::from_summary(summary("Новый чат", 2));
-        assert!(!chat.history_loaded, "чат с сообщениями не загружен по списку");
+        assert!(
+            !chat.history_loaded,
+            "чат с сообщениями не загружен по списку"
+        );
 
         chat.apply_history(ChatHistory {
             chat: summary("Заголовок сервиса", 2),
@@ -148,5 +150,4 @@ mod tests {
         assert!(block.contains("Вы: вопрос"));
         assert!(block.contains("Агент: ответ"));
     }
-
 }

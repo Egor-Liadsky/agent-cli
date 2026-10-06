@@ -46,11 +46,16 @@ async fn request_with_token_carries_authorization_header() {
     Mock::given(method("GET"))
         .and(path("/v1/chats"))
         .and(header("authorization", "Bearer token-a"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "chats": [], "next_cursor": null })))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(json!({ "chats": [], "next_cursor": null })),
+        )
         .mount(&server)
         .await;
 
-    chats(&server, "token-a").list().await.expect("список чатов");
+    chats(&server, "token-a")
+        .list()
+        .await
+        .expect("список чатов");
 }
 
 #[tokio::test]
@@ -64,7 +69,9 @@ async fn request_without_token_has_no_authorization_header() {
         .await;
     Mock::given(method("GET"))
         .and(path("/v1/chats"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "chats": [], "next_cursor": null })))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(json!({ "chats": [], "next_cursor": null })),
+        )
         .mount(&server)
         .await;
 
@@ -96,7 +103,10 @@ async fn list_reads_all_pages_in_service_order() {
         .mount(&server)
         .await;
 
-    let list = chats(&server, "token-a").list().await.expect("список чатов");
+    let list = chats(&server, "token-a")
+        .list()
+        .await
+        .expect("список чатов");
 
     assert_eq!(
         list.iter().map(|chat| chat.id.as_str()).collect::<Vec<_>>(),
@@ -156,7 +166,10 @@ async fn load_reads_all_message_pages_in_seq_order() {
         .mount(&server)
         .await;
 
-    let history = chats(&server, "token-a").load("chat-1").await.expect("история");
+    let history = chats(&server, "token-a")
+        .load("chat-1")
+        .await
+        .expect("история");
 
     assert_eq!(history.chat.id, "chat-1");
     assert_eq!(history.chat.settings.provider, Provider::Ollama);
@@ -224,7 +237,10 @@ async fn create_sends_title_and_settings() {
         .await;
 
     let chat = chats(&server, "token-a")
-        .create(Some("  Мой чат  "), &settings_with(Provider::Ollama, "llama3"))
+        .create(
+            Some("  Мой чат  "),
+            &settings_with(Provider::Ollama, "llama3"),
+        )
         .await
         .expect("созданный чат");
 
@@ -238,8 +254,13 @@ async fn create_sends_title_and_settings() {
     assert_eq!(body["settings"]["experts"], json!(["аналитик"]));
     assert_eq!(body["settings"]["custom_response_mode"], true);
     assert_eq!(body["settings"]["response_format"]["max_length"], 500);
-    let temperature = body["settings"]["temperature"].as_f64().expect("температура");
-    assert!((temperature - 0.3).abs() < 1e-6, "температура искажена: {temperature}");
+    let temperature = body["settings"]["temperature"]
+        .as_f64()
+        .expect("температура");
+    assert!(
+        (temperature - 0.3).abs() < 1e-6,
+        "температура искажена: {temperature}"
+    );
 }
 
 #[tokio::test]
@@ -257,7 +278,10 @@ async fn create_without_title_omits_field() {
         .expect("созданный чат");
 
     let body = received_bodies(&server).await.remove(0);
-    assert!(body.get("title").is_none(), "заголовок не должен отправляться: {body}");
+    assert!(
+        body.get("title").is_none(),
+        "заголовок не должен отправляться: {body}"
+    );
 }
 
 #[tokio::test]
@@ -473,14 +497,23 @@ async fn working_memory_is_listed_set_and_deleted() {
         .await;
 
     let client = chats(&server, "token-a");
-    let entries = client.working_memory("chat-1").await.expect("список рабочей памяти");
+    let entries = client
+        .working_memory("chat-1")
+        .await
+        .expect("список рабочей памяти");
     assert_eq!(entries.len(), 1);
     assert_eq!(entries[0].key, "target");
 
-    let set = client.set_working_memory("chat-1", "budget", "200000").await.expect("запись рабочей памяти");
+    let set = client
+        .set_working_memory("chat-1", "budget", "200000")
+        .await
+        .expect("запись рабочей памяти");
     assert_eq!(set.value, "200000");
 
-    client.delete_working_memory("chat-1", "budget").await.expect("удаление записи рабочей памяти");
+    client
+        .delete_working_memory("chat-1", "budget")
+        .await
+        .expect("удаление записи рабочей памяти");
 }
 
 #[tokio::test]
@@ -531,7 +564,10 @@ async fn long_term_memory_is_listed_set_and_deleted() {
         .await;
 
     let client = chats(&server, "token-a");
-    let entries = client.long_term_memory().await.expect("список долговременной памяти");
+    let entries = client
+        .long_term_memory()
+        .await
+        .expect("список долговременной памяти");
     assert_eq!(entries.len(), 1);
     assert_eq!(entries[0].entry_type, "decision");
 
@@ -541,7 +577,10 @@ async fn long_term_memory_is_listed_set_and_deleted() {
         .expect("запись долговременной памяти");
     assert_eq!(set.value, "Егор");
 
-    client.delete_long_term_memory("id-2").await.expect("удаление записи долговременной памяти");
+    client
+        .delete_long_term_memory("id-2")
+        .await
+        .expect("удаление записи долговременной памяти");
 }
 
 #[tokio::test]
@@ -672,7 +711,10 @@ async fn delete_accepts_empty_response_body() {
         .mount(&server)
         .await;
 
-    chats(&server, "token-a").delete("chat-1").await.expect("удаление");
+    chats(&server, "token-a")
+        .delete("chat-1")
+        .await
+        .expect("удаление");
 }
 
 // --- 2.5 Дозапись обмена ---
@@ -758,12 +800,18 @@ async fn unauthorized_carries_hint_and_request_id() {
     let err = list_error(401, error_body("unauthorized", "нужен токен")).await;
     match err.downcast_ref::<AgentError>() {
         Some(AgentError::Unauthorized { hint, request_id }) => {
-            assert_eq!(hint.as_deref(), Some("выполните: agentcli config set-token"));
+            assert_eq!(
+                hint.as_deref(),
+                Some("выполните: agentcli config set-token")
+            );
             assert_eq!(request_id.as_deref(), Some("req-1"));
         }
         other => panic!("ожидался Unauthorized, получено: {other:?}"),
     }
-    assert!(format!("{err}").contains("req-1"), "идентификатор запроса не виден");
+    assert!(
+        format!("{err}").contains("req-1"),
+        "идентификатор запроса не виден"
+    );
 }
 
 #[tokio::test]
@@ -771,7 +819,10 @@ async fn invalid_request_is_distinguished() {
     let err = list_error(400, error_body("invalid_request", "плохой курсор")).await;
     match err.downcast_ref::<AgentError>() {
         Some(AgentError::InvalidRequest { message, .. }) => {
-            assert!(message.contains("курсор"), "текст причины потерян: {message}");
+            assert!(
+                message.contains("курсор"),
+                "текст причины потерян: {message}"
+            );
         }
         other => panic!("ожидался InvalidRequest, получено: {other:?}"),
     }
@@ -781,9 +832,14 @@ async fn invalid_request_is_distinguished() {
 async fn missing_chat_is_reported_as_404() {
     let err = list_error(404, error_body("chat_not_found", "чат не найден")).await;
     match err.downcast_ref::<AgentError>() {
-        Some(AgentError::Provider { status, message, .. }) => {
+        Some(AgentError::Provider {
+            status, message, ..
+        }) => {
             assert_eq!(*status, 404);
-            assert!(message.contains("не найден"), "текст причины потерян: {message}");
+            assert!(
+                message.contains("не найден"),
+                "текст причины потерян: {message}"
+            );
         }
         other => panic!("ожидался Provider со статусом 404, получено: {other:?}"),
     }
@@ -793,7 +849,10 @@ async fn missing_chat_is_reported_as_404() {
 async fn rate_limited_is_distinguished() {
     let err = list_error(429, error_body("rate_limited", "слишком много запросов")).await;
     assert!(
-        matches!(err.downcast_ref::<AgentError>(), Some(AgentError::RateLimited { .. })),
+        matches!(
+            err.downcast_ref::<AgentError>(),
+            Some(AgentError::RateLimited { .. })
+        ),
         "ожидался RateLimited"
     );
 }
@@ -809,16 +868,30 @@ async fn provider_failure_keeps_status() {
 
 #[tokio::test]
 async fn request_id_falls_back_to_header() {
-    let err = list_error(404, json!({ "error": { "code": "chat_not_found", "message": "нет чата" } })).await;
+    let err = list_error(
+        404,
+        json!({ "error": { "code": "chat_not_found", "message": "нет чата" } }),
+    )
+    .await;
     let text = format!("{err}");
-    assert!(text.contains("req-header"), "идентификатор из заголовка потерян: {text}");
+    assert!(
+        text.contains("req-header"),
+        "идентификатор из заголовка потерян: {text}"
+    );
 }
 
 #[tokio::test]
 async fn unreachable_service_is_transport_error_with_address() {
     // Порт 1 на localhost не слушает никто: соединение не устанавливается.
-    let client = ChatsClient::new("http://127.0.0.1:1", "token-a", Arc::new(ExchangeLog::disabled()));
-    let err = client.list().await.expect_err("ожидалась ошибка транспорта");
+    let client = ChatsClient::new(
+        "http://127.0.0.1:1",
+        "token-a",
+        Arc::new(ExchangeLog::disabled()),
+    );
+    let err = client
+        .list()
+        .await
+        .expect_err("ожидалась ошибка транспорта");
     match err.downcast_ref::<AgentError>() {
         Some(AgentError::Transport(message)) => {
             assert!(
@@ -863,7 +936,10 @@ async fn task_reads_stage_step_and_transitions() {
         .mount(&server)
         .await;
 
-    let task = chats(&server, "token-a").task("chat-1").await.expect("состояние задачи");
+    let task = chats(&server, "token-a")
+        .task("chat-1")
+        .await
+        .expect("состояние задачи");
     assert_eq!(task.stage, "execution");
     assert_eq!(task.step, "правит парсер");
     assert_eq!(task.transitions.len(), 1);
@@ -880,7 +956,13 @@ async fn task_transition_sends_stage_step_and_expected_action() {
         .await;
 
     let task = chats(&server, "token-a")
-        .task_transition("chat-1", Some("execution"), Some("шаг"), Some("действие"), &[])
+        .task_transition(
+            "chat-1",
+            Some("execution"),
+            Some("шаг"),
+            Some("действие"),
+            &[],
+        )
         .await
         .expect("переход");
     assert_eq!(task.stage, "execution");
@@ -926,8 +1008,14 @@ async fn task_pause_and_resume_round_trip() {
 #[test]
 fn allowed_next_stages_matches_server_automaton() {
     assert_eq!(allowed_next_stages("planning"), vec!["clarification"]);
-    assert_eq!(allowed_next_stages("clarification"), vec!["execution", "planning"]);
-    assert_eq!(allowed_next_stages("execution"), vec!["validation", "planning"]);
+    assert_eq!(
+        allowed_next_stages("clarification"),
+        vec!["execution", "planning"]
+    );
+    assert_eq!(
+        allowed_next_stages("execution"),
+        vec!["validation", "planning"]
+    );
     assert_eq!(allowed_next_stages("validation"), vec!["done", "execution"]);
     assert!(allowed_next_stages("done").is_empty());
 }
@@ -948,7 +1036,10 @@ async fn create_chat_sends_task_state_settings() {
         task_state_auto_enabled: Some(false),
         ..ChatSettings::default()
     };
-    chats(&server, "token-a").create(None, &settings).await.expect("чат создан");
+    chats(&server, "token-a")
+        .create(None, &settings)
+        .await
+        .expect("чат создан");
 
     let bodies = received_bodies(&server).await;
     assert_eq!(bodies[0]["settings"]["task_state_enabled"], true);
@@ -981,9 +1072,15 @@ async fn tool_messages_keep_their_role_and_links_on_load() {
         .mount(&server)
         .await;
 
-    let history = chats(&server, "token-a").load("chat-1").await.expect("история");
+    let history = chats(&server, "token-a")
+        .load("chat-1")
+        .await
+        .expect("история");
     assert_eq!(history.chat.settings.git_tools_enabled, Some(true));
-    assert_eq!(history.chat.settings.git_repository.as_deref(), Some("/tmp/r"));
+    assert_eq!(
+        history.chat.settings.git_repository.as_deref(),
+        Some("/tmp/r")
+    );
     let call = &history.messages[1].message;
     assert_eq!(call.tool_calls.len(), 1);
     assert_eq!(call.tool_calls[0].name, "git_status");
@@ -1034,7 +1131,10 @@ async fn append_sends_tool_turn_with_links() {
         ),
         Message::tool_result("call_0", "git_status", "clean"),
     ];
-    chats(&server, "t").append("chat-1", &turn).await.expect("дозапись");
+    chats(&server, "t")
+        .append("chat-1", &turn)
+        .await
+        .expect("дозапись");
     let bodies = received_bodies(&server).await;
     let messages = bodies[0]["messages"].as_array().unwrap();
     assert_eq!(messages[1]["tool_calls"][0]["name"], "git_status");

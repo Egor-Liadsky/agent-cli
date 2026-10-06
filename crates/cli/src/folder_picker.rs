@@ -46,7 +46,9 @@ pub fn pick_folder(start: Option<&Path>) -> Result<Option<PathBuf>> {
 /// Причина, по которой графический диалог открыть нельзя, для текущего
 /// процесса.
 pub fn gui_unavailable() -> Option<&'static str> {
-    gui_unavailable_reason(std::env::consts::OS, |name| std::env::var_os(name).is_some_and(|value| !value.is_empty()))
+    gui_unavailable_reason(std::env::consts::OS, |name| {
+        std::env::var_os(name).is_some_and(|value| !value.is_empty())
+    })
 }
 
 /// Причина, по которой диалог открыть нельзя, по ОС и наличию переменных
@@ -109,7 +111,10 @@ mod tests {
     fn linux_needs_display_or_wayland() {
         assert!(gui_unavailable_reason("linux", env(&[])).is_some());
         assert_eq!(gui_unavailable_reason("linux", env(&["DISPLAY"])), None);
-        assert_eq!(gui_unavailable_reason("freebsd", env(&["WAYLAND_DISPLAY"])), None);
+        assert_eq!(
+            gui_unavailable_reason("freebsd", env(&["WAYLAND_DISPLAY"])),
+            None
+        );
     }
 
     #[test]
@@ -124,7 +129,10 @@ mod tests {
         let home = std::env::temp_dir();
         let nested = home.join("folder-picker-start-dir");
         std::fs::create_dir_all(&nested).unwrap();
-        assert_eq!(start_dir("~/folder-picker-start-dir", Some(&home)), Some(nested.clone()));
+        assert_eq!(
+            start_dir("~/folder-picker-start-dir", Some(&home)),
+            Some(nested.clone())
+        );
         assert_eq!(start_dir("~", Some(&home)), Some(home.clone()));
         std::fs::remove_dir(&nested).unwrap();
     }
@@ -133,7 +141,10 @@ mod tests {
     fn start_dir_falls_back_to_home() {
         let home = Path::new("/home-fallback");
         assert_eq!(start_dir("", Some(home)), Some(home.to_path_buf()));
-        assert_eq!(start_dir("/definitely/missing/dir", Some(home)), Some(home.to_path_buf()));
+        assert_eq!(
+            start_dir("/definitely/missing/dir", Some(home)),
+            Some(home.to_path_buf())
+        );
         assert_eq!(start_dir("/definitely/missing/dir", None), None);
     }
 }

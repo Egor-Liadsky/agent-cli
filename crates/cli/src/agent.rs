@@ -57,7 +57,11 @@ impl CliAgent {
         settings: &ChatSettings,
     ) -> Result<AgentReply> {
         match settings.provider {
-            Provider::Cloud => self.server.ask_in_chat(chat_id, prompt, settings, &[]).await,
+            Provider::Cloud => {
+                self.server
+                    .ask_in_chat(chat_id, prompt, settings, &[])
+                    .await
+            }
             Provider::Ollama => self.local.ask(history, settings).await,
         }
     }

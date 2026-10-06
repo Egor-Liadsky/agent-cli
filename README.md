@@ -1151,11 +1151,11 @@ cargo install --path ../mcp/index/crates/index
 
 | Инструмент | Пишет | Аргументы | Результат |
 |------------|-------|-----------|-----------|
-| `index_search` | нет | `query`, `strategy`, `top_k` | `{query, strategy, model, dim, hits:[{chunk_id, source, section, score, text}]}` |
+| `index_search` | нет | `query`, `strategy`, `top_k`, `candidate_top_k`, `similarity_threshold`, `rewrite` | `{query, used_query, strategy, model, dim, top_k, candidate_top_k, similarity_threshold, rewrite, rewrite_fallback, candidates, results, hits:[{chunk_id, source, section, score, text}]}` |
 | `index_status` | нет | — | `{db, exists, search_model, strategies:[{strategy, chunks, files, chars, model, dim, embed_ms, built_at, params}]}` |
 | `index_models` | нет | — | `{models:[{name, dim, context_length, size}]}` — модели Ollama с эмбеддингами |
 | `index_build` | базу | `input`, `strategy`, `unit`, `chunk_size`, `overlap`, `max_section`, `min_section`, `min_chars`, `model`, `num_ctx`, `batch`, `dim` | `{db, model, dim, strategies:[{strategy, chunks, files, chars, embed_ms}]}` |
-| `index_compare` | отчёт | `questions`, `out` | `{out, report}` — клиент его не использует |
+| `index_compare` | отчёт | `questions`, `out`, `top_k`, `candidate_top_k`, `similarity_threshold`, `rewrite_model` | `{out, report}` — клиент его не использует |
 
 Поиск не смешивает модели: если модель запроса (`index_model`) не совпадает с
 моделью, которой построены векторы стратегии, `index_search` отвечает
@@ -1168,6 +1168,8 @@ Ollama (`/api/show`, иначе длина первого вектора), а н
 cargo run -p agentcli -- config index set --root ~/notes --db ~/.local/share/agentcli/index.db
 cargo run -p agentcli -- config index set --strategy structure --model nomic-embed-text
 cargo run -p agentcli -- config index set --unit tokens --chunk-size 400 --overlap 60 --max-section 600 --min-section 100
+# Поиск: параметры общие для index_search в командах и чатах
+cargo run -p agentcli -- config index set --top-k 5 --candidate-top-k 20 --similarity-threshold 0.7 --rewrite true --rewrite-model qwen3
 cargo run -p agentcli -- config index set --model "" --chunk-size 0   # пустая строка (у чисел — 0) снимает значение
 cargo run -p agentcli -- config index show
 cargo run -p agentcli -- config index clear
@@ -1176,13 +1178,19 @@ cargo run -p agentcli -- config index clear
 | Поле конфига | Что задаёт | Умолчание |
 |--------------|-----------|-----------|
 | `index_root` | каталог с `.docx` для сборки | — |
-| `index_db` | файл базы SQLite; **заданная база включает инструменты в чатах** | — |
+| `index_db` | файл базы SQLite для индексных инструментов | — |
+| `index_search_enabled` | включать индексные инструменты в чатах и `agentcli ask` | true |
 | `index_strategy` | `fixed`, `structure` или `all` | `all` |
 | `index_model` | модель эмбеддингов Ollama | `nomic-embed-text` |
 | `index_unit` | единица размеров: `chars` или `tokens` | `chars` |
 | `index_chunk_size`, `index_overlap` | `fixed`: окно и перекрытие | 1200, 200 |
 | `index_max_section`, `index_min_section` | `structure`: потолок и минимум чанка | 1500, 200 |
 | `index_ollama_url` | адрес Ollama | `http://localhost:11434` |
+| `index_top_k` | число результатов после фильтрации | 5 |
+| `index_candidate_top_k` | число кандидатов до фильтрации | 20 |
+| `index_similarity_threshold` | минимальный cosine score в RAG; пусто — клиент применяет `0.5` | `0.5` |
+| `index_rewrite` | включать query rewrite | false |
+| `index_rewrite_model` | Ollama-модель rewrite | модель эмбеддингов |
 
 **Команды.** Каждая запускает `index-mcp` на время команды; флаги `build`
 перекрывают конфиг только для этого запуска. Ход сборки идёт в stderr, итог —
@@ -1192,18 +1200,19 @@ cargo run -p agentcli -- config index clear
 cargo run -p agentcli -- index build --strategy structure           # каталог и база из конфига
 cargo run -p agentcli -- index build --root ~/notes --db /tmp/idx.db --min-chars 0
 cargo run -p agentcli -- index search "как TCP гарантирует доставку" --top-k 3
+cargo run -p agentcli -- index search "как TCP гарантирует доставку" --top-k 3 --candidate-top-k 20 --similarity-threshold 0.7 --rewrite
 cargo run -p agentcli -- index status
 cargo run -p agentcli -- index models
 ```
 
-**Чат.** При заданном `index_db` модель во всех чатах и в `agentcli ask`
-получает `index_search` и `index_status` — можно спросить «что в моих
-конспектах про UDP». Пишущий `index_build` в TUI требует подтверждения (каталог
+**Чат.** При заданном `index_db` и включённом `index_search_enabled` модель во
+всех чатах и в `agentcli ask` получает `index_search` и `index_status` — можно
+спросить «что в моих конспектах про UDP». Пишущий `index_build` в TUI требует подтверждения (каталог
 и параметры подставляются из настроек, что модель не назвала сама), в `ask`
 отклоняется. `index_models` и `index_compare` в чат не отдаются.
 
-**Настройки в TUI.** Раздел «Индекс документов» в `Ctrl+P` (после
-«Пайплайна») правит те же поля: «Каталог с .docx» (`Ctrl+X` — системный
+**Настройки в TUI.** Вкладка «Индекс документов» в `Ctrl+P` (после
+«Пайплайна») правит поля сборки: «Каталог с .docx» (`Ctrl+X` — системный
 диалог), «Файл базы», «Стратегия chunking» и «Единица размеров» (`◀`/`▶`,
 `Space`), «Модель эмбеддингов» (`◀`/`▶` перебирает модели Ollama с
 эмбеддингами, список грузится по первой стрелке, `Ctrl+L` обновляет), размеры
@@ -1214,6 +1223,27 @@ cargo run -p agentcli -- index models
 повторный `Enter` во время сборки ничего не делает. Размеры проверяются по
 `Ctrl+S` и при сборке: целое больше нуля или пусто. Значения не попадают в
 `ChatSettings` и на сервис.
+
+Вкладка «Поиск индекса» рядом с ней правит RAG-параметры: переключатель
+«Поиск по индексу», а если он включён — «Результатов top-k» (1–20),
+«Кандидатов до фильтра» (1–100), «Similarity threshold» (-1…1), «Query
+rewrite» (`◀`/`▶` или `Space`) и
+«Модель query rewrite». Пустые значения сохраняют серверные умолчания: 5,
+20, фильтр для ручной команды выключен, rewrite выключен и модель эмбеддингов
+для rewrite. В RAG-чате незаданный порог равен `0.5`.
+
+В чатах и `agentcli ask` клиент фиксирует настроенный `index_similarity_threshold`
+(или `0.5`, если он не задан), поэтому аргументы модели не могут его понизить.
+Модель получает инструкцию отвечать только по чанкам и возвращать разделы
+«Ответ», «Источники» и «Цитаты»: каждый пункт ответа ссылается на `chunk_id`,
+источник содержит `source` и `section`, а цитата должна дословно находиться в
+тексте этого чанка. Клиент отбрасывает результаты ниже порога, проверяет
+ссылки и цитаты и один раз просит исправить невалидный ответ; без подходящих
+чанков или после неудачной проверки отвечает «Не знаю» и просит уточнение.
+Инструкция передаётся в пользовательской реплике, поэтому работает с Ollama
+и `agentd`, который не принимает `Role::System`. Rewrite при недоступной
+Ollama-модели возвращается к исходному запросу и сообщает `rewrite_fallback`.
+Порядок поиска: candidate_top_k → threshold → top_k.
 
 Живой тест против собранного сервера и Ollama с `nomic-embed-text`:
 `AGENTCLI_INDEX_MCP=$PWD/../mcp/index/target/release/index-mcp cargo test -p agentcli live_index -- --ignored`.

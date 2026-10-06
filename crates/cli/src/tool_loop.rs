@@ -8,7 +8,7 @@
 //! приходят трейтами, поэтому цикл тестируется без процесса и сети.
 
 use agentclient::ServerAgent;
-use agentcore::agent::{Agent, AgentError, AgentReply, Message, ToolCall, ToolSpec};
+use agentcore::agent::{Agent, AgentError, AgentReply, Message, Role, ToolCall, ToolSpec};
 use agentcore::config::ChatSettings;
 use anyhow::Result;
 use async_trait::async_trait;
@@ -25,6 +25,7 @@ pub const LIMIT_RESULT: &str =
     "лимит вызовов инструментов исчерпан, ответь по уже полученным данным";
 pub const TOO_MANY_CALLS_RESULT: &str =
     "слишком много вызовов за один ответ: этот вызов не выполнен, повтори его следующим шагом";
+const GROUNDING_REFUSAL: &str = "## Ответ\nНе знаю: не могу подтвердить ответ точными цитатами из найденных чанков. Уточните, пожалуйста, какой аспект вопроса вас интересует?\n\n## Источники\nНет проверенных источников.\n\n## Цитаты\nНет.";
 
 /// Исполнитель инструментов (для git — процесс `git-mcp`).
 #[async_trait]
@@ -33,6 +34,16 @@ pub trait ToolExecutor: Send + Sync {
     fn specs(&self) -> Vec<ToolSpec>;
     /// Пишущий инструмент требует подтверждения человека.
     fn is_write(&self, name: &str) -> bool;
+    /// Включает проверку финального ответа по результатам поиска.
+    fn grounding_instruction(&self) -> Option<&'static str> {
+        None
+    }
+    fn grounding_has_context(&self) -> bool {
+        true
+    }
+    fn validate_grounded_answer(&self, _answer: &str) -> std::result::Result<(), String> {
+        Ok(())
+    }
     /// Текст результата для модели. `Err` с [`AgentError::ToolServerUnavailable`]
     /// прерывает ход; прочие ошибки становятся результатом-ошибкой.
     async fn call(&self, call: &ToolCall) -> Result<String>;
@@ -54,11 +65,17 @@ pub trait ToolApprover: Send + Sync {
 #[async_trait]
 pub trait TurnBackend: Send {
     /// Первый запрос хода.
-    async fn first(&mut self, tools: &[ToolSpec]) -> Result<AgentReply>;
+    async fn first(
+        &mut self,
+        tools: &[ToolSpec],
+        instruction: Option<&'static str>,
+    ) -> Result<AgentReply>;
     /// Следующий запрос: `turn` — все сообщения хода после реплики
     /// пользователя (ответы с вызовами и результаты), последними идут
     /// результаты только что выполненных вызовов.
     async fn next(&mut self, turn: &[Message], tools: &[ToolSpec]) -> Result<AgentReply>;
+    /// Исправление финального ответа новым пользовательским запросом.
+    async fn repair(&mut self, turn: &[Message], correction: &str) -> Result<AgentReply>;
 }
 
 /// Что цикл сообщает интерфейсу по ходу работы.
@@ -88,7 +105,8 @@ impl std::fmt::Display for TurnError {
 
 /// Ответ модели с вызовами как сообщение истории.
 fn assistant_message(reply: &AgentReply) -> Message {
-    let mut message = Message::assistant_with_tool_calls(reply.content.clone(), reply.tool_calls.clone());
+    let mut message =
+        Message::assistant_with_tool_calls(reply.content.clone(), reply.tool_calls.clone());
     message.reasoning = reply.reasoning.clone();
     message.meta = Some(reply.meta.clone());
     message
@@ -122,23 +140,61 @@ pub async fn run_tool_loop(
     let mut executed = 0usize;
     let mut iterations = 0u32;
     let mut forced_final = false;
+    let mut grounding_repaired = false;
 
     let fail = |error: anyhow::Error, executed: usize| TurnError { error, executed };
 
-    let mut reply = match backend.first(&specs).await {
+    let instruction = executor.grounding_instruction();
+    let mut reply = match backend.first(&specs, instruction).await {
         Ok(reply) => reply,
         Err(error) => return Err(fail(error, executed)),
     };
 
     loop {
         if reply.tool_calls.is_empty() {
+            if instruction.is_none() {
+                return Ok(reply);
+            }
+            if !executor.grounding_has_context() {
+                reply.content = GROUNDING_REFUSAL.into();
+                reply.reasoning = None;
+                return Ok(reply);
+            }
+            if let Err(reason) = executor.validate_grounded_answer(&reply.content) {
+                if grounding_repaired {
+                    reply.content = GROUNDING_REFUSAL.into();
+                    reply.reasoning = None;
+                    return Ok(reply);
+                }
+                grounding_repaired = true;
+                let correction = format!(
+                    "Предыдущий ответ не прошёл проверку источников: {reason}. Исправь его по исходному вопросу, используя только результаты index_search. Верни обязательные разделы «Ответ», «Источники», «Цитаты»; каждое фактическое утверждение снабди ссылкой [chunk_id] и точной цитатой. Не вызывай инструменты. Предыдущий ответ:\n{}",
+                    reply.content
+                );
+                reply = match backend.repair(&messages, &correction).await {
+                    Ok(reply) => reply,
+                    Err(error) => return Err(fail(error, executed)),
+                };
+                if !reply.tool_calls.is_empty() {
+                    reply.content = GROUNDING_REFUSAL.into();
+                    reply.reasoning = None;
+                    reply.tool_calls.clear();
+                    return Ok(reply);
+                }
+                continue;
+            }
+            reply.reasoning = None;
             return Ok(reply);
         }
         if forced_final {
             let error = AgentError::ToolLoopLimit { iterations }.into();
             return Err(fail(error, executed));
         }
-        let assistant = assistant_message(&reply);
+        let mut assistant = assistant_message(&reply);
+        if instruction.is_some() {
+            assistant.content.clear();
+            assistant.reasoning = None;
+        }
         messages.push(assistant.clone());
         observer.messages(std::slice::from_ref(&assistant));
 
@@ -168,7 +224,11 @@ pub async fn run_tool_loop(
                     Err(error) => format!("Ошибка инструмента: {error:#}"),
                 }
             };
-            results.push(Message::tool_result(call.id.clone(), call.name.clone(), text));
+            results.push(Message::tool_result(
+                call.id.clone(),
+                call.name.clone(),
+                text,
+            ));
         }
         observer.messages(&results);
         messages.extend(results);
@@ -208,15 +268,29 @@ pub struct CloudTurn<'a> {
 
 #[async_trait]
 impl TurnBackend for CloudTurn<'_> {
-    async fn first(&mut self, tools: &[ToolSpec]) -> Result<AgentReply> {
+    async fn first(
+        &mut self,
+        tools: &[ToolSpec],
+        instruction: Option<&'static str>,
+    ) -> Result<AgentReply> {
+        let prompt = instruction.map_or_else(
+            || self.prompt.to_string(),
+            |instruction| format!("{}\n\n{instruction}", self.prompt),
+        );
         self.server
-            .ask_in_chat(self.chat_id, self.prompt, self.settings, tools)
+            .ask_in_chat(self.chat_id, &prompt, self.settings, tools)
             .await
     }
 
     async fn next(&mut self, turn: &[Message], tools: &[ToolSpec]) -> Result<AgentReply> {
         self.server
             .continue_in_chat(self.chat_id, trailing_results(turn), self.settings, tools)
+            .await
+    }
+
+    async fn repair(&mut self, _turn: &[Message], correction: &str) -> Result<AgentReply> {
+        self.server
+            .ask_in_chat(self.chat_id, correction, self.settings, &[])
             .await
     }
 }
@@ -227,18 +301,50 @@ pub struct HistoryTurn<'a> {
     pub agent: &'a dyn Agent,
     pub history: &'a [Message],
     pub settings: &'a ChatSettings,
+    pub instruction: Option<&'static str>,
+}
+
+fn history_with_instruction(history: &[Message], instruction: Option<&str>) -> Vec<Message> {
+    let mut history = history.to_vec();
+    if let Some(instruction) = instruction {
+        if let Some(user) = history
+            .last_mut()
+            .filter(|message| matches!(message.role, Role::User))
+        {
+            user.content.push_str("\n\n");
+            user.content.push_str(instruction);
+        } else {
+            history.push(Message::user(instruction));
+        }
+    }
+    history
 }
 
 #[async_trait]
 impl TurnBackend for HistoryTurn<'_> {
-    async fn first(&mut self, tools: &[ToolSpec]) -> Result<AgentReply> {
-        self.agent.ask_with_tools(self.history, self.settings, tools).await
+    async fn first(
+        &mut self,
+        tools: &[ToolSpec],
+        instruction: Option<&'static str>,
+    ) -> Result<AgentReply> {
+        self.instruction = instruction;
+        let history = history_with_instruction(self.history, self.instruction);
+        self.agent.ask_with_tools(&history, self.settings, tools).await
     }
 
     async fn next(&mut self, turn: &[Message], tools: &[ToolSpec]) -> Result<AgentReply> {
+        let mut history = history_with_instruction(self.history, self.instruction);
+        history.extend(turn.iter().cloned());
+        self.agent
+            .ask_with_tools(&history, self.settings, tools)
+            .await
+    }
+
+    async fn repair(&mut self, turn: &[Message], correction: &str) -> Result<AgentReply> {
         let mut history = self.history.to_vec();
         history.extend(turn.iter().cloned());
-        self.agent.ask_with_tools(&history, self.settings, tools).await
+        history.push(Message::user(correction));
+        self.agent.ask_with_tools(&history, self.settings, &[]).await
     }
 }
 
@@ -263,18 +369,43 @@ impl<'a> ToolSet<'a> {
             .copied()
             .find(|executor| executor.specs().iter().any(|spec| spec.name == name))
     }
+
+    fn grounding_executor(&self) -> Option<&'a dyn ToolExecutor> {
+        self.executors
+            .iter()
+            .copied()
+            .find(|executor| executor.grounding_instruction().is_some())
+    }
 }
 
 #[async_trait]
 impl ToolExecutor for ToolSet<'_> {
     fn specs(&self) -> Vec<ToolSpec> {
-        self.executors.iter().flat_map(|executor| executor.specs()).collect()
+        self.executors
+            .iter()
+            .flat_map(|executor| executor.specs())
+            .collect()
     }
 
     /// Инструмент без владельца — пишущий: неизвестное опасно, а не
     /// безопасно, как и в `mcp::is_read_only`.
     fn is_write(&self, name: &str) -> bool {
-        self.owner(name).is_none_or(|executor| executor.is_write(name))
+        self.owner(name)
+            .is_none_or(|executor| executor.is_write(name))
+    }
+
+    fn grounding_instruction(&self) -> Option<&'static str> {
+        self.grounding_executor()?.grounding_instruction()
+    }
+
+    fn grounding_has_context(&self) -> bool {
+        self.grounding_executor()
+            .is_none_or(|executor| executor.grounding_has_context())
+    }
+
+    fn validate_grounded_answer(&self, answer: &str) -> std::result::Result<(), String> {
+        self.grounding_executor()
+            .map_or(Ok(()), |executor| executor.validate_grounded_answer(answer))
     }
 
     async fn call(&self, call: &ToolCall) -> Result<String> {
@@ -334,6 +465,7 @@ mod tests {
         replies: Vec<AgentReply>,
         asked_tools: Vec<usize>,
         turns: Vec<Vec<Message>>,
+        repairs: usize,
     }
 
     impl Script {
@@ -342,24 +474,37 @@ mod tests {
                 replies: replies.into_iter().rev().collect(),
                 asked_tools: Vec::new(),
                 turns: Vec::new(),
+                repairs: 0,
             }
         }
 
         fn take(&mut self, tools: &[ToolSpec]) -> Result<AgentReply> {
             self.asked_tools.push(tools.len());
-            self.replies.pop().ok_or_else(|| anyhow::anyhow!("сценарий закончился"))
+            self.replies
+                .pop()
+                .ok_or_else(|| anyhow::anyhow!("сценарий закончился"))
         }
     }
 
     #[async_trait]
     impl TurnBackend for Script {
-        async fn first(&mut self, tools: &[ToolSpec]) -> Result<AgentReply> {
+        async fn first(
+            &mut self,
+            tools: &[ToolSpec],
+            _instruction: Option<&'static str>,
+        ) -> Result<AgentReply> {
             self.take(tools)
         }
 
         async fn next(&mut self, turn: &[Message], tools: &[ToolSpec]) -> Result<AgentReply> {
             self.turns.push(turn.to_vec());
             self.take(tools)
+        }
+
+        async fn repair(&mut self, turn: &[Message], _correction: &str) -> Result<AgentReply> {
+            self.repairs += 1;
+            self.turns.push(turn.to_vec());
+            self.take(&[])
         }
     }
 
@@ -407,6 +552,39 @@ mod tests {
         }
     }
 
+    struct Grounded(bool);
+
+    #[async_trait]
+    impl ToolExecutor for Grounded {
+        fn specs(&self) -> Vec<ToolSpec> {
+            Vec::new()
+        }
+
+        fn is_write(&self, _name: &str) -> bool {
+            true
+        }
+
+        fn grounding_instruction(&self) -> Option<&'static str> {
+            Some("use retrieved sources")
+        }
+
+        fn grounding_has_context(&self) -> bool {
+            self.0
+        }
+
+        fn validate_grounded_answer(&self, answer: &str) -> std::result::Result<(), String> {
+            if answer == "valid" {
+                Ok(())
+            } else {
+                Err("missing references".into())
+            }
+        }
+
+        async fn call(&self, _call: &ToolCall) -> Result<String> {
+            unreachable!("нет инструментов")
+        }
+    }
+
     struct Approve(bool);
 
     #[async_trait]
@@ -431,6 +609,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn weak_grounding_refuses_and_invalid_answer_gets_one_repair() {
+        let mut backend = Script::new(vec![reply("unsupported", vec![])]);
+        let outcome = run_tool_loop(
+            &mut backend,
+            &Grounded(false),
+            &Approve(true),
+            8,
+            &Collect::default(),
+        )
+        .await
+        .expect("без контекста возвращается безопасный ответ");
+        assert!(outcome.content.contains("Не знаю"));
+        assert!(outcome.content.contains("Уточните"));
+        assert_eq!(backend.repairs, 0);
+
+        let mut corrected = reply("valid", vec![]);
+        corrected.reasoning = Some("unverified reasoning".into());
+        let mut backend = Script::new(vec![reply("unsupported", vec![]), corrected]);
+        let outcome = run_tool_loop(
+            &mut backend,
+            &Grounded(true),
+            &Approve(true),
+            8,
+            &Collect::default(),
+        )
+        .await
+        .expect("исправленный ответ");
+        assert_eq!(outcome.content, "valid");
+        assert!(outcome.reasoning.is_none());
+        assert_eq!(backend.repairs, 1);
+    }
+
+    #[tokio::test]
     async fn two_tool_iterations_then_answer() {
         let mut backend = Script::new(vec![
             reply("", vec![call("c0", "git_status")]),
@@ -444,9 +655,16 @@ mod tests {
             .expect("ход");
         assert_eq!(outcome.content, "готово");
         assert_eq!(executor.called(), vec!["git_status", "git_status"]);
-        assert_eq!(seen.all().len(), 4, "два ответа с вызовами и два результата");
+        assert_eq!(
+            seen.all().len(),
+            4,
+            "два ответа с вызовами и два результата"
+        );
         let last_turn = backend.turns.last().unwrap();
-        assert_eq!(last_turn.last().unwrap().tool_call_id.as_deref(), Some("c1"));
+        assert_eq!(
+            last_turn.last().unwrap().tool_call_id.as_deref(),
+            Some("c1")
+        );
         assert_eq!(last_turn.last().unwrap().content, "вывод git_status");
     }
 
@@ -494,8 +712,16 @@ mod tests {
             .await
             .expect("ход");
         assert_eq!(outcome.content, "по имеющимся данным");
-        assert_eq!(executor.called().len(), 2, "третий ответ сверх лимита не выполняется");
-        assert_eq!(backend.asked_tools, vec![2, 2, 2, 0], "финальный запрос без инструментов");
+        assert_eq!(
+            executor.called().len(),
+            2,
+            "третий ответ сверх лимита не выполняется"
+        );
+        assert_eq!(
+            backend.asked_tools,
+            vec![2, 2, 2, 0],
+            "финальный запрос без инструментов"
+        );
         assert_eq!(seen.all().last().unwrap().content, LIMIT_RESULT);
     }
 
@@ -534,7 +760,11 @@ mod tests {
             .await
             .expect_err("сервер недоступен");
         assert_eq!(err.executed, 1);
-        assert_eq!(seen.all().len(), 1, "ответ с вызовом сохранён, результата нет");
+        assert_eq!(
+            seen.all().len(),
+            1,
+            "ответ с вызовом сохранён, результата нет"
+        );
     }
 
     #[tokio::test]
@@ -601,9 +831,18 @@ mod tests {
         assert!(set.is_write("git_add"));
         assert!(!set.is_write("activity_changes"));
         assert!(set.is_write("unknown_tool"));
-        assert_eq!(set.call(&call("1", "activity_changes")).await.unwrap(), "активность activity_changes");
-        assert_eq!(set.call(&call("2", "git_status")).await.unwrap(), "вывод git_status");
-        assert_eq!(set.call(&call("3", "unknown_tool")).await.unwrap(), NOT_ALLOWED_RESULT);
+        assert_eq!(
+            set.call(&call("1", "activity_changes")).await.unwrap(),
+            "активность activity_changes"
+        );
+        assert_eq!(
+            set.call(&call("2", "git_status")).await.unwrap(),
+            "вывод git_status"
+        );
+        assert_eq!(
+            set.call(&call("3", "unknown_tool")).await.unwrap(),
+            NOT_ALLOWED_RESULT
+        );
         assert_eq!(git.called(), vec!["git_status"]);
         assert!(ToolSet::default().specs().is_empty());
     }

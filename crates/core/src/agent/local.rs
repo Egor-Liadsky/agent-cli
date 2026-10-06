@@ -4,7 +4,7 @@
 //! консольный клиент (как единственным прямым вызовом модели) и сетевой
 //! сервис (как одним из провайдеров).
 
-use super::{ollama, system_prompt, Agent, AgentReply, Message, ToolSpec};
+use super::{Agent, AgentReply, Message, ToolSpec, ollama, system_prompt};
 use crate::config::{ChatSettings, Config};
 use crate::logging::ExchangeLog;
 use anyhow::Result;
@@ -184,7 +184,10 @@ mod tests {
         assert_eq!(reply.tool_calls[0].name, "git_status");
 
         let request = handle.await.expect("запрос");
-        assert!(request.contains(r#""tools":[{"type":"function""#), "запрос: {request}");
+        assert!(
+            request.contains(r#""tools":[{"type":"function""#),
+            "запрос: {request}"
+        );
     }
 
     #[tokio::test]

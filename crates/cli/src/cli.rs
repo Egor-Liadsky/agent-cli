@@ -112,6 +112,18 @@ pub enum IndexAction {
         /// Сколько чанков показать (по умолчанию 5, не больше 20)
         #[arg(long = "top-k")]
         top_k: Option<usize>,
+        /// Сколько кандидатов взять до фильтрации
+        #[arg(long = "candidate-top-k")]
+        candidate_top_k: Option<usize>,
+        /// Минимальный cosine score
+        #[arg(long = "similarity-threshold")]
+        similarity_threshold: Option<f32>,
+        /// Включить query rewrite
+        #[arg(long)]
+        rewrite: bool,
+        /// Отключить query rewrite из конфигурации
+        #[arg(long = "no-rewrite")]
+        no_rewrite: bool,
     },
     /// Что лежит в базе: стратегии, число чанков, модель, время сборки
     Status,
@@ -377,6 +389,21 @@ pub enum IndexConfigAction {
         /// Адрес Ollama (по умолчанию http://localhost:11434)
         #[arg(long = "ollama-url")]
         ollama_url: Option<String>,
+        /// Сколько результатов возвращать после фильтрации
+        #[arg(long = "top-k")]
+        top_k: Option<usize>,
+        /// Сколько кандидатов брать до фильтрации
+        #[arg(long = "candidate-top-k")]
+        candidate_top_k: Option<usize>,
+        /// Минимальный cosine score; пустая строка снимает значение
+        #[arg(long = "similarity-threshold")]
+        similarity_threshold: Option<String>,
+        /// true/false
+        #[arg(long)]
+        rewrite: Option<String>,
+        /// Модель Ollama для query rewrite
+        #[arg(long = "rewrite-model")]
+        rewrite_model: Option<String>,
     },
     /// Снять все настройки индекса: инструменты в чатах выключаются
     Clear,

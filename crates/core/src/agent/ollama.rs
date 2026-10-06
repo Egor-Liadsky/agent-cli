@@ -5,10 +5,12 @@
 //! (`message.thinking`), счётчики токенов и `top_k`, то есть всё, что
 //! приложение уже показывает для облачных моделей.
 
-use super::{close_dangling_tool_calls, AgentReply, Message, MessageMeta, Role, ToolCall, ToolSpec};
+use super::error::{AgentError, transport_error};
+use super::{
+    AgentReply, Message, MessageMeta, Role, ToolCall, ToolSpec, close_dangling_tool_calls,
+};
 use crate::config::{ChatSettings, ThinkingMode};
-use super::error::{transport_error, AgentError};
-use crate::logging::{request_id, unix_timestamp, ExchangeLog, RequestLogEntry, ResponseLogEntry};
+use crate::logging::{ExchangeLog, RequestLogEntry, ResponseLogEntry, request_id, unix_timestamp};
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::time::Instant;
@@ -238,25 +240,27 @@ fn build_messages(system: Option<String>, history: &[Message]) -> Vec<ChatMessag
             tool_name: None,
         });
     }
-    messages.extend(history.iter().map(|m| ChatMessage {
-        role: match m.role {
-            Role::User => "user",
-            Role::Assistant => "assistant",
-            Role::System => "system",
-            Role::Tool => "tool",
-        },
-        content: m.content.clone(),
-        tool_calls: m
-            .tool_calls
-            .iter()
-            .map(|call| WireToolCall {
-                function: WireToolFunction {
-                    name: call.name.clone(),
-                    arguments: call.arguments.clone(),
-                },
-            })
-            .collect(),
-        tool_name: m.tool_name.clone(),
+    messages.extend(history.iter().map(|m| {
+        ChatMessage {
+            role: match m.role {
+                Role::User => "user",
+                Role::Assistant => "assistant",
+                Role::System => "system",
+                Role::Tool => "tool",
+            },
+            content: m.content.clone(),
+            tool_calls: m
+                .tool_calls
+                .iter()
+                .map(|call| WireToolCall {
+                    function: WireToolFunction {
+                        name: call.name.clone(),
+                        arguments: call.arguments.clone(),
+                    },
+                })
+                .collect(),
+            tool_name: m.tool_name.clone(),
+        }
     }));
     messages
 }
@@ -428,13 +432,13 @@ mod tests {
 
     #[test]
     fn splices_settings_prompt_with_history_system_message() {
-        let history = vec![
-            Message::system("факты чата: ..."),
-            Message::user("привет"),
-        ];
+        let history = vec![Message::system("факты чата: ..."), Message::user("привет")];
         let messages = build_messages(Some("формат ответа: markdown".to_string()), &history);
         assert_eq!(roles(&messages), vec!["system", "user"]);
-        assert_eq!(messages[0].content, "формат ответа: markdown\n\nфакты чата: ...");
+        assert_eq!(
+            messages[0].content,
+            "формат ответа: markdown\n\nфакты чата: ..."
+        );
     }
 
     #[test]

@@ -15,7 +15,9 @@
 
 use crate::tool_loop::ToolExecutor;
 use agentcore::agent::{AgentError, ToolCall, ToolSpec};
-use agentcore::logging::{request_id, unix_timestamp, ExchangeLog, RequestLogEntry, ResponseLogEntry};
+use agentcore::logging::{
+    ExchangeLog, RequestLogEntry, ResponseLogEntry, request_id, unix_timestamp,
+};
 use anyhow::Result;
 use async_trait::async_trait;
 use rmcp::model::CallToolRequestParams;
@@ -80,7 +82,10 @@ const LIST_URL: &str = "mcp+stdio://git-mcp/tools/list";
 /// не проверяются: сервер собирается своим репозиторием, и собственная
 /// сборка `agentcli` его туда не кладёт.
 pub fn server_program() -> PathBuf {
-    locate_server(std::env::var_os(SERVER_PROGRAM_ENV), std::env::current_exe().ok())
+    locate_server(
+        std::env::var_os(SERVER_PROGRAM_ENV),
+        std::env::current_exe().ok(),
+    )
 }
 
 /// Путь из переменной окружения берётся как есть, даже если файла нет:
@@ -91,7 +96,10 @@ fn locate_server(from_env: Option<std::ffi::OsString>, exe: Option<PathBuf>) -> 
         return PathBuf::from(path);
     }
     let name = format!("{SERVER_NAME}{}", std::env::consts::EXE_SUFFIX);
-    if let Some(beside) = exe.as_deref().and_then(Path::parent).map(|dir| dir.join(&name))
+    if let Some(beside) = exe
+        .as_deref()
+        .and_then(Path::parent)
+        .map(|dir| dir.join(&name))
         && beside.is_file()
     {
         return beside;
@@ -122,11 +130,16 @@ pub fn validate_repository(path: &str) -> std::result::Result<PathBuf, AgentErro
         ));
     }
     let expanded = match trimmed.strip_prefix("~/") {
-        Some(rest) => dirs::home_dir().map(|home| home.join(rest)).unwrap_or_else(|| PathBuf::from(trimmed)),
+        Some(rest) => dirs::home_dir()
+            .map(|home| home.join(rest))
+            .unwrap_or_else(|| PathBuf::from(trimmed)),
         None => PathBuf::from(trimmed),
     };
     if !expanded.is_dir() {
-        return Err(unavailable(format!("каталог {} не существует", expanded.display())));
+        return Err(unavailable(format!(
+            "каталог {} не существует",
+            expanded.display()
+        )));
     }
     if !expanded.join(".git").exists() {
         return Err(unavailable(format!(
@@ -134,9 +147,12 @@ pub fn validate_repository(path: &str) -> std::result::Result<PathBuf, AgentErro
             expanded.display()
         )));
     }
-    expanded
-        .canonicalize()
-        .map_err(|err| unavailable(format!("не удалось разрешить путь {}: {err}", expanded.display())))
+    expanded.canonicalize().map_err(|err| {
+        unavailable(format!(
+            "не удалось разрешить путь {}: {err}",
+            expanded.display()
+        ))
+    })
 }
 
 /// Описание инструмента сервера в том виде, в каком его держит клиент.
@@ -185,7 +201,10 @@ pub fn prepare_specs(tools: &[ServerTool], allowed_writes: Option<&[String]>) ->
 /// Аргументы вызова с подставленным путём репозитория. Значение модели
 /// перезаписывается: модель не может обратиться к другому репозиторию, даже
 /// если сервер этого не запрещает.
-pub fn with_repo_path(arguments: &Value, repo: &Path) -> std::result::Result<serde_json::Map<String, Value>, String> {
+pub fn with_repo_path(
+    arguments: &Value,
+    repo: &Path,
+) -> std::result::Result<serde_json::Map<String, Value>, String> {
     let mut object = match arguments {
         Value::Object(object) => object.clone(),
         Value::Null => serde_json::Map::new(),
@@ -208,7 +227,10 @@ fn truncate(text: String, max_chars: usize) -> String {
         return text;
     }
     let head: String = text.chars().take(max_chars).collect();
-    format!("{head}\n[… обрезано: отброшено {} символов]", total - max_chars)
+    format!(
+        "{head}\n[… обрезано: отброшено {} символов]",
+        total - max_chars
+    )
 }
 
 /// Текст результата для модели: текстовые элементы `content` через перевод
@@ -317,11 +339,9 @@ impl GitToolServer {
                 .serve(transport)
                 .await
                 .map_err(|err| unavailable(format!("рукопожатие MCP не прошло: {err}")))?;
-            let tools = service
-                .peer()
-                .list_all_tools()
-                .await
-                .map_err(|err| unavailable(format!("не удалось получить список инструментов: {err}")))?;
+            let tools = service.peer().list_all_tools().await.map_err(|err| {
+                unavailable(format!("не удалось получить список инструментов: {err}"))
+            })?;
             Ok::<_, AgentError>((service, tools))
         })
         .await
@@ -379,7 +399,12 @@ impl GitToolServer {
         if guard.is_none() {
             *guard = Some(self.respawn().await?);
         }
-        let peer = guard.as_ref().expect("процесс запущен").service.peer().clone();
+        let peer = guard
+            .as_ref()
+            .expect("процесс запущен")
+            .service
+            .peer()
+            .clone();
         let params = CallToolRequestParams::new(name.to_string()).with_arguments(arguments);
         let outcome = tokio::time::timeout(CALL_TIMEOUT, peer.call_tool(params)).await;
 
@@ -390,7 +415,11 @@ impl GitToolServer {
                     .and_then(|value| value.as_array().cloned())
                     .unwrap_or_default();
                 let is_error = result.is_error == Some(true);
-                (if is_error { 500 } else { 200 }, format_result(&content, is_error), false)
+                (
+                    if is_error { 500 } else { 200 },
+                    format_result(&content, is_error),
+                    false,
+                )
             }
             Ok(Err(ServiceError::McpError(error))) => {
                 // Протокольная ошибка (неизвестный инструмент, неверные
@@ -399,14 +428,19 @@ impl GitToolServer {
             }
             Ok(Err(error)) => (
                 500,
-                format!("Ошибка инструмента: сервер инструментов перестал отвечать ({error}); он перезапущен"),
+                format!(
+                    "Ошибка инструмента: сервер инструментов перестал отвечать ({error}); он перезапущен"
+                ),
                 true,
             ),
             // Состояние зависшего сервера неизвестно: перед следующим
             // вызовом он перезапускается.
             Err(_) => (
                 504,
-                format!("Ошибка инструмента: вызов не уложился в {} с", CALL_TIMEOUT.as_secs()),
+                format!(
+                    "Ошибка инструмента: вызов не уложился в {} с",
+                    CALL_TIMEOUT.as_secs()
+                ),
                 true,
             ),
         };
@@ -512,7 +546,10 @@ mod tests {
         let names = |specs: Vec<ToolSpec>| specs.into_iter().map(|s| s.name).collect::<Vec<_>>();
         assert_eq!(names(prepare_specs(&tools, None)), vec!["git_status"]);
         let allowed = vec!["git_add".to_string()];
-        assert_eq!(names(prepare_specs(&tools, Some(&allowed))), vec!["git_status", "git_add"]);
+        assert_eq!(
+            names(prepare_specs(&tools, Some(&allowed))),
+            vec!["git_status", "git_add"]
+        );
     }
 
     #[test]
@@ -532,7 +569,10 @@ mod tests {
             json!({ "type": "image", "data": "…", "mimeType": "image/png" }),
             json!({ "type": "text", "text": "строка 2" }),
         ];
-        assert_eq!(format_result(&content, false), "строка 1\n[image опущен]\nстрока 2");
+        assert_eq!(
+            format_result(&content, false),
+            "строка 1\n[image опущен]\nстрока 2"
+        );
         assert_eq!(
             format_result(&content[..1], true),
             "Ошибка инструмента: строка 1"
@@ -558,14 +598,20 @@ mod tests {
         std::fs::write(&custom, "").unwrap();
         let exe = Some(dir.join("agentcli"));
 
-        assert_eq!(locate_server(Some(custom.clone().into()), exe.clone()), custom);
+        assert_eq!(
+            locate_server(Some(custom.clone().into()), exe.clone()),
+            custom
+        );
         // Пустая переменная — как отсутствующая.
         assert_eq!(locate_server(Some("".into()), exe.clone()), beside);
         assert_eq!(locate_server(None, exe.clone()), beside);
         // Неверный путь из переменной не подменяется соседним бинарником.
         let missing = dir.join("missing");
         assert_eq!(locate_server(Some(missing.clone().into()), exe), missing);
-        assert_eq!(locate_server(None, Some(std::env::temp_dir().join("agentcli"))), PathBuf::from(&name));
+        assert_eq!(
+            locate_server(None, Some(std::env::temp_dir().join("agentcli"))),
+            PathBuf::from(&name)
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -632,7 +678,10 @@ mod tests {
             .expect("запуск git-mcp");
         let names: Vec<&str> = server.tools().iter().map(|t| t.name.as_str()).collect();
         assert!(names.contains(&"git_status"), "инструменты: {names:?}");
-        let text = server.call("git_status", &json!({})).await.expect("git_status");
+        let text = server
+            .call("git_status", &json!({}))
+            .await
+            .expect("git_status");
         assert!(text.contains("README.md"), "вывод: {text}");
         server.shutdown().await;
         let _ = std::fs::remove_dir_all(dir);

@@ -22,17 +22,19 @@ use crate::mcp::format_result;
 use crate::tool_loop::ToolExecutor;
 use agentcore::agent::{Agent, AgentError, Message, ToolCall, ToolSpec};
 use agentcore::config::{ChatSettings, Config};
-use agentcore::logging::{request_id, unix_timestamp, ExchangeLog, RequestLogEntry, ResponseLogEntry};
+use agentcore::logging::{
+    ExchangeLog, RequestLogEntry, ResponseLogEntry, request_id, unix_timestamp,
+};
 use anyhow::Result;
 use async_trait::async_trait;
 use rmcp::model::{
-    CallToolRequestParams, ClientCapabilities, ClientConfig, CreateMessageRequestParams, CreateMessageResult,
-    ErrorData, Implementation, SamplingCapability, SamplingMessage,
+    CallToolRequestParams, ClientCapabilities, ClientConfig, CreateMessageRequestParams,
+    CreateMessageResult, ErrorData, Implementation, SamplingCapability, SamplingMessage,
 };
 use rmcp::service::{RequestContext, RunningService, ServiceError};
 use rmcp::transport::TokioChildProcess;
 use rmcp::{ClientHandler, RoleClient, ServiceExt};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
@@ -110,7 +112,11 @@ impl<A: Agent + Send + Sync + 'static> Sampler for AgentSampler<A> {
             Some(system) => format!("{system}\n\n{prompt}"),
             None => prompt.to_string(),
         };
-        Ok(self.agent.ask(&[Message::user(text)], &self.settings).await?.content)
+        Ok(self
+            .agent
+            .ask(&[Message::user(text)], &self.settings)
+            .await?
+            .content)
     }
 }
 
@@ -129,7 +135,10 @@ impl ClientHandler for Handler {
         _context: RequestContext<RoleClient>,
     ) -> std::result::Result<CreateMessageResult, ErrorData> {
         let Some(sampler) = &self.sampler else {
-            return Err(ErrorData::invalid_request("клиент не поддерживает sampling", None));
+            return Err(ErrorData::invalid_request(
+                "клиент не поддерживает sampling",
+                None,
+            ));
         };
         let prompt = params
             .messages
@@ -147,7 +156,9 @@ impl ClientHandler for Handler {
             request: json!({ "system": params.system_prompt, "prompt": prompt }),
         });
         let started_at = Instant::now();
-        let result = sampler.sample(params.system_prompt.as_deref(), &prompt).await;
+        let result = sampler
+            .sample(params.system_prompt.as_deref(), &prompt)
+            .await;
         self.log.log_response(&ResponseLogEntry {
             id: &id,
             timestamp: unix_timestamp(),
@@ -197,7 +208,9 @@ impl PipelineServer {
     ) -> Result<Self> {
         let root = expand(root);
         if !root.is_dir() {
-            return Err(unavailable(format!("каталог поиска {} не существует", root.display())).into());
+            return Err(
+                unavailable(format!("каталог поиска {} не существует", root.display())).into(),
+            );
         }
         let mut command = tokio::process::Command::new(program);
         command
@@ -230,15 +243,18 @@ impl PipelineServer {
                 .serve(transport)
                 .await
                 .map_err(|err| unavailable(format!("рукопожатие MCP не прошло: {err}")))?;
-            let tools = service
-                .peer()
-                .list_all_tools()
-                .await
-                .map_err(|err| unavailable(format!("не удалось получить список инструментов: {err}")))?;
+            let tools = service.peer().list_all_tools().await.map_err(|err| {
+                unavailable(format!("не удалось получить список инструментов: {err}"))
+            })?;
             Ok::<_, AgentError>((service, tools))
         })
         .await
-        .map_err(|_| unavailable(format!("сервер не запустился за {} с", START_TIMEOUT.as_secs())))??;
+        .map_err(|_| {
+            unavailable(format!(
+                "сервер не запустился за {} с",
+                START_TIMEOUT.as_secs()
+            ))
+        })??;
         let specs = tools
             .into_iter()
             .map(|tool| ToolSpec {
@@ -294,13 +310,23 @@ impl PipelineServer {
         let outcome = tokio::time::timeout(CALL_TIMEOUT, peer.call_tool(params)).await;
         let (status, logged, result) = match outcome {
             Ok(Ok(result)) => {
-                let status = if result.is_error == Some(true) { 500 } else { 200 };
+                let status = if result.is_error == Some(true) {
+                    500
+                } else {
+                    200
+                };
                 let text = serde_json::to_string(&result.content).unwrap_or_default();
                 (status, text, Ok(result))
             }
             Ok(Err(ServiceError::McpError(error))) => {
                 let text = format!("Ошибка инструмента: {}", error.message);
-                (500, text.clone(), Ok(rmcp::model::CallToolResult::error(vec![rmcp::model::ContentBlock::text(text)])))
+                (
+                    500,
+                    text.clone(),
+                    Ok(rmcp::model::CallToolResult::error(vec![
+                        rmcp::model::ContentBlock::text(text),
+                    ])),
+                )
             }
             Ok(Err(error)) => {
                 let text = format!("сервер перестал отвечать: {error}");
@@ -343,12 +369,20 @@ pub(crate) fn expand(path: &str) -> PathBuf {
 /// проверяет передачу данных без сервера.
 #[async_trait]
 pub trait StepCaller: Send + Sync {
-    async fn call_step(&self, name: &str, arguments: Value) -> Result<std::result::Result<Value, String>>;
+    async fn call_step(
+        &self,
+        name: &str,
+        arguments: Value,
+    ) -> Result<std::result::Result<Value, String>>;
 }
 
 #[async_trait]
 impl StepCaller for PipelineServer {
-    async fn call_step(&self, name: &str, arguments: Value) -> Result<std::result::Result<Value, String>> {
+    async fn call_step(
+        &self,
+        name: &str,
+        arguments: Value,
+    ) -> Result<std::result::Result<Value, String>> {
         let result = self.call_raw(name, &arguments).await?;
         let content = serde_json::to_value(&result.content)
             .ok()
@@ -419,7 +453,10 @@ pub async fn run_pipeline(
     if matches.is_empty() {
         // Сводка по пустому и файл с ней ничего не дают: цепочка
         // останавливается до записи.
-        anyhow::bail!("по запросу «{}» ничего не найдено — файл не записан", request.query);
+        anyhow::bail!(
+            "по запросу «{}» ничего не найдено — файл не записан",
+            request.query
+        );
     }
 
     observer.step(2, SUMMARIZE);
@@ -457,7 +494,11 @@ pub async fn run_pipeline(
             saved["sha256"]
         );
     }
-    Ok(PipelineReport { search, summary, saved })
+    Ok(PipelineReport {
+        search,
+        summary,
+        saved,
+    })
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {
@@ -506,10 +547,19 @@ mod tests {
 
     #[async_trait]
     impl StepCaller for FakeSteps {
-        async fn call_step(&self, name: &str, arguments: Value) -> Result<std::result::Result<Value, String>> {
-            self.calls.lock().unwrap().push((name.to_string(), arguments.clone()));
+        async fn call_step(
+            &self,
+            name: &str,
+            arguments: Value,
+        ) -> Result<std::result::Result<Value, String>> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push((name.to_string(), arguments.clone()));
             Ok(Ok(match name {
-                SEARCH if self.empty_search => json!({ "query": arguments["query"], "matches": [] }),
+                SEARCH if self.empty_search => {
+                    json!({ "query": arguments["query"], "matches": [] })
+                }
                 SEARCH => json!({
                     "query": arguments["query"],
                     "matches": [
@@ -526,7 +576,11 @@ mod tests {
                     "input_matches": arguments["matches"].as_array().unwrap().len()
                 }),
                 SAVE_TO_FILE => {
-                    let content = if self.corrupt_save { "другое" } else { arguments["content"].as_str().unwrap() };
+                    let content = if self.corrupt_save {
+                        "другое"
+                    } else {
+                        arguments["content"].as_str().unwrap()
+                    };
                     json!({ "path": "/out/x.md", "bytes": content.len(), "sha256": sha256_hex(content.as_bytes()) })
                 }
                 other => panic!("неожиданный инструмент {other}"),
@@ -591,7 +645,11 @@ mod tests {
 
     #[async_trait]
     impl Agent for RecordingAgent {
-        async fn ask(&self, history: &[Message], _settings: &ChatSettings) -> Result<agentcore::agent::AgentReply> {
+        async fn ask(
+            &self,
+            history: &[Message],
+            _settings: &ChatSettings,
+        ) -> Result<agentcore::agent::AgentReply> {
             *self.0.lock().unwrap() = history.to_vec();
             anyhow::bail!("не нужен ответ")
         }
@@ -633,7 +691,11 @@ mod tests {
             .as_nanos();
         let root = std::env::temp_dir().join(format!("agentcli-pipeline-{nanos}"));
         std::fs::create_dir_all(&root).unwrap();
-        std::fs::write(root.join("a.md"), "ToolSet merges executors\nnoise\nToolSet routes calls\n").unwrap();
+        std::fs::write(
+            root.join("a.md"),
+            "ToolSet merges executors\nnoise\nToolSet routes calls\n",
+        )
+        .unwrap();
         let output = root.join("out");
         let log = Arc::new(ExchangeLog::disabled());
         let server = PipelineServer::start(
@@ -651,6 +713,9 @@ mod tests {
         assert_eq!(report.summary["method"], "sampling");
         let summary = report.summary["summary"].as_str().unwrap();
         assert!(summary.starts_with("SAMPLED["), "{summary}");
-        assert_eq!(std::fs::read_to_string(output.join("x.md")).unwrap(), summary);
+        assert_eq!(
+            std::fs::read_to_string(output.join("x.md")).unwrap(),
+            summary
+        );
     }
 }

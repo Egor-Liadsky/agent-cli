@@ -5,12 +5,12 @@
 //! зависимостей. Запрет держится сборкой, а не договорённостью.
 
 use agentcore::agent::{
-    close_dangling_tool_calls, system_prompt, transport_error, Agent, AgentError, AgentReply,
-    Message, MessageMeta, Role, ToolCall, ToolSpec,
+    Agent, AgentError, AgentReply, Message, MessageMeta, Role, ToolCall, ToolSpec,
+    close_dangling_tool_calls, system_prompt, transport_error,
 };
 use agentcore::config::{ChatSettings, DEFAULT_MODEL};
 use agentcore::logging::{
-    request_id, unix_timestamp, ExchangeLog, RequestLogEntry, ResponseLogEntry,
+    ExchangeLog, RequestLogEntry, ResponseLogEntry, request_id, unix_timestamp,
 };
 use anyhow::Result;
 use async_trait::async_trait;
@@ -695,7 +695,10 @@ mod tests {
         assert_eq!(request["tools"][0]["type"], "function");
         assert_eq!(request["tools"][0]["function"]["name"], "git_log");
         assert_eq!(request["messages"][1]["content"], serde_json::Value::Null);
-        assert_eq!(request["messages"][1]["tool_calls"][0]["function"]["arguments"], "{}");
+        assert_eq!(
+            request["messages"][1]["tool_calls"][0]["function"]["arguments"],
+            "{}"
+        );
         assert_eq!(request["messages"][2]["role"], "tool");
         assert_eq!(request["messages"][2]["tool_call_id"], "call_0");
     }

@@ -166,7 +166,10 @@ async fn unauthorized_carries_hint_and_request_id() {
     let err = ask_error(401, error_body("unauthorized", "нужен токен")).await;
     match err.downcast_ref::<AgentError>() {
         Some(AgentError::Unauthorized { hint, request_id }) => {
-            assert_eq!(hint.as_deref(), Some("выполните: agentcli config set-token"));
+            assert_eq!(
+                hint.as_deref(),
+                Some("выполните: agentcli config set-token")
+            );
             assert_eq!(request_id.as_deref(), Some("req-1"));
         }
         other => panic!("ожидался Unauthorized, получено: {other:?}"),
@@ -361,7 +364,12 @@ async fn max_context_tokens_is_sent_in_ask_in_chat_when_configured() {
     mount_chat(&server, 200, success_body()).await;
 
     agent(&server, "token")
-        .ask_in_chat("chat-1", "привет", &cloud_settings_with_context_limit(4000), &[])
+        .ask_in_chat(
+            "chat-1",
+            "привет",
+            &cloud_settings_with_context_limit(4000),
+            &[],
+        )
         .await
         .expect("ответ сервиса");
 
@@ -396,8 +404,7 @@ async fn summary_settings_are_omitted_when_not_configured_and_sent_when_set() {
         .await
         .expect("ответ сервиса");
     let requests = server.received_requests().await.expect("запросы");
-    let body: serde_json::Value =
-        serde_json::from_slice(&requests[1].body).expect("тело запроса");
+    let body: serde_json::Value = serde_json::from_slice(&requests[1].body).expect("тело запроса");
     assert_eq!(body["settings"]["summary_enabled"], true);
     assert_eq!(body["settings"]["summary_keep_messages"], 20);
     assert_eq!(body["settings"]["summary_step_messages"], 10);
@@ -446,9 +453,7 @@ async fn models_come_from_service() {
     let server = MockServer::start().await;
     Mock::given(method("GET"))
         .and(path("/v1/models"))
-        .respond_with(
-            ResponseTemplate::new(200).set_body_json(json!({ "models": ["a", "b"] })),
-        )
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "models": ["a", "b"] })))
         .mount(&server)
         .await;
 
@@ -482,7 +487,10 @@ async fn ask_in_chat_sends_chat_id_and_prompt_only() {
         .expect("ответ сервиса");
     assert_eq!(reply.content, "ответ");
 
-    let requests = server.received_requests().await.expect("записанные запросы");
+    let requests = server
+        .received_requests()
+        .await
+        .expect("записанные запросы");
     let body: serde_json::Value = serde_json::from_slice(&requests[0].body).expect("тело");
     assert_eq!(body["chat_id"], "chat-1");
     assert_eq!(body["prompt"], "привет");
@@ -503,9 +511,15 @@ async fn ask_without_chat_id_still_sends_history() {
         .await
         .expect("ответ сервиса");
 
-    let requests = server.received_requests().await.expect("записанные запросы");
+    let requests = server
+        .received_requests()
+        .await
+        .expect("записанные запросы");
     let body: serde_json::Value = serde_json::from_slice(&requests[0].body).expect("тело");
-    assert!(body.get("chat_id").is_none(), "разовый запрос без чата: {body}");
+    assert!(
+        body.get("chat_id").is_none(),
+        "разовый запрос без чата: {body}"
+    );
     assert_eq!(body["messages"][0]["content"], "привет");
 }
 
@@ -540,7 +554,10 @@ async fn ask_in_chat_sends_tools_and_parses_tool_calls() {
     assert_eq!(reply.tool_calls[0].id, "call_0");
     assert_eq!(reply.tool_calls[0].name, "git_status");
 
-    let requests = server.received_requests().await.expect("записанные запросы");
+    let requests = server
+        .received_requests()
+        .await
+        .expect("записанные запросы");
     let body: serde_json::Value = serde_json::from_slice(&requests[0].body).expect("тело");
     assert_eq!(body["tools"][0]["name"], "git_status");
     assert_eq!(body["tools"][0]["parameters"]["type"], "object");
@@ -557,9 +574,15 @@ async fn continue_in_chat_sends_tool_results_instead_of_prompt() {
         .continue_in_chat("chat-1", &results, &cloud_settings(), &[git_status_spec()])
         .await
         .expect("ответ сервиса");
-    assert!(reply.tool_calls.is_empty(), "старый ответ без поля — окончательный");
+    assert!(
+        reply.tool_calls.is_empty(),
+        "старый ответ без поля — окончательный"
+    );
 
-    let requests = server.received_requests().await.expect("записанные запросы");
+    let requests = server
+        .received_requests()
+        .await
+        .expect("записанные запросы");
     let body: serde_json::Value = serde_json::from_slice(&requests[0].body).expect("тело");
     assert_eq!(body["chat_id"], "chat-1");
     assert!(body.get("prompt").is_none(), "тело: {body}");
@@ -578,7 +601,10 @@ async fn request_without_tools_has_no_tool_fields() {
         .ask(&history(), &cloud_settings())
         .await
         .expect("ответ сервиса");
-    let requests = server.received_requests().await.expect("записанные запросы");
+    let requests = server
+        .received_requests()
+        .await
+        .expect("записанные запросы");
     let body: serde_json::Value = serde_json::from_slice(&requests[0].body).expect("тело");
     assert!(body.get("tools").is_none());
     assert!(body.get("tool_results").is_none());
@@ -605,7 +631,10 @@ async fn history_with_tool_messages_is_sent_with_links() {
         .ask_with_tools(&history, &cloud_settings(), &[git_status_spec()])
         .await
         .expect("ответ сервиса");
-    let requests = server.received_requests().await.expect("записанные запросы");
+    let requests = server
+        .received_requests()
+        .await
+        .expect("записанные запросы");
     let body: serde_json::Value = serde_json::from_slice(&requests[0].body).expect("тело");
     assert_eq!(body["messages"][1]["tool_calls"][0]["id"], "call_0");
     assert_eq!(body["messages"][2]["role"], "tool");
@@ -615,7 +644,14 @@ async fn history_with_tool_messages_is_sent_with_links() {
 
 #[tokio::test]
 async fn tools_unsupported_code_is_typed() {
-    let err = ask_error(400, error_body("tools_unsupported", "модель не поддерживает вызов инструментов")).await;
+    let err = ask_error(
+        400,
+        error_body(
+            "tools_unsupported",
+            "модель не поддерживает вызов инструментов",
+        ),
+    )
+    .await;
     match err.downcast_ref::<AgentError>() {
         Some(AgentError::ToolsUnsupported { request_id, .. }) => {
             assert_eq!(request_id.as_deref(), Some("req-1"));

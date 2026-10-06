@@ -5,13 +5,13 @@
 //! облачной модели, не зная ключа провайдера: ключ принадлежит сервису.
 
 use agentcore::agent::{
-    transport_error, Agent, AgentError, AgentReply, Message, MessageMeta, Role, ToolCall, ToolSpec,
+    Agent, AgentError, AgentReply, Message, MessageMeta, Role, ToolCall, ToolSpec, transport_error,
 };
 use agentcore::config::{ChatSettings, ContextStrategy, ReasoningMode, ThinkingMode};
-use agentcore::pipeline::PolicyLog;
 use agentcore::logging::{
-    request_id, unix_timestamp, ExchangeLog, RequestLogEntry, ResponseLogEntry,
+    ExchangeLog, RequestLogEntry, ResponseLogEntry, request_id, unix_timestamp,
 };
+use agentcore::pipeline::PolicyLog;
 use anyhow::Result;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -376,7 +376,9 @@ pub(crate) fn parse_service_error(
     header_request_id: Option<String>,
     unauthorized_hint: Option<String>,
 ) -> AgentError {
-    let envelope = serde_json::from_str::<ErrorEnvelope>(body).ok().map(|e| e.error);
+    let envelope = serde_json::from_str::<ErrorEnvelope>(body)
+        .ok()
+        .map(|e| e.error);
     let request_id = envelope
         .as_ref()
         .and_then(|e| e.request_id.clone())
@@ -435,7 +437,12 @@ pub(crate) fn header_request_id(response: &reqwest::Response) -> Option<String> 
 }
 
 impl ServerAgent {
-    fn build_request(&self, history: &[Message], settings: &ChatSettings, tools: &[ToolSpec]) -> ChatRequest {
+    fn build_request(
+        &self,
+        history: &[Message],
+        settings: &ChatSettings,
+        tools: &[ToolSpec],
+    ) -> ChatRequest {
         // Системное сообщение клиент не отправляет: контракт `/v1` знает
         // только роли `user`, `assistant` и `tool`, а системный промпт
         // сервис собирает сам из полученных настроек чата.
@@ -685,7 +692,9 @@ pub async fn list_models(server_url: &str, token: &str) -> Result<Vec<String>> {
         return Err(parse_service_error(status, &body, header_id, None).into());
     }
     let parsed: ModelsResponse = serde_json::from_str(&body).map_err(|err| {
-        AgentError::Decode(format!("не удалось разобрать список моделей сервиса: {err}"))
+        AgentError::Decode(format!(
+            "не удалось разобрать список моделей сервиса: {err}"
+        ))
     })?;
     Ok(parsed.models)
 }
@@ -728,12 +737,18 @@ pub async fn list_profiles(server_url: &str, token: &str) -> Result<Vec<ProfileC
         return Err(parse_service_error(status, &body, header_id, None).into());
     }
     let parsed: ProfilesResponse = serde_json::from_str(&body).map_err(|err| {
-        AgentError::Decode(format!("не удалось разобрать список профилей сервиса: {err}"))
+        AgentError::Decode(format!(
+            "не удалось разобрать список профилей сервиса: {err}"
+        ))
     })?;
     Ok(parsed
         .profiles
         .into_iter()
-        .map(|p| ProfileChoice { id: p.id, name: p.name, built_in: p.built_in })
+        .map(|p| ProfileChoice {
+            id: p.id,
+            name: p.name,
+            built_in: p.built_in,
+        })
         .collect())
 }
 
@@ -747,8 +762,8 @@ pub struct ProfileChoice {
 
 mod chats;
 pub use chats::{
-    allowed_next_stages, Branch, ChatHistory, ChatSummary, ChatsClient, Fact, LongTermMemoryEntry, Profile,
-    StoredMessage, TaskState, TaskTransition, WorkingMemoryEntry,
+    Branch, ChatHistory, ChatSummary, ChatsClient, Fact, LongTermMemoryEntry, Profile,
+    StoredMessage, TaskState, TaskTransition, WorkingMemoryEntry, allowed_next_stages,
 };
 
 #[cfg(test)]

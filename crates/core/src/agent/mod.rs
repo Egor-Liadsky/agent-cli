@@ -3,10 +3,10 @@ mod local;
 pub mod ollama;
 pub mod tools;
 
-pub use error::{transport_error, AgentError, MISSING_API_KEY_MESSAGE, UNAUTHORIZED_MESSAGE};
+pub use error::{AgentError, MISSING_API_KEY_MESSAGE, UNAUTHORIZED_MESSAGE, transport_error};
 pub use local::OllamaAgent;
 pub use ollama::list_models as list_ollama_models;
-pub use tools::{close_dangling_tool_calls, ToolCall, ToolSpec};
+pub use tools::{ToolCall, ToolSpec, close_dangling_tool_calls};
 
 use crate::config::ResponseFormat;
 
