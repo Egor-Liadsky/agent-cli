@@ -629,6 +629,9 @@ pub struct Config {
     /// обратной совместимости, `Some(false)` сохраняет остальные настройки.
     #[serde(default)]
     pub index_search_enabled: Option<bool>,
+    /// Простой RAG: без фильтра, реранжирования и проверки цитат.
+    #[serde(default)]
+    pub index_simple_rag: bool,
     /// Стратегия chunking: `fixed`, `structure` или `all`. Пусто —
     /// умолчание `index-mcp build`.
     #[serde(default)]

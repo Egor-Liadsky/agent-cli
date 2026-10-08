@@ -401,6 +401,9 @@ pub enum IndexConfigAction {
         /// true/false
         #[arg(long)]
         rewrite: Option<String>,
+        /// Простой RAG без фильтрации, реранжирования и проверки цитат: true/false
+        #[arg(long = "simple-rag")]
+        simple_rag: Option<String>,
         /// Модель Ollama для query rewrite
         #[arg(long = "rewrite-model")]
         rewrite_model: Option<String>,

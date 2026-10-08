@@ -547,6 +547,7 @@ enum FormatField {
     IndexMinSection,
     IndexOllamaUrl,
     IndexSearchEnabled,
+    IndexSimpleRag,
     IndexTopK,
     IndexCandidateTopK,
     IndexSimilarityThreshold,
@@ -718,6 +719,7 @@ impl SettingsSection {
             ],
             SettingsSection::IndexSearch => &[
                 FormatField::IndexSearchEnabled,
+                FormatField::IndexSimpleRag,
                 FormatField::IndexTopK,
                 FormatField::IndexCandidateTopK,
                 FormatField::IndexSimilarityThreshold,
@@ -859,6 +861,7 @@ impl FormatField {
             FormatField::IndexMinSection => "structure: минимум чанка",
             FormatField::IndexOllamaUrl => "Адрес Ollama",
             FormatField::IndexSearchEnabled => "Поиск по индексу",
+            FormatField::IndexSimpleRag => "Простой RAG",
             FormatField::IndexTopK => "Результатов top-k",
             FormatField::IndexCandidateTopK => "Кандидатов до фильтра",
             FormatField::IndexSimilarityThreshold => "Similarity threshold",
@@ -1069,6 +1072,9 @@ index_build. Ctrl+X — выбрать каталог в системном ди
             FormatField::IndexSearchEnabled => {
                 "◀/▶ или Space — подключать ли индексные инструменты к чатам и agentcli ask. Выключение сохраняет базу и параметры поиска."
             }
+            FormatField::IndexSimpleRag => {
+                "◀/▶ или Space — отвечать по найденным чанкам без порога, query rewrite, реранжирования и проверки цитат."
+            }
             FormatField::IndexBuild => {
                 "Enter — построить индекс из каталога с текущими настройками (поля сохраняются в конфиг до запуска). Долго: \
 эмбеддинг идёт по всем чанкам; ход виден в строке ниже. Прежний индекс стратегии заменяется целиком только при успехе."
@@ -1130,6 +1136,7 @@ index_build. Ctrl+X — выбрать каталог в системном ди
                 | FormatField::IndexStrategy
                 | FormatField::IndexUnit
                 | FormatField::IndexSearchEnabled
+                | FormatField::IndexSimpleRag
                 | FormatField::IndexRewrite
                 | FormatField::IndexBuild
         )
@@ -1180,6 +1187,7 @@ index_build. Ctrl+X — выбрать каталог в системном ди
                 | FormatField::IndexMinSection
                 | FormatField::IndexOllamaUrl
                 | FormatField::IndexSearchEnabled
+                | FormatField::IndexSimpleRag
                 | FormatField::IndexTopK
                 | FormatField::IndexCandidateTopK
                 | FormatField::IndexSimilarityThreshold
@@ -1244,6 +1252,7 @@ struct SettingsEditor {
     index_min_section: String,
     index_ollama_url: String,
     index_search_enabled: bool,
+    index_simple_rag: bool,
     index_top_k: String,
     index_candidate_top_k: String,
     index_similarity_threshold: String,
@@ -1405,6 +1414,7 @@ impl SettingsEditor {
                 .unwrap_or_default(),
             index_ollama_url: config.index_ollama_url.clone().unwrap_or_default(),
             index_search_enabled: config.index_search_switch_on(),
+            index_simple_rag: config.index_simple_rag,
             index_top_k: config
                 .index_top_k
                 .map(|n| n.to_string())
@@ -1581,6 +1591,7 @@ impl SettingsEditor {
                     self.index_strategy == "structure"
                 }
                 FormatField::IndexTopK
+                | FormatField::IndexSimpleRag
                 | FormatField::IndexCandidateTopK
                 | FormatField::IndexSimilarityThreshold
                 | FormatField::IndexRewrite
@@ -1879,6 +1890,7 @@ impl SettingsEditor {
             Some(FormatField::IndexStrategy) => self.index_strategy.clear(),
             Some(FormatField::IndexUnit) => self.index_unit.clear(),
             Some(FormatField::IndexSearchEnabled) => self.toggle_index_search(false),
+            Some(FormatField::IndexSimpleRag) => self.index_simple_rag = false,
             Some(FormatField::IndexRewrite) => self.index_rewrite.clear(),
             Some(FormatField::IndexBuild) => {}
             // Ctrl+D на строке демона — остановка, её обрабатывает
@@ -1912,6 +1924,7 @@ impl SettingsEditor {
             | FormatField::IndexStrategy
             | FormatField::IndexUnit
             | FormatField::IndexSearchEnabled
+            | FormatField::IndexSimpleRag
             | FormatField::IndexRewrite
             | FormatField::IndexBuild => None,
             FormatField::IndexRoot => Some(&mut self.index_root),
@@ -3850,6 +3863,12 @@ fn handle_settings_key(
         {
             editor.toggle_index_search(!editor.index_search_enabled);
         }
+        KeyCode::Left | KeyCode::Right | KeyCode::Char(' ')
+            if editor.pane == SettingsPane::Fields
+                && editor.current_field() == Some(FormatField::IndexSimpleRag) =>
+        {
+            editor.index_simple_rag = !editor.index_simple_rag;
+        }
         KeyCode::Left
             if editor.pane == SettingsPane::Fields
                 && editor.current_field() == Some(FormatField::IndexRewrite) =>
@@ -4037,6 +4056,7 @@ struct IndexValues {
     min_section: Option<usize>,
     ollama_url: Option<String>,
     search_enabled: bool,
+    simple_rag: bool,
     top_k: Option<usize>,
     candidate_top_k: Option<usize>,
     similarity_threshold: Option<f32>,
@@ -4094,6 +4114,7 @@ impl SettingsEditor {
             min_section: parse_index_size(&self.index_min_section, "Минимум чанка")?,
             ollama_url: non_empty(&self.index_ollama_url),
             search_enabled: self.index_search_enabled,
+            simple_rag: self.index_simple_rag,
             top_k: parse_index_top_k(&self.index_top_k, "Top-k", 20)?,
             candidate_top_k: parse_index_top_k(
                 &self.index_candidate_top_k,
@@ -4126,6 +4147,7 @@ fn save_index_with(
 ) {
     let config = &mut state.config;
     let unchanged = config.index_search_switch_on() == values.search_enabled
+        && config.index_simple_rag == values.simple_rag
         && config.index_root == values.root
         && config.index_db == values.db
         && config.index_strategy == values.strategy
@@ -4147,6 +4169,7 @@ fn save_index_with(
     config.index_root = values.root;
     config.index_db = values.db;
     config.index_search_enabled = Some(values.search_enabled);
+    config.index_simple_rag = values.simple_rag;
     config.index_strategy = values.strategy;
     config.index_model = values.model;
     config.index_unit = values.unit;
@@ -8708,6 +8731,13 @@ fn render_settings_fields(f: &mut Frame, editor: &SettingsEditor, area: Rect) {
                     "Выключен".to_string()
                 }
             }
+            FormatField::IndexSimpleRag => {
+                if editor.index_simple_rag {
+                    "Включён".to_string()
+                } else {
+                    "Выключен".to_string()
+                }
+            }
             FormatField::IndexTopK => editor.index_top_k.clone(),
             FormatField::IndexCandidateTopK => editor.index_candidate_top_k.clone(),
             FormatField::IndexSimilarityThreshold => editor.index_similarity_threshold.clone(),
@@ -11497,6 +11527,7 @@ mod tests {
                 min_section: None,
                 ollama_url: None,
                 search_enabled: true,
+                simple_rag: false,
                 top_k: Some(7),
                 candidate_top_k: Some(30),
                 similarity_threshold: Some(0.7),
@@ -11556,6 +11587,7 @@ mod tests {
             editor.visible_fields()
                 == vec![
                     FormatField::IndexSearchEnabled,
+                    FormatField::IndexSimpleRag,
                     FormatField::IndexTopK,
                     FormatField::IndexCandidateTopK,
                     FormatField::IndexSimilarityThreshold,
@@ -11610,6 +11642,7 @@ mod tests {
         let mut state = test_state();
         let mut editor = editor_on_index(&index_config());
         editor.index_model = "nomic-embed-text".into();
+        editor.index_simple_rag = true;
         let values = editor.index_values().unwrap();
         let mut saved = false;
         save_index_with(&mut state, values, |config| {
@@ -11623,6 +11656,7 @@ mod tests {
             assert_eq!(config.index_rewrite, Some(true));
             assert_eq!(config.index_rewrite_model.as_deref(), Some("qwen3"));
             assert_eq!(config.index_search_enabled, Some(true));
+            assert!(config.index_simple_rag);
             Ok(())
         });
         assert!(saved);

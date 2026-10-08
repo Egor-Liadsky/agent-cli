@@ -764,6 +764,7 @@ fn run_index_config(action: IndexConfigAction) -> anyhow::Result<()> {
             candidate_top_k,
             similarity_threshold,
             rewrite,
+            simple_rag,
             rewrite_model,
         } => {
             if [
@@ -774,6 +775,7 @@ fn run_index_config(action: IndexConfigAction) -> anyhow::Result<()> {
                 &unit,
                 &ollama_url,
                 &rewrite,
+                &simple_rag,
                 &rewrite_model,
                 &similarity_threshold,
             ]
@@ -814,6 +816,9 @@ fn run_index_config(action: IndexConfigAction) -> anyhow::Result<()> {
             if let Some(rewrite) = rewrite {
                 config.index_rewrite = Some(parse_bool_flag(&rewrite)?);
             }
+            if let Some(simple_rag) = simple_rag {
+                config.index_simple_rag = parse_bool_flag(&simple_rag)?;
+            }
             config.save()?;
             println!("{}", style("Настройки индекса сохранены.").green().bold());
             print_index(&config);
@@ -835,6 +840,7 @@ fn run_index_config(action: IndexConfigAction) -> anyhow::Result<()> {
             config.index_candidate_top_k = None;
             config.index_similarity_threshold = None;
             config.index_rewrite = None;
+            config.index_simple_rag = false;
             config.index_rewrite_model = None;
             config.save()?;
             println!("{}", style("Настройки индекса сняты.").green().bold());
@@ -899,6 +905,14 @@ fn print_index(config: &Config) {
     );
     line("top-k", number(config.index_top_k, 5));
     line("candidate-top-k", number(config.index_candidate_top_k, 20));
+    line(
+        "простой RAG",
+        if config.index_simple_rag {
+            "включён".into()
+        } else {
+            "выключен".into()
+        },
+    );
     line(
         "similarity-threshold (RAG)",
         config.index_similarity_threshold.map_or_else(
@@ -2053,9 +2067,7 @@ async fn ask_with_tools(
     // Если индекс включён, без него нельзя безопасно отвечать на вопрос.
     let index_tools = if config.index_active() {
         let settings = index::IndexSettings::from_config(config)?;
-        Some(
-            index::IndexTools::start(&settings, index::Progress::Discard, exchange_log()).await?,
-        )
+        Some(index::IndexTools::start(&settings, index::Progress::Discard, exchange_log()).await?)
     } else {
         None
     };

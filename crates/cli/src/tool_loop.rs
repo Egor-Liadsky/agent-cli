@@ -25,7 +25,7 @@ pub const LIMIT_RESULT: &str =
     "лимит вызовов инструментов исчерпан, ответь по уже полученным данным";
 pub const TOO_MANY_CALLS_RESULT: &str =
     "слишком много вызовов за один ответ: этот вызов не выполнен, повтори его следующим шагом";
-const GROUNDING_REFUSAL: &str = "## Ответ\nНе знаю: не могу подтвердить ответ точными цитатами из найденных чанков. Уточните, пожалуйста, какой аспект вопроса вас интересует?\n\n## Источники\nНет проверенных источников.\n\n## Цитаты\nНет.";
+pub(crate) const GROUNDING_REFUSAL: &str = "## Ответ\nНе знаю: не могу подтвердить ответ точными цитатами из найденных чанков. Уточните, пожалуйста, какой аспект вопроса вас интересует?\n\n## Источники\nНет проверенных источников.\n\n## Цитаты\nНет.";
 
 /// Исполнитель инструментов (для git — процесс `git-mcp`).
 #[async_trait]
@@ -41,8 +41,8 @@ pub trait ToolExecutor: Send + Sync {
     fn grounding_has_context(&self) -> bool {
         true
     }
-    fn validate_grounded_answer(&self, _answer: &str) -> std::result::Result<(), String> {
-        Ok(())
+    fn grounded_answer(&self, answer: &str) -> std::result::Result<String, String> {
+        Ok(answer.to_string())
     }
     /// Контекст, который обязателен до первого ответа модели (например,
     /// поиск по индексу). Ошибка прерывает ход: отвечать без поиска нельзя.
@@ -181,31 +181,35 @@ pub async fn run_tool_loop(
                 reply.reasoning = None;
                 return Ok(reply);
             }
-            if let Err(reason) = executor.validate_grounded_answer(&reply.content) {
-                if grounding_repaired {
-                    reply.content = GROUNDING_REFUSAL.into();
+            match executor.grounded_answer(&reply.content) {
+                Ok(formatted) => {
+                    reply.content = formatted;
                     reply.reasoning = None;
                     return Ok(reply);
                 }
-                grounding_repaired = true;
-                let correction = format!(
-                    "Предыдущий ответ не прошёл проверку источников: {reason}. Исправь его по исходному вопросу, используя только результаты index_search. Верни обязательные разделы «Ответ», «Источники», «Цитаты»; каждое фактическое утверждение снабди ссылкой [chunk_id] и точной цитатой. Не вызывай инструменты. Предыдущий ответ:\n{}",
-                    reply.content
-                );
-                reply = match backend.repair(&messages, &correction).await {
-                    Ok(reply) => reply,
-                    Err(error) => return Err(fail(error, executed)),
-                };
-                if !reply.tool_calls.is_empty() {
-                    reply.content = GROUNDING_REFUSAL.into();
-                    reply.reasoning = None;
-                    reply.tool_calls.clear();
-                    return Ok(reply);
+                Err(reason) => {
+                    if grounding_repaired {
+                        reply.content = GROUNDING_REFUSAL.into();
+                        reply.reasoning = None;
+                        return Ok(reply);
+                    }
+                    grounding_repaired = true;
+                    let correction = format!(
+                        "Ответ не прошёл проверку: {reason}. Выбери один подтверждающий чанк и скопируй короткий фрагмент одного предложения. Верни ровно три строки: `Факт: <слова из цитаты>`, `Чанк: <chunk_id>`, `Цитата: <короткий дословный фрагмент>`. Без заголовка и всего абзаца. Если подтверждения нет, ответь `Не знаю`."
+                    );
+                    reply = match backend.repair(&messages, &correction).await {
+                        Ok(reply) => reply,
+                        Err(error) => return Err(fail(error, executed)),
+                    };
+                    if !reply.tool_calls.is_empty() {
+                        reply.content = GROUNDING_REFUSAL.into();
+                        reply.reasoning = None;
+                        reply.tool_calls.clear();
+                        return Ok(reply);
+                    }
+                    continue;
                 }
-                continue;
             }
-            reply.reasoning = None;
-            return Ok(reply);
         }
         if forced_final {
             let error = AgentError::ToolLoopLimit { iterations }.into();
@@ -529,9 +533,11 @@ impl ToolExecutor for ToolSet<'_> {
             .is_none_or(|executor| executor.grounding_has_context())
     }
 
-    fn validate_grounded_answer(&self, answer: &str) -> std::result::Result<(), String> {
+    fn grounded_answer(&self, answer: &str) -> std::result::Result<String, String> {
         self.grounding_executor()
-            .map_or(Ok(()), |executor| executor.validate_grounded_answer(answer))
+            .map_or(Ok(answer.to_string()), |executor| {
+                executor.grounded_answer(answer)
+            })
     }
 
     async fn prepare_context(&self, query: &str) -> Result<Option<String>> {
@@ -705,9 +711,9 @@ mod tests {
             self.0
         }
 
-        fn validate_grounded_answer(&self, answer: &str) -> std::result::Result<(), String> {
+        fn grounded_answer(&self, answer: &str) -> std::result::Result<String, String> {
             if answer == "valid" {
-                Ok(())
+                Ok("formatted".into())
             } else {
                 Err("missing references".into())
             }
@@ -769,7 +775,7 @@ mod tests {
         )
         .await
         .expect("исправленный ответ");
-        assert_eq!(outcome.content, "valid");
+        assert_eq!(outcome.content, "formatted");
         assert!(outcome.reasoning.is_none());
         assert_eq!(backend.repairs, 1);
     }

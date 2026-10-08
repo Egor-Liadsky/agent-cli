@@ -69,12 +69,15 @@ fn set_show_clear_and_validation() {
             "0.7",
             "--rewrite",
             "true",
+            "--simple-rag",
+            "true",
             "--rewrite-model",
             "qwen",
         ],
     );
     assert!(set.status.success(), "stderr: {}", stderr(&set));
     let shown = stdout(&run(&home, &["config", "index", "show"]));
+    assert!(shown.contains("простой RAG: включён"), "{shown}");
     for expected in [
         "включены",
         "/notes",
@@ -128,7 +131,9 @@ fn set_show_clear_and_validation() {
     assert!(shown.contains("1200 (умолчание)"), "{shown}");
 
     assert!(run(&home, &["config", "index", "clear"]).status.success());
-    assert!(stdout(&run(&home, &["config", "index", "show"])).contains("выключены"));
+    let cleared = stdout(&run(&home, &["config", "index", "show"]));
+    assert!(cleared.contains("выключены"));
+    assert!(cleared.contains("простой RAG: выключен"));
 }
 
 #[test]
