@@ -91,6 +91,8 @@ struct Options {
     #[serde(skip_serializing_if = "Option::is_none")]
     num_predict: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    num_ctx: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     stop: Option<Vec<String>>,
 }
 
@@ -102,6 +104,7 @@ impl Options {
             && self.frequency_penalty.is_none()
             && self.presence_penalty.is_none()
             && self.num_predict.is_none()
+            && self.num_ctx.is_none()
             && self.stop.is_none()
     }
 }
@@ -275,6 +278,7 @@ fn build_options(settings: &ChatSettings) -> Options {
         frequency_penalty: sampling.frequency_penalty,
         presence_penalty: sampling.presence_penalty,
         num_predict: format.and_then(|f| f.max_length),
+        num_ctx: settings.ollama_num_ctx,
         stop: format.and_then(|f| f.stop.clone()),
     }
 }

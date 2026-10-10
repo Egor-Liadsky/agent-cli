@@ -77,7 +77,7 @@ impl Agent for OllamaAgent {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::Provider;
+    use crate::config::{Provider, ResponseFormat, SamplingParams};
     use crate::logging::ExchangeLog;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
@@ -184,6 +184,10 @@ mod tests {
         assert_eq!(reply.tool_calls[0].name, "git_status");
 
         let request = handle.await.expect("запрос");
+        let body: serde_json::Value =
+            serde_json::from_str(request.split_once("\r\n\r\n").expect("HTTP-тело").1)
+                .expect("JSON запроса");
+        assert!(body.get("options").is_none());
         assert!(
             request.contains(r#""tools":[{"type":"function""#),
             "запрос: {request}"
@@ -235,5 +239,56 @@ mod tests {
         // сервис: локальные модели остаются исключением.
         assert!(request.contains("POST /api/chat"), "запрос: {request}");
         assert!(!request.contains("/v1/chat"), "запрос: {request}");
+    }
+
+    #[tokio::test]
+    async fn configured_local_settings_reach_native_ollama_request() {
+        let (url, handle) = stub_ollama().await;
+        let (agent, mut settings) = agent_for(&url);
+        settings.ollama_num_ctx = Some(8192);
+        settings.custom_response_mode = true;
+        settings.response_format = ResponseFormat {
+            description: Some("строго JSON".into()),
+            max_length: Some(512),
+            stop_instruction: Some("не добавляй пояснения".into()),
+            ..ResponseFormat::default()
+        };
+        settings.sampling = SamplingParams {
+            temperature: Some(0.25),
+            top_p: Some(0.8),
+            top_k: Some(30),
+            ..SamplingParams::default()
+        };
+        agent
+            .ask(&[Message::user("Проверка")], &settings)
+            .await
+            .expect("ответ");
+        let request = handle.await.expect("запрос");
+        let body: serde_json::Value =
+            serde_json::from_str(request.split_once("\r\n\r\n").expect("HTTP-тело").1)
+                .expect("JSON запроса");
+        assert_eq!(
+            body["options"],
+            serde_json::json!({
+                "temperature": 0.25,
+                "top_p": 0.8,
+                "top_k": 30,
+                "num_predict": 512,
+                "num_ctx": 8192
+            })
+        );
+        let system = body["messages"]
+            .as_array()
+            .expect("сообщения")
+            .iter()
+            .find(|message| message["role"] == "system")
+            .expect("system-сообщение");
+        assert!(system["content"].as_str().unwrap().contains("строго JSON"));
+        assert!(
+            system["content"]
+                .as_str()
+                .unwrap()
+                .contains("не добавляй пояснения")
+        );
     }
 }

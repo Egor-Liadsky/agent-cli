@@ -21,8 +21,8 @@ use clap::Parser;
 use cli::{
     ActivityAction, ActivityConfigAction, BranchesAction, Cli, Commands, ConfigAction,
     ContextLimitAction, FactsAction, FormatAction, GitToolsAction, IndexAction, IndexConfigAction,
-    OllamaAction, PipelineAction, PipelineConfigAction, ProfilesAction, SamplingAction,
-    SummaryAction,
+    OllamaAction, OllamaContextAction, PipelineAction, PipelineConfigAction, ProfilesAction,
+    SamplingAction, SummaryAction,
 };
 use console::style;
 use indicatif::{ProgressBar, ProgressStyle};
@@ -1539,6 +1539,28 @@ async fn run_ollama(action: OllamaAction) -> anyhow::Result<()> {
             config.save()?;
             println!("{}", style("Адрес Ollama сохранён.").green().bold());
         }
+        OllamaAction::Context { action } => match action {
+            OllamaContextAction::Set { tokens } => {
+                anyhow::ensure!(tokens > 0, "размер контекста должен быть больше нуля");
+                let mut config = Config::load()?;
+                config.ollama_num_ctx = Some(tokens);
+                config.save()?;
+                println!("Размер контекста Ollama для новых чатов и ask: {tokens} токенов.");
+            }
+            OllamaContextAction::Clear => {
+                let mut config = Config::load()?;
+                config.ollama_num_ctx = None;
+                config.save()?;
+                println!("Размер контекста сброшен; используется штатное поведение Ollama.");
+            }
+            OllamaContextAction::Show => {
+                let config = Config::load()?;
+                match config.ollama_num_ctx {
+                    Some(tokens) => println!("Размер контекста Ollama: {tokens} токенов."),
+                    None => println!("Размер контекста Ollama не задан."),
+                }
+            }
+        },
     }
     Ok(())
 }

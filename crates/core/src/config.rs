@@ -374,6 +374,10 @@ pub struct ChatSettings {
     pub response_format: ResponseFormat,
     #[serde(default)]
     pub sampling: SamplingParams,
+    /// Размер контекстного окна локальной модели Ollama (`options.num_ctx`).
+    /// `None` оставляет штатный выбор Ollama и модели.
+    #[serde(default)]
+    pub ollama_num_ctx: Option<u32>,
     /// Стратегия рассуждения агента для этого чата
     #[serde(default)]
     pub reasoning: ReasoningMode,
@@ -519,6 +523,9 @@ pub struct Config {
     pub ollama_url: Option<String>,
     /// Локальная модель по умолчанию для чатов с провайдером Ollama.
     pub ollama_model: Option<String>,
+    /// `num_ctx` для новых чатов Ollama. `None` — штатное поведение Ollama.
+    #[serde(default)]
+    pub ollama_num_ctx: Option<u32>,
     /// Свой список моделей для быстрого переключения в настройках чата.
     /// Пустой список — используется `KNOWN_MODELS`.
     #[serde(default)]
@@ -818,6 +825,7 @@ impl Config {
             custom_response_mode: self.custom_response_mode,
             response_format: self.response_format.clone(),
             sampling: self.sampling.clone(),
+            ollama_num_ctx: self.ollama_num_ctx,
             reasoning: self.reasoning,
             thinking: self.thinking,
             experts: self.experts.clone(),
@@ -966,6 +974,7 @@ client_token = "t"
     fn old_chat_settings_without_field_parse_as_none() {
         let settings: ChatSettings = serde_json::from_str("{}").expect("настройки чата");
         assert_eq!(settings.max_context_tokens, None);
+        assert_eq!(settings.ollama_num_ctx, None);
     }
 
     #[test]
@@ -1031,6 +1040,19 @@ client_token = "t"
     }
 
     #[test]
+    fn new_chat_inherits_ollama_context_default_and_chat_round_trips_it() {
+        let config = Config {
+            ollama_num_ctx: Some(8192),
+            ..Config::default()
+        };
+        let settings = config.default_chat_settings();
+        assert_eq!(settings.ollama_num_ctx, Some(8192));
+        let encoded = serde_json::to_string(&settings).expect("сериализация настроек");
+        let restored: ChatSettings = serde_json::from_str(&encoded).expect("восстановление");
+        assert_eq!(restored.ollama_num_ctx, Some(8192));
+    }
+
+    #[test]
     fn changing_config_default_does_not_affect_already_built_chat_settings() {
         let mut config = Config {
             max_context_tokens: Some(4000),
@@ -1071,6 +1093,7 @@ client_token = "t"
         let settings: ChatSettings = serde_json::from_str("{}").expect("настройки чата");
         assert_eq!(settings.context_strategy, None);
         assert_eq!(settings.context_window_messages, None);
+        assert_eq!(settings.ollama_num_ctx, None);
     }
 
     #[test]
@@ -1081,6 +1104,7 @@ server_url = "http://127.0.0.1:9000"
         let (config, _legacy) = Config::parse_with_legacy_fields(content).expect("конфиг");
         assert_eq!(config.context_strategy, None);
         assert_eq!(config.context_window_messages, None);
+        assert_eq!(config.ollama_num_ctx, None);
     }
 
     #[test]

@@ -517,6 +517,7 @@ enum FormatField {
     SummaryStepMessages,
     ContextStrategy,
     ContextWindowMessages,
+    OllamaNumCtx,
     Profile,
     MemoryLayersEnabled,
     MemoryRouterEnabled,
@@ -671,6 +672,7 @@ impl SettingsSection {
             ],
             SettingsSection::Context => &[
                 FormatField::ContextLimit,
+                FormatField::OllamaNumCtx,
                 FormatField::ContextStrategy,
                 FormatField::ContextWindowMessages,
                 FormatField::SummaryEnabled,
@@ -831,6 +833,7 @@ impl FormatField {
             FormatField::SummaryStepMessages => "Шаг пересказа (сообщений)",
             FormatField::ContextStrategy => "Стратегия контекста",
             FormatField::ContextWindowMessages => "Окно последних сообщений",
+            FormatField::OllamaNumCtx => "Окно Ollama (токены)",
             FormatField::Profile => "Профиль",
             FormatField::MemoryLayersEnabled => "Слоистая память",
             FormatField::MemoryRouterEnabled => "Автомаршрутизатор памяти",
@@ -937,6 +940,10 @@ impl FormatField {
             FormatField::ContextWindowMessages => {
                 "Сколько последних сообщений чата уходят провайдеру при стратегиях «Окно последних сообщений» и \
 «Устойчивые факты». Пусто — действует операторское умолчание сервиса."
+            }
+            FormatField::OllamaNumCtx => {
+                "Размер контекстного окна модели в Ollama (`options.num_ctx`). Пусто — Ollama выбирает размер сама. \
+Значение не может увеличить пределы выбранной модели и может увеличить расход памяти."
             }
             FormatField::Profile => {
                 "◀/▶ — выбрать из профилей, доступных владельцу (встроенные и свои, список приходит с сервиса), \
@@ -1296,6 +1303,8 @@ struct SettingsEditor {
     /// Размер окна последних сообщений для стратегий `sliding_window` и
     /// `facts` — настройка этого чата. Пусто — операторское умолчание сервиса.
     context_window_messages: String,
+    /// Контекстное окно модели в Ollama; пусто — поведение по умолчанию.
+    ollama_num_ctx: String,
     /// Профиль этого чата (id): "" — операторское умолчание сервиса
     /// (`AGENTD_DEFAULT_PROFILE`). Подставляется поверх стратегии контекста
     /// и слоистой памяти (specs/user-profiles).
@@ -1468,6 +1477,10 @@ impl SettingsEditor {
                 .context_window_messages
                 .map(|v| v.to_string())
                 .unwrap_or_default(),
+            ollama_num_ctx: settings
+                .ollama_num_ctx
+                .map(|v| v.to_string())
+                .unwrap_or_default(),
             profile_id: settings.profile_id.clone().unwrap_or_default(),
             profile_choices: profile_choices.to_vec(),
             memory_layers_enabled: match settings.memory_layers_enabled {
@@ -1566,6 +1579,7 @@ impl SettingsEditor {
                 | FormatField::SummaryEnabled
                 | FormatField::SummaryKeepMessages
                 | FormatField::SummaryStepMessages => self.provider == Provider::Cloud,
+                FormatField::OllamaNumCtx => self.provider == Provider::Ollama,
                 FormatField::OllamaUrl => self.provider == Provider::Ollama,
                 // параметры слоистой памяти видны при включённом переключателе,
                 // независимо от действующей стратегии контекста
@@ -1954,6 +1968,7 @@ impl SettingsEditor {
             FormatField::SummaryKeepMessages => Some(&mut self.summary_keep_messages),
             FormatField::SummaryStepMessages => Some(&mut self.summary_step_messages),
             FormatField::ContextWindowMessages => Some(&mut self.context_window_messages),
+            FormatField::OllamaNumCtx => Some(&mut self.ollama_num_ctx),
             FormatField::Profile => Some(&mut self.profile_id),
             FormatField::MemoryWorkingMaxEntries => Some(&mut self.memory_working_max_entries),
             FormatField::MemoryLongTermMaxEntries => Some(&mut self.memory_long_term_max_entries),
@@ -2147,6 +2162,10 @@ impl SettingsEditor {
 
     fn build_context_window_messages(&self) -> Result<Option<u32>, String> {
         Self::build_summary_count(&self.context_window_messages, "Окно последних сообщений")
+    }
+
+    fn build_ollama_num_ctx(&self) -> Result<Option<u32>, String> {
+        Self::build_summary_count(&self.ollama_num_ctx, "Окно контекста Ollama")
     }
 
     /// Разобрать профиль: пусто — `None` (умолчание сервиса).
@@ -3389,6 +3408,13 @@ fn handle_settings_key(
                     return LoopControl::Continue;
                 }
             };
+            let ollama_num_ctx = match editor.build_ollama_num_ctx() {
+                Ok(value) => value,
+                Err(err) => {
+                    editor.error = Some(err);
+                    return LoopControl::Continue;
+                }
+            };
             match editor
                 .build()
                 .and_then(|format| editor.build_sampling().map(|sampling| (format, sampling)))
@@ -3531,6 +3557,7 @@ fn handle_settings_key(
                             custom_response_mode: format.is_some(),
                             response_format: format.unwrap_or_default(),
                             sampling,
+                            ollama_num_ctx,
                             reasoning,
                             thinking,
                             experts,
@@ -8577,6 +8604,7 @@ fn empty_field_hint(field: FormatField, editor: &SettingsEditor) -> String {
         FormatField::IndexMaxSection => "не задан — 1500".to_string(),
         FormatField::IndexMinSection => "не задан — 200".to_string(),
         FormatField::IndexOllamaUrl => "не задан — http://localhost:11434".to_string(),
+        FormatField::OllamaNumCtx => "не задано — Ollama выбирает сама".to_string(),
         FormatField::IndexTopK => "не задан — 5".to_string(),
         FormatField::IndexCandidateTopK => "не задан — 20".to_string(),
         FormatField::IndexSimilarityThreshold => "не задан — 0.5 для RAG".to_string(),
@@ -8652,6 +8680,7 @@ fn render_settings_fields(f: &mut Frame, editor: &SettingsEditor, area: Rect) {
                 }
             }
             FormatField::ContextWindowMessages => editor.context_window_messages.clone(),
+            FormatField::OllamaNumCtx => editor.ollama_num_ctx.clone(),
             FormatField::Profile => match editor
                 .profile_choices
                 .iter()

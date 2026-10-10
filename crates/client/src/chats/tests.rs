@@ -207,6 +207,7 @@ fn settings_with(provider: Provider, model: &str) -> ChatSettings {
             temperature: Some(0.3),
             ..SamplingParams::default()
         },
+        ollama_num_ctx: Some(4096),
         max_context_tokens: None,
         summary_enabled: None,
         summary_keep_messages: None,
@@ -254,6 +255,7 @@ async fn create_sends_title_and_settings() {
     assert_eq!(body["settings"]["experts"], json!(["аналитик"]));
     assert_eq!(body["settings"]["custom_response_mode"], true);
     assert_eq!(body["settings"]["response_format"]["max_length"], 500);
+    assert_eq!(body["settings"]["ollama_num_ctx"], 4096);
     let temperature = body["settings"]["temperature"]
         .as_f64()
         .expect("температура");

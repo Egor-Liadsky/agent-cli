@@ -238,6 +238,21 @@ pub enum OllamaAction {
         /// Адрес без /api/chat
         url: String,
     },
+    /// Размер окна Ollama по умолчанию для новых чатов и команды ask.
+    Context {
+        #[command(subcommand)]
+        action: OllamaContextAction,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum OllamaContextAction {
+    /// Задать положительное число токенов
+    Set { tokens: u32 },
+    /// Сбросить настройку и оставить штатное поведение Ollama
+    Clear,
+    /// Показать текущее значение
+    Show,
 }
 
 #[derive(Subcommand)]
